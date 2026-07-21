@@ -10,7 +10,6 @@
 *.out
 
 # Agentic tooling workspace
-.turbo/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
