@@ -19,6 +19,7 @@ type Config struct {
 	S3        S3Config
 	Ollama    OllamaConfig
 	Embedding EmbeddingConfig
+	Sandbox   SandboxConfig
 }
 
 // Neo4jConfig holds the bolt connection details for the graph store.
@@ -67,6 +68,17 @@ type OllamaConfig struct {
 // a migration + full re-embed, not a runtime toggle.
 type EmbeddingConfig struct {
 	Dimension int
+}
+
+// SandboxConfig drives the stateless Sandbox Execution HTTP service. MaxObjectBytes
+// caps how much of a data source the sandbox will stage locally before rejecting
+// it, bounding disk use; MaxTempDirSize is a DuckDB size string (e.g. 2GiB, with a
+// unit -- never a bare byte count) passed verbatim into SET max_temp_directory_size
+// to bound query-spill blast radius.
+type SandboxConfig struct {
+	Port           string
+	MaxObjectBytes int64
+	MaxTempDirSize string
 }
 
 // dsn assembles a libpq/pgx keyword DSN for one role against the shared host.
@@ -148,6 +160,11 @@ func Load() (Config, error) {
 		Embedding: EmbeddingConfig{
 			Dimension: intEnv("EMBEDDING_DIMENSION", 768),
 		},
+		Sandbox: SandboxConfig{
+			Port:           env("SANDBOX_PORT", "8081"),
+			MaxObjectBytes: int64Env("SANDBOX_MAX_OBJECT_BYTES", 512<<20),
+			MaxTempDirSize: env("SANDBOX_MAX_TEMP_DIR_SIZE", "2GiB"),
+		},
 	}
 	return cfg, nil
 }
@@ -162,6 +179,15 @@ func env(key, fallback string) string {
 func intEnv(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+func int64Env(key string, fallback int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
 	}

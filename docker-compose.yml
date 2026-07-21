@@ -148,11 +148,11 @@ services:
     env_file: [.env]
     environment:
       <<: *app-environment
+    ports:
+      - "8081:8081"
     depends_on:
       migrate:
         condition: service_completed_successfully
-      neo4j:
-        condition: service_healthy
       minio:
         condition: service_healthy
 

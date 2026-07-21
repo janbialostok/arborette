@@ -77,6 +77,23 @@ func (c *Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return out.Body, nil
 }
 
+// IsNotFound reports whether err is a missing-object result, from either the
+// modeled NoSuchKey type or MinIO's non-modeled API error form. It keeps SDK-
+// specific error-shape knowledge inside this wrapper so callers classify a
+// missing key without importing the S3 types themselves.
+func IsNotFound(err error) bool {
+	var noSuchKey *types.NoSuchKey
+	if errors.As(err, &noSuchKey) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code := apiErr.ErrorCode()
+		return code == "NoSuchKey" || code == "NotFound"
+	}
+	return false
+}
+
 // EnsureBucket idempotently creates the configured bucket to bootstrap local
 // MinIO, which starts empty. It creates directly rather than checking first, so
 // two services racing to bootstrap the same empty bucket both succeed: an
