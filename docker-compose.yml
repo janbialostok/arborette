@@ -1,0 +1,193 @@
+# Local-dev stack: four infra services, a completion-gated init chain
+# (db-bootstrap -> migrate), and the four Go service stubs. The init chain
+# provisions runtime roles and applies migrations before any service
+# authenticates; embedding-consuming services additionally wait for the model
+# pull. See .env.example for the variables .env must supply.
+
+# Hostnames point at compose service names; passwords/creds come from .env via
+# env_file. environment wins over env_file, so these hostnames always apply.
+x-app-environment: &app-environment
+  NEO4J_URI: bolt://neo4j:7687
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  S3_ENDPOINT: http://minio:9000
+  OLLAMA_URL: http://ollama:11434
+
+services:
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    # cypher-shell's password is passed on the command line: the neo4j image maps
+    # every NEO4J_-prefixed env var to a server config key, so NEO4J_USERNAME/
+    # NEO4J_PASSWORD would fail strict config validation at boot. NEO4J_AUTH
+    # already exposes the password in the container env, so this adds no exposure.
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p '${NEO4J_PASSWORD}' 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_OWNER_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_OWNER_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  minio:
+    # Pinned to a release that still bundles curl for the /minio/health/live
+    # healthcheck; newer tags dropped curl from the image.
+    image: minio/minio:RELEASE.2023-09-04T19-57-37Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+
+  # One-shot: pulls the embedding model to completion so no service starts
+  # before its model is present.
+  ollama-pull:
+    image: ollama/ollama
+    entrypoint: ["/bin/sh", "-c", "ollama pull ${OLLAMA_MODEL}"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  # Init chain step 1: provision runtime LOGIN roles (idempotent) before grants.
+  db-bootstrap:
+    build:
+      context: .
+      dockerfile: cmd/dbbootstrap/Dockerfile
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # Init chain step 2: apply migrations (extension, tables, grants) as owner.
+  migrate:
+    build:
+      context: .
+      dockerfile: cmd/migrate/Dockerfile
+    command: ["up"]
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    depends_on:
+      db-bootstrap:
+        condition: service_completed_successfully
+    restart: "no"
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: cmd/orchestrator/Dockerfile
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      ollama-pull:
+        condition: service_completed_successfully
+      neo4j:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  sandbox:
+    build:
+      context: .
+      dockerfile: cmd/sandbox/Dockerfile
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      neo4j:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  sleepcycle:
+    build:
+      context: .
+      dockerfile: cmd/sleepcycle/Dockerfile
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      ollama-pull:
+        condition: service_completed_successfully
+      neo4j:
+        condition: service_healthy
+
+  mcpserver:
+    build:
+      context: .
+      dockerfile: cmd/mcpserver/Dockerfile
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      ollama-pull:
+        condition: service_completed_successfully
+      neo4j:
+        condition: service_healthy
+
+volumes:
+  neo4j_data:
+  postgres_data:
+  minio_data:
+  ollama_data:
