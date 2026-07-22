@@ -21,6 +21,7 @@ type Config struct {
 	Embedding    EmbeddingConfig
 	Sandbox      SandboxConfig
 	Orchestrator OrchestratorConfig
+	MCP          MCPConfig
 	Anthropic    AnthropicConfig
 }
 
@@ -95,6 +96,15 @@ type OrchestratorConfig struct {
 	AnalystID         string
 	SleepCycleJobName string
 	LocalImportDir    string
+}
+
+// MCPConfig drives the MCP Server, arborette's read-side interface for
+// downstream agents. Port is the streamable-HTTP listen port; OrchestratorURL
+// is the compose hostname of the Orchestrator the submit_analyst_goal tool
+// proxies goal registration to (the MCP server never writes state directly).
+type MCPConfig struct {
+	Port            string
+	OrchestratorURL string
 }
 
 // AnthropicConfig points the Claude client at a model and key. Model is
@@ -195,6 +205,10 @@ func Load() (Config, error) {
 			AnalystID:         env("ARBORETTE_ANALYST_ID", "analyst-stub"),
 			SleepCycleJobName: env("SLEEPCYCLE_JOB_NAME", "arborette-sleepcycle"),
 			LocalImportDir:    env("ARBORETTE_LOCAL_IMPORT_DIR", "/import"),
+		},
+		MCP: MCPConfig{
+			Port:            env("MCP_PORT", "8082"),
+			OrchestratorURL: env("ORCHESTRATOR_URL", "http://orchestrator:8080"),
 		},
 		Anthropic: AnthropicConfig{
 			APIKey: os.Getenv("ANTHROPIC_API_KEY"),

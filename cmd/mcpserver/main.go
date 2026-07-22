@@ -6,11 +6,15 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/arborette/arborette/internal/config"
 	"github.com/arborette/arborette/internal/embedding"
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/heuristics"
+	"github.com/arborette/arborette/internal/mcpserver"
 	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
@@ -42,8 +46,18 @@ func main() {
 
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
 	queries := heuristics.NewService(provider, store.NewEmbeddingStore(pool), repo)
-	log.Printf("mcpserver: wired neo4j, postgres, heuristics query service (dim=%d)", provider.Dimensions())
-	_ = queries
+	log.Printf("mcpserver: wired neo4j, postgres, heuristics query service (dim=%d), serving HTTP on :%s", provider.Dimensions(), cfg.MCP.Port)
 
-	service.WaitForShutdown("mcpserver")
+	orchClient := mcpserver.NewOrchestratorClient(cfg.MCP.OrchestratorURL, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "arborette-mcp", Version: "0.1.0"}, nil)
+	mcpserver.RegisterTools(srv, queries, orchClient)
+
+	// A single http.Handler value: arborette's downstream Agent Chat Backend
+	// wraps this with bearer-token middleware to expose it publicly, without
+	// touching the tool handlers or transport.
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+
+	if err := service.RunHTTPServer("mcpserver", ":"+cfg.MCP.Port, handler); err != nil {
+		log.Fatalf("mcpserver: http server: %v", err)
+	}
 }

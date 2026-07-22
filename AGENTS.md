@@ -10,6 +10,12 @@
   ancient `aws-sdk-go-v2/service/s3` (predating `Options.BaseEndpoint`). Keep
   `service/s3` explicitly required at a current version, or the object-store
   client's `BaseEndpoint`/`UsePathStyle` (MinIO/S3 selection) will not compile.
+- `github.com/modelcontextprotocol/go-sdk` (the MCP server) must stay at **v1.3.1**
+  — the version `github.com/anthropics/anthropic-sdk-go` v1.58.0 transitively
+  requires. Pinning it lower (e.g. v0.8.0) makes `go mod tidy` silently downgrade
+  `anthropic-sdk-go` to v1.40.0, breaking the orchestrator's structured-output
+  usage. The MCP APIs in use (`AddTool`, `ToolHandlerFor`, the streamable handler,
+  in-memory transports) are identical across v0.8.0 and v1.3.1.
 
 ## Testing
 
