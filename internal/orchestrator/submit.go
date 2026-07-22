@@ -1,0 +1,189 @@
+package orchestrator
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/google/uuid"
+
+	"github.com/arborette/arborette/internal/store"
+)
+
+// maxUploadMemory bounds how much of a multipart upload is buffered in memory
+// before spilling to a temp file during form parsing. maxUploadBytes caps the
+// whole request body so an oversized upload is rejected before it spills to disk
+// or is stored — mirroring the Sandbox's own object-size ceiling so the
+// orchestrator never persists an object the sandbox would later reject.
+const (
+	maxUploadMemory = 32 << 20
+	maxUploadBytes  = 512 << 20
+)
+
+// Ingestion-path sentinels, mapped to statuses by writeIngestErr.
+var (
+	errNoSource    = errors.New("a data source (file upload or import_path) is required")
+	errBothSources = errors.New("provide either a file upload or import_path, not both")
+	errPathEscape  = errors.New("import_path escapes the import directory")
+	errNoImportDir = errors.New("on-disk import is not configured")
+)
+
+// handleSubmitGoal registers an analyst goal: it ingests the data source into
+// the object store, generates the Evaluation Matrix from the goal text, validates
+// the target→column bindings, persists the goal, and audits the submission. It
+// does not start Phase 1 — the hypothesis loop is a separate explicit trigger.
+func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(maxUploadMemory); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid or oversized multipart form")
+		return
+	}
+	goal := strings.TrimSpace(r.FormValue("goal"))
+	if goal == "" {
+		writeErr(w, http.StatusBadRequest, "goal is required")
+		return
+	}
+
+	ref, err := s.ingest(r)
+	if err != nil {
+		s.writeIngestErr(w, err)
+		return
+	}
+
+	matrix, err := s.claude.GenerateEvaluationMatrix(ctx, goal)
+	if err != nil {
+		log.Printf("orchestrator: generate evaluation matrix: %v", err)
+		writeErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
+		return
+	}
+
+	// Validate target→column bindings at intake. Bindings are validate/log-only:
+	// there is no persistence path, and the sandbox re-resolves Target.Field at
+	// execute time. An introspection failure here is non-fatal.
+	if resp, ierr := s.sandbox.Introspect(ctx, IntrospectRequest{DataSourceRef: ref, Targets: matrix.Targets}); ierr == nil {
+		for _, b := range resp.TargetBindings {
+			if !b.Matched {
+				log.Printf("orchestrator: goal target %q has no matching column in %q", b.Target, ref)
+			}
+		}
+	} else {
+		log.Printf("orchestrator: introspect validation for %q: %v", ref, ierr)
+	}
+
+	optID := uuid.NewString()
+	if err := s.goals.Insert(ctx, store.Goal{
+		OptimizationFunctionID: optID,
+		GoalText:               goal,
+		EvaluationMatrix:       matrix,
+		DataSourceRef:          ref,
+	}); err != nil {
+		log.Printf("orchestrator: insert goal: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	if err := s.recordAudit(ctx, "goal_submit", "goal", map[string]any{
+		"optimization_function_id": optID,
+		"data_source_ref":          ref,
+	}); err != nil {
+		log.Printf("orchestrator: append audit: %v", err)
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+}
+
+// ingest resolves the request's data source to an object-store ref via one of
+// two paths: an uploaded file part, or an on-disk path under the read-only
+// import mount. Exactly one must be present.
+func (s *Server) ingest(r *http.Request) (string, error) {
+	file, header, ferr := r.FormFile("file")
+	importPath := strings.TrimSpace(r.FormValue("import_path"))
+
+	switch {
+	case ferr == nil && importPath != "":
+		file.Close()
+		return "", errBothSources
+	case ferr == nil:
+		defer file.Close()
+		contentType := header.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		key := s.objects.NewKey("datasources", uuid.NewString(), filepath.Base(header.Filename))
+		if err := s.objects.Put(r.Context(), key, file, contentType); err != nil {
+			return "", err
+		}
+		return key, nil
+	case importPath != "":
+		return s.ingestLocal(r.Context(), importPath)
+	default:
+		return "", errNoSource
+	}
+}
+
+// ingestLocal copies a file from the read-only import mount into the object
+// store. It rejects any path that escapes the mount: the request path is forced
+// relative, joined under the mount, then symlink-resolved and verified to remain
+// contained.
+func (s *Server) ingestLocal(ctx context.Context, importPath string) (string, error) {
+	if s.localImportDir == "" {
+		return "", errNoImportDir
+	}
+	// Clean("/"+path) neutralizes "..", leading slashes, and absolute paths; Join
+	// re-roots the result under the mount.
+	rel := filepath.Clean("/" + importPath)
+	full := filepath.Join(s.localImportDir, rel)
+
+	rootReal, err := filepath.EvalSymlinks(s.localImportDir)
+	if err != nil {
+		return "", err
+	}
+	fullReal, err := filepath.EvalSymlinks(full)
+	if err != nil {
+		return "", err
+	}
+	if fullReal != rootReal && !strings.HasPrefix(fullReal, rootReal+string(os.PathSeparator)) {
+		return "", errPathEscape
+	}
+
+	f, err := os.Open(fullReal)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	key := s.objects.NewKey("datasources", uuid.NewString(), filepath.Base(fullReal))
+	if err := s.objects.Put(ctx, key, f, contentTypeForPath(fullReal)); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+func contentTypeForPath(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".csv":
+		return "text/csv"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+// writeIngestErr maps an ingestion error to a status: validation and escape
+// errors are 400, a missing on-disk file is 404, anything else is a masked 500.
+func (s *Server) writeIngestErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errNoSource), errors.Is(err, errBothSources),
+		errors.Is(err, errPathEscape), errors.Is(err, errNoImportDir):
+		writeErr(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, os.ErrNotExist):
+		writeErr(w, http.StatusNotFound, "data source not found")
+	default:
+		log.Printf("orchestrator: ingest data source: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+	}
+}

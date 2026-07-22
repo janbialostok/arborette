@@ -131,6 +131,10 @@ services:
     env_file: [.env]
     environment:
       <<: *app-environment
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./local-import:/import:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -140,6 +144,9 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      # The sandbox defines no healthcheck, so gate on start, not health.
+      sandbox:
+        condition: service_started
 
   sandbox:
     build:

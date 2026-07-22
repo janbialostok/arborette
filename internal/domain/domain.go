@@ -121,3 +121,24 @@ type Constraint struct {
 	Op    ConstraintOp `json:"op"`
 	Value float64      `json:"value"`
 }
+
+// Aggregations is the canonical set of aggregate functions a query intervention
+// may measure its objective with; the Sandbox accepts exactly these. It is the
+// single source both the structured-output schema enum and the objective
+// validator derive from, so the two cannot drift.
+var Aggregations = []string{"count", "sum", "avg", "min", "max"}
+
+// IsAggregation reports whether agg is a supported aggregation.
+func IsAggregation(agg string) bool {
+	for _, a := range Aggregations {
+		if a == agg {
+			return true
+		}
+	}
+	return false
+}
+
+// ConstraintOps is the canonical set of hard-constraint comparison operators, so
+// the structured-output schema enum derives from the same values the typed
+// ConstraintOp constants define rather than re-hardcoding them.
+var ConstraintOps = []ConstraintOp{LessThan, LessThanOrEqual, GreaterThan, GreaterThanOrEqual}

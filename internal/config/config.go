@@ -14,12 +14,14 @@ import (
 // Config is the union of every service's configuration. A given service only
 // reads the fields it needs.
 type Config struct {
-	Neo4j     Neo4jConfig
-	Postgres  PostgresConfig
-	S3        S3Config
-	Ollama    OllamaConfig
-	Embedding EmbeddingConfig
-	Sandbox   SandboxConfig
+	Neo4j        Neo4jConfig
+	Postgres     PostgresConfig
+	S3           S3Config
+	Ollama       OllamaConfig
+	Embedding    EmbeddingConfig
+	Sandbox      SandboxConfig
+	Orchestrator OrchestratorConfig
+	Anthropic    AnthropicConfig
 }
 
 // Neo4jConfig holds the bolt connection details for the graph store.
@@ -79,6 +81,28 @@ type SandboxConfig struct {
 	Port           string
 	MaxObjectBytes int64
 	MaxTempDirSize string
+}
+
+// OrchestratorConfig drives the REST/API service. SandboxURL is the compose
+// hostname of the Sandbox Execution service the goal-intake and hypothesis loop
+// call; AnalystID backs the stub identity every audit record is stamped with;
+// SleepCycleJobName is the named job the Phase-2 trigger launches; LocalImportDir
+// is the read-only mount the on-disk ingestion path resolves relative paths
+// against (a path escaping it is rejected).
+type OrchestratorConfig struct {
+	Port              string
+	SandboxURL        string
+	AnalystID         string
+	SleepCycleJobName string
+	LocalImportDir    string
+}
+
+// AnthropicConfig points the Claude client at a model and key. Model is
+// overridable so a cheaper/faster structured-output model can back demos without
+// a code change; APIKey is a secret with no default.
+type AnthropicConfig struct {
+	APIKey string
+	Model  string
 }
 
 // dsn assembles a libpq/pgx keyword DSN for one role against the shared host.
@@ -164,6 +188,17 @@ func Load() (Config, error) {
 			Port:           env("SANDBOX_PORT", "8081"),
 			MaxObjectBytes: int64Env("SANDBOX_MAX_OBJECT_BYTES", 512<<20),
 			MaxTempDirSize: env("SANDBOX_MAX_TEMP_DIR_SIZE", "2GiB"),
+		},
+		Orchestrator: OrchestratorConfig{
+			Port:              env("ORCHESTRATOR_PORT", "8080"),
+			SandboxURL:        env("SANDBOX_URL", "http://sandbox:8081"),
+			AnalystID:         env("ARBORETTE_ANALYST_ID", "analyst-stub"),
+			SleepCycleJobName: env("SLEEPCYCLE_JOB_NAME", "arborette-sleepcycle"),
+			LocalImportDir:    env("ARBORETTE_LOCAL_IMPORT_DIR", "/import"),
+		},
+		Anthropic: AnthropicConfig{
+			APIKey: os.Getenv("ANTHROPIC_API_KEY"),
+			Model:  env("ANTHROPIC_MODEL", "claude-opus-4-8"),
 		},
 	}
 	return cfg, nil

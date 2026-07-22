@@ -1,6 +1,7 @@
 // Command orchestrator is the REST/API service. It wires its connections and
-// blocks until shutdown, authenticating to Postgres as the orchestrator runtime
-// role.
+// serves the goal-registry, hypothesis-loop, streaming, and heuristic-browsing
+// HTTP API until shutdown, authenticating to Postgres as the orchestrator
+// runtime role.
 package main
 
 import (
@@ -10,7 +11,10 @@ import (
 	"github.com/arborette/arborette/internal/config"
 	"github.com/arborette/arborette/internal/embedding"
 	"github.com/arborette/arborette/internal/graph"
+	"github.com/arborette/arborette/internal/heuristics"
+	"github.com/arborette/arborette/internal/llm"
 	"github.com/arborette/arborette/internal/objectstore"
+	"github.com/arborette/arborette/internal/orchestrator"
 	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
@@ -49,7 +53,22 @@ func main() {
 	}
 
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
-	log.Printf("orchestrator: wired neo4j, postgres, object store, embeddings (dim=%d)", provider.Dimensions())
+	goals := store.NewGoalRegistry(pool)
+	audits := store.NewAuditLog(pool)
+	embeddings := store.NewEmbeddingStore(pool)
+	heur := heuristics.NewService(provider, embeddings, repo)
+	claude := llm.NewClient(cfg.Anthropic.APIKey, cfg.Anthropic.Model)
+	sandbox := orchestrator.NewSandboxClient(cfg.Orchestrator.SandboxURL, nil)
 
-	service.WaitForShutdown("orchestrator")
+	srv := orchestrator.NewServer(
+		repo, goals, audits, objects, heur, claude, sandbox,
+		orchestrator.NewHub(), orchestrator.StubLauncher{},
+		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID},
+		cfg.Orchestrator.LocalImportDir, cfg.Orchestrator.SleepCycleJobName,
+	)
+
+	log.Printf("orchestrator: wired neo4j, postgres, object store, embeddings (dim=%d), serving HTTP on :%s", provider.Dimensions(), cfg.Orchestrator.Port)
+	if err := service.RunHTTPServer("orchestrator", ":"+cfg.Orchestrator.Port, srv.Routes()); err != nil {
+		log.Fatalf("orchestrator: http server: %v", err)
+	}
 }
