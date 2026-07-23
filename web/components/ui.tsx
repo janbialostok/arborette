@@ -100,6 +100,37 @@ export function Callout({
   );
 }
 
+export type BadgeTone = "positive" | "neutral" | "warn" | "negative";
+
+// Badge is the rounded-full status pill; callers pass a semantic tone.
+export function Badge({
+  tone = "neutral",
+  children,
+  className,
+}: {
+  tone?: BadgeTone;
+  children: ReactNode;
+  className?: string;
+}) {
+  const tones: Record<BadgeTone, string> = {
+    positive: "border-signal/40 text-signal",
+    neutral: "border-line-strong text-muted",
+    warn: "border-warn/40 text-warn",
+    negative: "border-neg/40 text-neg",
+  };
+  return (
+    <span
+      className={cn(
+        "rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider",
+        tones[tone],
+        className,
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
 export function Panel({
   children,
   className,

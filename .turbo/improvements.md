@@ -81,3 +81,19 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Where**: `internal/orchestrator/hypothesis.go` (runLoop, pinObjective, processCandidate), `internal/llm` (ProposeInterventionTree prompt/schema)
 - **Why**: Real runs frequently produced zero triplets: Claude's `ProposeInterventionTree` either returned no candidate interventions or pinned a non-column objective field, so the loop finished immediately or failed the baseline. Root cause (prompt grounding on the actual introspected schema, structured-output constraints, or objective selection) needs analysis before a fix. Observed across multiple runs during web-UI e2e testing; the web UI handled the empty/failed runs correctly, so this is purely an orchestrator/LLM robustness question.
 - **Noted**: 2026-07-22
+
+### Wide-dataset goal registration fails: evaluation-matrix tool schema exceeds Anthropic's grammar limit
+
+- **Type**: plan
+- **Category**: reliability
+- **Where**: `internal/llm` (`GenerateEvaluationMatrix` structured-output/strict tool schema), invoked from `internal/orchestrator/submit.go` (`handleSubmitGoal`)
+- **Why**: Registering a goal against a wide dataset (e.g. Spaceship Titanic `train.csv`, ~14 columns) fails. Claude returns `400 invalid_request_error: "The compiled grammar is too large... Simplify your tool schemas or reduce the number of strict tools."`; the orchestrator maps it to a 502 "evaluation matrix generation failed". The schema-aware intake embeds dataset columns as enum constraints AND the recursive objective-expression AST in one strict tool schema, so the compiled constrained-decoding grammar exceeds Anthropic's ceiling for many-column datasets. Registration is broken for real-world wide datasets — a core intake limitation, not an edge case. Directions to weigh: validate columns deterministically post-generation (against the introspected schema, reusing the existing dry-run + repair retry) instead of via enum grammar; or stage matrix generation to shrink each schema; or prune the column enum. Discovered during the objectives-list/failure-rendering change, which correctly surfaced the failure.
+- **Noted**: 2026-07-23
+
+### Extract and unit-test the LiveRun reopen-reconciliation decision core
+
+- **Type**: plan
+- **Category**: testing
+- **Where**: `web/components/LiveRun.tsx` — `resolveSilence` + `reconcileStatus` (persisted run status + stream flags → target phase / "defer")
+- **Why**: The highest-risk new logic in the web objectives change (reconciling server-persisted run status with the live SSE stream and the localStorage heuristic on reopen) has zero automated tests — it was verified only by trace + live preview + code review. The pure decision is a pure mapping that could be factored into a `web/lib` helper and unit-tested with Vitest, following the existing `runState.ts` + `runState.test.ts` precedent, upholding four invariants (no neutral-flash duplicate-run, no crashed-running trap, no latency race, no stale failure Callout). Marked `plan` because the timer orchestration isn't cleanly extractable without also adding a fake-timer harness the project lacks, so the extraction boundary needs deciding first. Deferred deliberately: extracting immediately after the logic stabilized carried refactor risk not worth taking inline.
+- **Noted**: 2026-07-23

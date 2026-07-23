@@ -38,6 +38,17 @@ export interface HeuristicMatch {
   definition: string;
 }
 
+// A registered objective plus its latest run status, as projected by GET /goals.
+// `status` is one of the run lifecycle states or a synthetic "no run"; the
+// backend omits `failure_reason` unless the latest run failed with a reason.
+export interface GoalListItem {
+  optimization_function_id: string;
+  goal_text: string;
+  created_at: string;
+  status: string;
+  failure_reason?: string;
+}
+
 // The trace DTO is richer than the live triplet payload: it carries full node
 // properties, whereas the SSE frame carries only ids and numeric baseline/value.
 export interface TraceTriplet {
@@ -114,6 +125,10 @@ export function triggerSleepCycle(id: string): Promise<SubmitGoalResponse> {
     `${API_BASE}/goals/${encodeURIComponent(id)}/sleep-cycle`,
     { method: "POST" },
   );
+}
+
+export function listGoals(): Promise<GoalListItem[]> {
+  return requestJSON<GoalListItem[]>(`${API_BASE}/goals`);
 }
 
 export function searchHeuristics(

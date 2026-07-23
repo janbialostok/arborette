@@ -8,7 +8,16 @@ import {
   type HeuristicMatch,
   type TraceTriplet,
 } from "@/lib/orchestrator";
-import { Button, Callout, cn, Panel, SectionLabel, Spinner } from "@/components/ui";
+import {
+  Badge,
+  Button,
+  Callout,
+  cn,
+  Panel,
+  SectionLabel,
+  Spinner,
+  type BadgeTone,
+} from "@/components/ui";
 
 export function HeuristicBrowser() {
   const [q, setQ] = useState("");
@@ -273,23 +282,14 @@ function PropertyList({ props }: { props: Record<string, unknown> }) {
 }
 
 function VerificationBadge({ status }: { status: string }) {
-  const tone: Record<string, string> = {
-    verified: "border-signal/40 text-signal",
-    confirmed: "border-signal/40 text-signal",
-    unverified: "border-line-strong text-muted",
-    corrected: "border-warn/40 text-warn",
-    rejected: "border-neg/40 text-neg",
+  const tone: Record<string, BadgeTone> = {
+    verified: "positive",
+    confirmed: "positive",
+    unverified: "neutral",
+    corrected: "warn",
+    rejected: "negative",
   };
-  return (
-    <span
-      className={cn(
-        "rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider",
-        tone[status] ?? "border-line-strong text-muted",
-      )}
-    >
-      {status || "unknown"}
-    </span>
-  );
+  return <Badge tone={tone[status] ?? "neutral"}>{status || "unknown"}</Badge>;
 }
 
 function renderValue(val: unknown): string {

@@ -6,6 +6,7 @@ import { cn } from "@/components/ui";
 
 const LINKS = [
   { href: "/", label: "Submit goal" },
+  { href: "/goals", label: "Objectives" },
   { href: "/heuristics", label: "Heuristics" },
 ];
 
@@ -23,7 +24,7 @@ export function AppNav() {
         {LINKS.map((link) => {
           const active =
             link.href === "/"
-              ? pathname === "/" || pathname.startsWith("/goals")
+              ? pathname === "/"
               : pathname.startsWith(link.href);
           return (
             <Link

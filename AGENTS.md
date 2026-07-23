@@ -49,3 +49,9 @@
   compose container already holds 8080), sourcing `.env` for credentials — then
   `curl` the endpoint. Boot-time work (migrations already applied, reconciliation
   sweeps) runs too, so the local process exercises the real startup path.
+- To preview or smoke-test a `web/` frontend change against the live stack, run
+  `make web-dev` — it starts the Next.js dev server on :3000 with your local edits,
+  pointed at the orchestrator on :8080 (`ORCHESTRATOR_URL`). The compose `web`
+  service (:8083) serves the pre-built standalone image and will **not** reflect
+  local `web/` edits, so bring the backend up with `make up` but drive the frontend
+  through `make web-dev`, not the :8083 container.
