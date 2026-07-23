@@ -32,3 +32,8 @@
   `make test`, which sets the localhost host overrides plus
   `ARBORETTE_INTEGRATION=1` and runs `go test -p 1`. Use `-p 1`: the packages
   share one Postgres database and must not run concurrently.
+- Running a scoped subset (`go test ./internal/<pkg>/`) from the host still needs
+  those localhost overrides — especially `S3_ENDPOINT=http://localhost:9000`.
+  `.env` leaves `S3_ENDPOINT` unset (compose injects the in-network `minio:9000`),
+  so without the override the S3 client targets real AWS and fails with a
+  misleading `InvalidAccessKeyId` rather than an endpoint error.

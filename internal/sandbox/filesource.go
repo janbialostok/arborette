@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,9 +82,11 @@ func (s *FileSource) Introspect(ctx context.Context) (*datasource.Schema, error)
 // Execute measures one aggregate over the object under the given filters. It
 // stages once (sharing the download + engine with introspection's path), reads
 // the schema to validate the compiled query against, runs the single SELECT, and
-// returns the scalar. A nil result means the aggregate filtered to an empty set
-// (SQL NULL) for avg/sum/min/max; count over an empty set returns 0, not nil.
-func (s *FileSource) Execute(ctx context.Context, agg string, target domain.Target, filters []domain.Constraint) (*float64, error) {
+// returns the scalar. When expr is non-nil the aggregate measures that compiled
+// objective value expression; otherwise it measures the bare target column (the
+// legacy path). A nil result means the aggregate filtered to an empty set (SQL
+// NULL) for avg/sum/min/max; count over an empty set returns 0, not nil.
+func (s *FileSource) Execute(ctx context.Context, agg string, target domain.Target, expr *domain.Expression, filters []domain.Constraint) (*float64, error) {
 	db, tableFn, cleanup, err := s.stage(ctx)
 	if err != nil {
 		return nil, err
@@ -95,7 +98,13 @@ func (s *FileSource) Execute(ctx context.Context, agg string, target domain.Targ
 		return nil, err
 	}
 
-	query, args, err := compileQuery(tableFn, cols, agg, target, filters)
+	var query string
+	var args []any
+	if expr != nil {
+		query, args, err = compileObjective(tableFn, cols, agg, *expr, filters)
+	} else {
+		query, args, err = compileQuery(tableFn, cols, agg, target, filters)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +115,13 @@ func (s *FileSource) Execute(ctx context.Context, agg string, target domain.Targ
 	}
 	if !value.Valid {
 		return nil, nil
+	}
+	// A non-finite DOUBLE scans as a valid float64 but json.Marshal cannot encode
+	// it, so reject it here rather than emit a truncated 200 body: an expression
+	// division by zero (+Inf/NaN) or a source column literally containing inf both
+	// reach this guard regardless of which compiler produced the query.
+	if math.IsInf(value.Float64, 0) || math.IsNaN(value.Float64) {
+		return nil, errNonFiniteValue
 	}
 	return &value.Float64, nil
 }

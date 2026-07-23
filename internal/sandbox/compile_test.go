@@ -20,7 +20,26 @@ func testCols() []datasource.Column {
 		{Name: "price", Type: "DECIMAL(10,2)"},
 		{Name: "name", Type: "VARCHAR"},
 		{Name: "created", Type: "DATE"},
+		{Name: "flag", Type: "BOOLEAN"},
 	}
+}
+
+func ptrExpr(e domain.Expression) *domain.Expression { return &e }
+
+func col(name string) domain.Expression {
+	return domain.Expression{Kind: domain.ColumnRefKind, Column: name}
+}
+
+func strLit(s string) domain.Expression {
+	return domain.Expression{Kind: domain.LiteralKind, Literal: &domain.LiteralValue{String: &s}}
+}
+
+func numLit(n float64) domain.Expression {
+	return domain.Expression{Kind: domain.LiteralKind, Literal: &domain.LiteralValue{Number: &n}}
+}
+
+func cmp(op string, left, right domain.Expression) domain.Expression {
+	return domain.Expression{Kind: domain.ComparisonKind, Op: op, Left: ptrExpr(left), Right: ptrExpr(right)}
 }
 
 func target(field string) domain.Target {
@@ -128,6 +147,205 @@ func TestCompileQueryOperatorMapping(t *testing.T) {
 			}
 			if len(args) != 1 || args[0].(float64) != 5 {
 				t.Fatalf("threshold value not bound as arg: %v", args)
+			}
+		})
+	}
+}
+
+// TestCompileObjectiveAcceptance covers the expression paths that retire the
+// boolean/categorical hard failure: a boolean column is measured via an INTEGER
+// cast, and an equality comparison becomes a 0/1 indicator with its literal bound.
+func TestCompileObjectiveAcceptance(t *testing.T) {
+	t.Run("boolean column avg", func(t *testing.T) {
+		sql, args, err := compileObjective(testTableFn, testCols(), "avg", col("flag"), nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(sql, `AVG(CAST("flag" AS INTEGER))`) {
+			t.Fatalf("boolean not cast to INTEGER under the aggregate: %q", sql)
+		}
+		if !strings.Contains(sql, "AS DOUBLE)") {
+			t.Fatalf("aggregate not wrapped in CAST(... AS DOUBLE): %q", sql)
+		}
+		if len(args) != 0 {
+			t.Fatalf("expected no args, got %v", args)
+		}
+	})
+
+	t.Run("categorical equals indicator", func(t *testing.T) {
+		expr := cmp("=", col("name"), strLit("gold"))
+		sql, args, err := compileObjective(testTableFn, testCols(), "avg", expr, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(sql, `CASE WHEN ("name" = ?) THEN 1 ELSE 0 END`) {
+			t.Fatalf("comparison not compiled to a 0/1 indicator: %q", sql)
+		}
+		if len(args) != 1 || args[0].(string) != "gold" {
+			t.Fatalf("literal not bound as arg: %v", args)
+		}
+	})
+
+	t.Run("expression args precede filter args", func(t *testing.T) {
+		expr := cmp("=", col("name"), strLit("gold"))
+		filters := []domain.Constraint{{Field: "qty", Op: domain.GreaterThan, Value: 5}}
+		_, args, err := compileObjective(testTableFn, testCols(), "avg", expr, filters)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(args) != 2 || args[0].(string) != "gold" || args[1].(float64) != 5 {
+			t.Fatalf("expected [expression arg, filter arg] in order, got %v", args)
+		}
+	})
+
+	t.Run("arithmetic compiled in double space", func(t *testing.T) {
+		expr := domain.Expression{Kind: domain.ArithmeticKind, Op: "/", Left: ptrExpr(col("qty")), Right: ptrExpr(col("amount"))}
+		sql, _, err := compileObjective(testTableFn, testCols(), "sum", expr, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(sql, `(CAST("qty" AS DOUBLE) / CAST("amount" AS DOUBLE))`) {
+			t.Fatalf("arithmetic operands not cast to DOUBLE: %q", sql)
+		}
+	})
+}
+
+// TestCompileObjectiveCase covers the Case/bucket node: the emitted CASE shape,
+// the when/then/else arg accumulation order, and the guards that keep an invalid
+// branch from reaching DuckDB as a masked 500.
+func TestCompileObjectiveCase(t *testing.T) {
+	t.Run("bucket compiles with ordered args", func(t *testing.T) {
+		bucket := domain.Expression{Kind: domain.CaseKind,
+			Cases: []domain.CaseBranch{{
+				When: ptrExpr(cmp(">", col("amount"), numLit(100))),
+				Then: ptrExpr(numLit(1)),
+			}},
+			Else: ptrExpr(numLit(0))}
+		sql, args, err := compileObjective(testTableFn, testCols(), "avg", bucket, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(sql, "CASE WHEN") || !strings.Contains(sql, " THEN ") || !strings.Contains(sql, " ELSE ") || !strings.Contains(sql, " END") {
+			t.Fatalf("case not compiled to CASE WHEN...THEN...ELSE...END: %q", sql)
+		}
+		if len(args) != 3 || args[0].(float64) != 100 || args[1].(float64) != 1 || args[2].(float64) != 0 {
+			t.Fatalf("expected [when, then, else] args in order, got %v", args)
+		}
+	})
+
+	t.Run("boolean column when", func(t *testing.T) {
+		bucket := domain.Expression{Kind: domain.CaseKind,
+			Cases: []domain.CaseBranch{{When: ptrExpr(col("flag")), Then: ptrExpr(numLit(1))}},
+			Else:  ptrExpr(numLit(0))}
+		if _, _, err := compileObjective(testTableFn, testCols(), "avg", bucket, nil); err != nil {
+			t.Fatalf("boolean-column WHEN should compile, got %v", err)
+		}
+	})
+
+	cases := []struct {
+		name string
+		expr domain.Expression
+		want error
+	}{
+		{"empty branches", domain.Expression{Kind: domain.CaseKind}, errTypeIncompatible},
+		{"non-numeric then", domain.Expression{Kind: domain.CaseKind,
+			Cases: []domain.CaseBranch{{When: ptrExpr(col("flag")), Then: ptrExpr(strLit("hi"))}}}, errTypeIncompatible},
+		{"string when", domain.Expression{Kind: domain.CaseKind,
+			Cases: []domain.CaseBranch{{When: ptrExpr(col("name")), Then: ptrExpr(numLit(1))}}}, errTypeIncompatible},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, _, err := compileObjective(testTableFn, testCols(), "avg", c.expr, nil); !errors.Is(err, c.want) {
+				t.Fatalf("expected %v, got %v", c.want, err)
+			}
+		})
+	}
+}
+
+// TestCompileObjectiveCast covers the Cast acceptance paths: a boolean cast to
+// DOUBLE is measurable under a numeric aggregation, and any operand casts to
+// VARCHAR (measurable only under count).
+func TestCompileObjectiveCast(t *testing.T) {
+	boolToDouble := domain.Expression{Kind: domain.CastKind, CastType: "DOUBLE", Operand: ptrExpr(col("flag"))}
+	sql, _, err := compileObjective(testTableFn, testCols(), "avg", boolToDouble, nil)
+	if err != nil {
+		t.Fatalf("boolean->DOUBLE cast: %v", err)
+	}
+	if !strings.Contains(sql, `AVG(CAST("flag" AS DOUBLE))`) {
+		t.Fatalf("boolean not cast to DOUBLE under the aggregate: %q", sql)
+	}
+
+	numToVarchar := domain.Expression{Kind: domain.CastKind, CastType: "VARCHAR", Operand: ptrExpr(col("amount"))}
+	sql, _, err = compileObjective(testTableFn, testCols(), "count", numToVarchar, nil)
+	if err != nil {
+		t.Fatalf("numeric->VARCHAR cast under count: %v", err)
+	}
+	if !strings.Contains(sql, `COUNT(CAST("amount" AS VARCHAR))`) {
+		t.Fatalf("cast to VARCHAR not emitted under count: %q", sql)
+	}
+
+	// A numeric->BOOLEAN cast yields a boolean expression, so the aggregate
+	// boundary double-wraps it back to INTEGER for a 0/1 measure.
+	numToBool := domain.Expression{Kind: domain.CastKind, CastType: "BOOLEAN", Operand: ptrExpr(col("amount"))}
+	sql, _, err = compileObjective(testTableFn, testCols(), "avg", numToBool, nil)
+	if err != nil {
+		t.Fatalf("numeric->BOOLEAN cast under avg: %v", err)
+	}
+	if !strings.Contains(sql, `AVG(CAST(CAST("amount" AS BOOLEAN) AS INTEGER))`) {
+		t.Fatalf("numeric->BOOLEAN not double-wrapped to INTEGER under the aggregate: %q", sql)
+	}
+}
+
+// TestCompileObjectiveAggregateBoundary covers the aggregate-boundary branches:
+// count accepts a string expression that every numeric aggregation rejects, and
+// min/max measure a numeric expression.
+func TestCompileObjectiveAggregateBoundary(t *testing.T) {
+	if _, _, err := compileObjective(testTableFn, testCols(), "count", col("name"), nil); err != nil {
+		t.Fatalf("count over string column: %v", err)
+	}
+	div := domain.Expression{Kind: domain.ArithmeticKind, Op: "/", Left: ptrExpr(col("qty")), Right: ptrExpr(col("amount"))}
+	for _, agg := range []string{"min", "max"} {
+		if _, _, err := compileObjective(testTableFn, testCols(), agg, div, nil); err != nil {
+			t.Fatalf("%s over numeric expression: %v", agg, err)
+		}
+	}
+}
+
+// TestCompileObjectiveMalformedNodes covers the defensive guards for a malformed
+// AST: an empty Literal and a node missing a required operand.
+func TestCompileObjectiveMalformedNodes(t *testing.T) {
+	emptyLit := domain.Expression{Kind: domain.LiteralKind}
+	if _, _, err := compileObjective(testTableFn, testCols(), "avg", emptyLit, nil); !errors.Is(err, errTypeIncompatible) {
+		t.Fatalf("expected errTypeIncompatible for empty literal, got %v", err)
+	}
+	missingLeft := domain.Expression{Kind: domain.ComparisonKind, Op: "=", Right: ptrExpr(numLit(1))}
+	if _, _, err := compileObjective(testTableFn, testCols(), "avg", missingLeft, nil); !errors.Is(err, errTypeIncompatible) {
+		t.Fatalf("expected errTypeIncompatible for missing operand, got %v", err)
+	}
+}
+
+// TestCompileObjectiveRejections asserts every clearly-invalid combination is
+// caught at compile time with its sentinel, so it surfaces as a descriptive 400
+// rather than an opaque DuckDB runtime error.
+func TestCompileObjectiveRejections(t *testing.T) {
+	cases := []struct {
+		name string
+		expr domain.Expression
+		want error
+	}{
+		{"arithmetic over varchar", domain.Expression{Kind: domain.ArithmeticKind, Op: "+", Left: ptrExpr(col("amount")), Right: ptrExpr(col("name"))}, errTypeIncompatible},
+		{"comparison numeric vs string", cmp("=", col("amount"), strLit("x")), errTypeIncompatible},
+		{"unknown comparison operator", cmp("LIKE", col("name"), strLit("gold")), errUnknownOperator},
+		{"unknown arithmetic operator", domain.Expression{Kind: domain.ArithmeticKind, Op: "%", Left: ptrExpr(col("amount")), Right: ptrExpr(col("qty"))}, errUnknownOperator},
+		{"cast varchar to double", domain.Expression{Kind: domain.CastKind, CastType: "DOUBLE", Operand: ptrExpr(col("name"))}, errTypeIncompatible},
+		{"cast to integer target", domain.Expression{Kind: domain.CastKind, CastType: "INTEGER", Operand: ptrExpr(col("amount"))}, errUnknownCast},
+		{"unknown column", col("ghost"), errUnknownField},
+		{"avg over bare varchar", col("name"), errTypeIncompatible},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, _, err := compileObjective(testTableFn, testCols(), "avg", c.expr, nil); !errors.Is(err, c.want) {
+				t.Fatalf("expected %v, got %v", c.want, err)
 			}
 		})
 	}

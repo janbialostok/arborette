@@ -71,17 +71,24 @@ type IntrospectResponse struct {
 // ExecuteRequest measures one aggregate over a data source under hard-constraint
 // filters. Type discriminates the intervention shape; an empty Type defaults to
 // query, and since this service handles only query, any other value is rejected.
+// ValueExpression, when set, is the objective value expression measured in place
+// of the bare Target; ObjectiveLabel is the key the measured value is returned
+// under (a compiled expression has no single column name). Both are omitempty so
+// the legacy field-keyed request is unchanged.
 type ExecuteRequest struct {
-	DataSourceRef string                  `json:"data_source_ref"`
-	Type          domain.InterventionType `json:"type"`
-	Aggregation   string                  `json:"aggregation"`
-	Target        domain.Target           `json:"target"`
-	Filters       []domain.Constraint     `json:"filters"`
+	DataSourceRef   string                  `json:"data_source_ref"`
+	Type            domain.InterventionType `json:"type"`
+	Aggregation     string                  `json:"aggregation"`
+	Target          domain.Target           `json:"target"`
+	ValueExpression *domain.Expression      `json:"value_expression,omitempty"`
+	ObjectiveLabel  string                  `json:"objective_label,omitempty"`
+	Filters         []domain.Constraint     `json:"filters"`
 }
 
 // ExecuteResponse carries the single measured aggregate shaped like an Outcome's
-// Value: {"<target field>": <number>}, with a null number when a sum/avg/min/max
-// filtered to an empty set (count over an empty set is 0).
+// Value: {"<key>": <number>}, keyed by the request's objective label when set and
+// falling back to the target field for the legacy path, with a null number when a
+// sum/avg/min/max filtered to an empty set (count over an empty set is 0).
 type ExecuteResponse struct {
 	Value map[string]any `json:"value"`
 }
@@ -129,7 +136,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	src := NewFileSource(s.objects, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
-	value, err := src.Execute(r.Context(), req.Aggregation, req.Target, req.Filters)
+	value, err := src.Execute(r.Context(), req.Aggregation, req.Target, req.ValueExpression, req.Filters)
 	if err != nil {
 		writeStageErr(w, err)
 		return
@@ -139,7 +146,14 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	if value != nil {
 		measured = *value
 	}
-	writeJSON(w, http.StatusOK, ExecuteResponse{Value: map[string]any{req.Target.Field: measured}})
+	// A compiled expression has no single column name, so the value is keyed by the
+	// objective label; the legacy field-only request carries no label and falls
+	// back to the target field, keeping its response shape unchanged.
+	key := req.ObjectiveLabel
+	if key == "" {
+		key = req.Target.Field
+	}
+	writeJSON(w, http.StatusOK, ExecuteResponse{Value: map[string]any{key: measured}})
 }
 
 // bindTargets binds each target to a column using the shared case-insensitive
@@ -182,6 +196,9 @@ func writeStageErr(w http.ResponseWriter, err error) {
 		errors.Is(err, errNonNumeric),
 		errors.Is(err, errUnknownAggregation),
 		errors.Is(err, errUnknownOperator),
+		errors.Is(err, errTypeIncompatible),
+		errors.Is(err, errUnknownCast),
+		errors.Is(err, errNonFiniteValue),
 		errors.Is(err, errUnsupportedFormat),
 		errors.Is(err, errObjectTooLarge):
 		writeErr(w, http.StatusBadRequest, err.Error())

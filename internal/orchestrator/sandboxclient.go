@@ -56,16 +56,22 @@ type IntrospectResponse struct {
 }
 
 // ExecuteRequest measures one aggregate over a data source under hard-constraint
-// filters.
+// filters. ValueExpression, when set, is the objective value expression measured
+// in place of the bare Target; ObjectiveLabel is the key the measured value is
+// returned under. Both are omitempty so the legacy field-keyed request is
+// unchanged.
 type ExecuteRequest struct {
-	DataSourceRef string                  `json:"data_source_ref"`
-	Type          domain.InterventionType `json:"type"`
-	Aggregation   string                  `json:"aggregation"`
-	Target        domain.Target           `json:"target"`
-	Filters       []domain.Constraint     `json:"filters"`
+	DataSourceRef   string                  `json:"data_source_ref"`
+	Type            domain.InterventionType `json:"type"`
+	Aggregation     string                  `json:"aggregation"`
+	Target          domain.Target           `json:"target"`
+	ValueExpression *domain.Expression      `json:"value_expression,omitempty"`
+	ObjectiveLabel  string                  `json:"objective_label,omitempty"`
+	Filters         []domain.Constraint     `json:"filters"`
 }
 
-// ExecuteResponse carries the single measured aggregate keyed by target field.
+// ExecuteResponse carries the single measured aggregate keyed by the request's
+// objective label when set, falling back to the target field for the legacy path.
 type ExecuteResponse struct {
 	Value map[string]any `json:"value"`
 }

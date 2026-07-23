@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -106,7 +107,7 @@ func TestIntrospectAndExecute(t *testing.T) {
 
 			// avg(amount) where qty > 1 -> avg(20, 30) = 25.
 			gt := []domain.Constraint{{Field: "qty", Op: domain.GreaterThan, Value: 1}}
-			value, err := src.Execute(ctx, "avg", domain.Target{Field: "amount"}, gt)
+			value, err := src.Execute(ctx, "avg", domain.Target{Field: "amount"}, nil, gt)
 			if err != nil {
 				t.Fatalf("execute avg: %v", err)
 			}
@@ -116,14 +117,14 @@ func TestIntrospectAndExecute(t *testing.T) {
 
 			// Empty set: avg -> nil (SQL NULL), count -> 0.
 			none := []domain.Constraint{{Field: "qty", Op: domain.GreaterThan, Value: 100}}
-			emptyAvg, err := src.Execute(ctx, "avg", domain.Target{Field: "amount"}, none)
+			emptyAvg, err := src.Execute(ctx, "avg", domain.Target{Field: "amount"}, nil, none)
 			if err != nil {
 				t.Fatalf("execute empty avg: %v", err)
 			}
 			if emptyAvg != nil {
 				t.Fatalf("expected nil avg over empty set, got %v", *emptyAvg)
 			}
-			emptyCount, err := src.Execute(ctx, "count", domain.Target{Field: "amount"}, none)
+			emptyCount, err := src.Execute(ctx, "count", domain.Target{Field: "amount"}, nil, none)
 			if err != nil {
 				t.Fatalf("execute empty count: %v", err)
 			}
@@ -197,6 +198,100 @@ func TestServerEndpoints(t *testing.T) {
 	}
 }
 
+// exprCSV has a boolean and a categorical column so the expression path can be
+// measured end to end against a real DuckDB engine.
+const exprCSV = "flag,name,amount,qty\ntrue,gold,10.0,1\nfalse,silver,20.0,2\ntrue,gold,30.0,3\n"
+
+func TestExecuteExpression(t *testing.T) {
+	ctx := context.Background()
+	client := newTestClient(t, ctx)
+	ref := putObject(t, ctx, client, ".csv", []byte(exprCSV))
+	src := NewFileSource(client, ref, 1<<20, "1GiB")
+
+	// avg over a boolean column: (1 + 0 + 1) / 3.
+	v, err := src.Execute(ctx, "avg", domain.Target{}, ptrExpr(col("flag")), nil)
+	if err != nil {
+		t.Fatalf("execute boolean avg: %v", err)
+	}
+	if v == nil || math.Abs(*v-2.0/3.0) > 1e-9 {
+		t.Fatalf("expected boolean rate 0.667, got %v", v)
+	}
+
+	// avg over a categorical indicator name = 'gold': (1 + 0 + 1) / 3.
+	catExpr := cmp("=", col("name"), strLit("gold"))
+	v, err = src.Execute(ctx, "avg", domain.Target{}, &catExpr, nil)
+	if err != nil {
+		t.Fatalf("execute categorical avg: %v", err)
+	}
+	if v == nil || math.Abs(*v-2.0/3.0) > 1e-9 {
+		t.Fatalf("expected categorical rate 0.667, got %v", v)
+	}
+
+	// Division by zero yields +Inf, which the non-finite guard rejects.
+	divExpr := domain.Expression{Kind: domain.ArithmeticKind, Op: "/",
+		Left:  ptrExpr(col("amount")),
+		Right: ptrExpr(numLit(0))}
+	if _, err := src.Execute(ctx, "sum", domain.Target{}, &divExpr, nil); !errors.Is(err, errNonFiniteValue) {
+		t.Fatalf("expected errNonFiniteValue for divide-by-zero, got %v", err)
+	}
+}
+
+// TestExecuteLegacyNonFinite proves the guard covers the legacy path too: a source
+// DOUBLE column containing inf makes avg non-finite with no expression involved.
+func TestExecuteLegacyNonFinite(t *testing.T) {
+	ctx := context.Background()
+	client := newTestClient(t, ctx)
+	ref := putObject(t, ctx, client, ".csv", []byte("val\n1.0\ninf\n3.0\n"))
+	src := NewFileSource(client, ref, 1<<20, "1GiB")
+	if _, err := src.Execute(ctx, "avg", domain.Target{Field: "val"}, nil, nil); !errors.Is(err, errNonFiniteValue) {
+		t.Fatalf("expected errNonFiniteValue for legacy avg over inf column, got %v", err)
+	}
+}
+
+// TestServerExecuteExpression exercises the HTTP contract: a value expression is
+// measured and returned keyed by the objective label, and an expression naming an
+// unknown column surfaces as a descriptive 400.
+func TestServerExecuteExpression(t *testing.T) {
+	ctx := context.Background()
+	client := newTestClient(t, ctx)
+	ref := putObject(t, ctx, client, ".csv", []byte(exprCSV))
+
+	ts := httptest.NewServer(NewServer(client, 1<<20, "1GiB").Routes())
+	defer ts.Close()
+
+	post := func(t *testing.T, body string) (int, map[string]any) {
+		t.Helper()
+		resp, err := http.Post(ts.URL+"/execute", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post /execute: %v", err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode /execute: %v", err)
+		}
+		return resp.StatusCode, out
+	}
+
+	code, out := post(t, `{"data_source_ref":"`+ref+`","aggregation":"avg","value_expression":{"kind":"column_ref","column":"flag"},"objective_label":"avg(flag)"}`)
+	if code != http.StatusOK {
+		t.Fatalf("execute status %d: %v", code, out)
+	}
+	value, _ := out["value"].(map[string]any)
+	got, ok := value["avg(flag)"].(float64)
+	if !ok || math.Abs(got-2.0/3.0) > 1e-9 {
+		t.Fatalf("expected value keyed by label 'avg(flag)' ~0.667, got %v", value)
+	}
+
+	code, out = post(t, `{"data_source_ref":"`+ref+`","aggregation":"avg","value_expression":{"kind":"column_ref","column":"ghost"},"objective_label":"avg(ghost)"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown column, got %d: %v", code, out)
+	}
+	if _, ok := out["error"].(string); !ok {
+		t.Fatalf("expected descriptive error body, got %v", out)
+	}
+}
+
 func TestOverLimitRejected(t *testing.T) {
 	ctx := context.Background()
 	client := newTestClient(t, ctx)
@@ -220,7 +315,7 @@ func TestTempDirCleanup(t *testing.T) {
 		t.Fatalf("introspect: %v", err)
 	}
 	// A forced error after staging (invalid aggregation) must still clean up.
-	if _, err := src.Execute(ctx, "median", domain.Target{Field: "amount"}, nil); err == nil {
+	if _, err := src.Execute(ctx, "median", domain.Target{Field: "amount"}, nil, nil); err == nil {
 		t.Fatalf("expected error for invalid aggregation")
 	}
 

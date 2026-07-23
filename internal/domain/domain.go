@@ -3,6 +3,11 @@
 // use it without pulling in graph, storage, or embedding concerns.
 package domain
 
+import (
+	"strconv"
+	"strings"
+)
+
 // InterventionType discriminates how an intervention is evaluated against a
 // data source: a deterministic tabular query or a document extraction task.
 type InterventionType string
@@ -99,10 +104,141 @@ const (
 	Minimize TargetDirection = "minimize"
 )
 
-// Target is a single optimization objective bound to a data-source field.
+// Target is a single optimization objective. Aggregation and Value let an
+// objective measure a structured expression rather than a bare column; both are
+// omitempty so a field-only target deserializes unchanged and re-marshals
+// identically (rows persisted as {field, direction} round-trip).
 type Target struct {
-	Field     string          `json:"field"`
-	Direction TargetDirection `json:"direction"`
+	Field       string          `json:"field"`
+	Direction   TargetDirection `json:"direction"`
+	Aggregation string          `json:"aggregation,omitempty"`
+	Value       *Expression     `json:"value,omitempty"`
+}
+
+// ValueExpression resolves the target's measured value expression. A target
+// carrying an explicit Value uses it; a legacy field-only target degenerates to a
+// bare ColumnRef over Field. Routing both forms through one accessor keeps the
+// legacy row untouched on disk (no custom UnmarshalJSON rewriting it) while giving
+// the compiler a uniform Expression to consume.
+func (t Target) ValueExpression() Expression {
+	if t.Value != nil {
+		return *t.Value
+	}
+	return Expression{Kind: ColumnRefKind, Column: t.Field}
+}
+
+// ExpressionKind discriminates the node type of an objective value Expression.
+type ExpressionKind string
+
+const (
+	ColumnRefKind  ExpressionKind = "column_ref"
+	LiteralKind    ExpressionKind = "literal"
+	CastKind       ExpressionKind = "cast"
+	ComparisonKind ExpressionKind = "comparison"
+	ArithmeticKind ExpressionKind = "arithmetic"
+	CaseKind       ExpressionKind = "case"
+)
+
+// LiteralValue is the typed scalar carried by a LiteralKind Expression. Exactly
+// one field is set; the set field is both the compiler's coarse-type signal and
+// the value bound as a parameter, so a literal never reaches SQL uninterpreted.
+type LiteralValue struct {
+	Number *float64 `json:"number,omitempty"`
+	String *string  `json:"string,omitempty"`
+	Bool   *bool    `json:"bool,omitempty"`
+}
+
+// CaseBranch is one WHEN/THEN arm of a CaseKind Expression.
+type CaseBranch struct {
+	When *Expression `json:"when"`
+	Then *Expression `json:"then"`
+}
+
+// Expression is the objective value-expression AST: a discriminated union over
+// ExpressionKind, represented as one flat "fat node" so stdlib encoding/json
+// (un)marshals it without a custom marshaler -- Kind selects which omitempty
+// fields are populated. A bare ColumnRef is the degenerate "measure this column"
+// objective; the other kinds express a computed value (a boolean/categorical
+// indicator, a rate, a bucket) that no single column name describes. The Sandbox
+// compiles it to a DuckDB SQL expression; the model never emits raw SQL.
+type Expression struct {
+	Kind ExpressionKind `json:"kind"`
+
+	// ColumnRef
+	Column string `json:"column,omitempty"`
+	// Literal
+	Literal *LiteralValue `json:"literal,omitempty"`
+	// Cast
+	Operand  *Expression `json:"operand,omitempty"`
+	CastType string      `json:"cast_type,omitempty"`
+	// Comparison / Arithmetic
+	Op    string      `json:"op,omitempty"`
+	Left  *Expression `json:"left,omitempty"`
+	Right *Expression `json:"right,omitempty"`
+	// Case
+	Cases []CaseBranch `json:"cases,omitempty"`
+	Else  *Expression  `json:"else,omitempty"`
+}
+
+// RenderObjectiveLabel derives the human-readable key an objective is carried
+// under end to end. A compiled expression has no single column name, so the
+// aggregation and expression render into one stable string (e.g.
+// "avg(Transported = True)") that keys the execute request and its response
+// value. Deterministic and dependency-free so the orchestrator (CGO-free) and the
+// sandbox derive the same label.
+func RenderObjectiveLabel(agg string, expr Expression) string {
+	return agg + "(" + renderExpr(expr) + ")"
+}
+
+func renderExpr(e Expression) string {
+	switch e.Kind {
+	case ColumnRefKind:
+		return e.Column
+	case LiteralKind:
+		return renderLiteral(e.Literal)
+	case CastKind:
+		return renderChild(e.Operand) + "::" + e.CastType
+	case ComparisonKind, ArithmeticKind:
+		return renderChild(e.Left) + " " + e.Op + " " + renderChild(e.Right)
+	case CaseKind:
+		var b strings.Builder
+		b.WriteString("CASE")
+		for _, br := range e.Cases {
+			b.WriteString(" WHEN " + renderChild(br.When) + " THEN " + renderChild(br.Then))
+		}
+		if e.Else != nil {
+			b.WriteString(" ELSE " + renderChild(e.Else))
+		}
+		b.WriteString(" END")
+		return b.String()
+	default:
+		return ""
+	}
+}
+
+func renderChild(e *Expression) string {
+	if e == nil {
+		return ""
+	}
+	return renderExpr(*e)
+}
+
+func renderLiteral(l *LiteralValue) string {
+	switch {
+	case l == nil:
+		return ""
+	case l.Number != nil:
+		return strconv.FormatFloat(*l.Number, 'g', -1, 64)
+	case l.String != nil:
+		return *l.String
+	case l.Bool != nil:
+		if *l.Bool {
+			return "True"
+		}
+		return "False"
+	default:
+		return ""
+	}
 }
 
 // ConstraintOp expresses a hard-constraint boundary comparison.
