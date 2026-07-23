@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -53,17 +54,27 @@ func thinkingBlockJSON(text string) map[string]any {
 }
 
 func TestGenerateEvaluationMatrix(t *testing.T) {
-	body := `{"targets":[{"field":"revenue","direction":"maximize"}],` +
+	// A boolean/categorical objective is fitted as an aggregation over a
+	// comparison indicator, which must round-trip into the AST.
+	body := `{"targets":[{"field":"revenue","direction":"maximize","aggregation":"avg",` +
+		`"value":{"kind":"comparison","op":"=",` +
+		`"left":{"kind":"column_ref","column":"revenue"},` +
+		`"right":{"kind":"literal","literal":{"number":100}}}}],` +
 		`"constraints":[{"field":"cost","op":"lte","value":100}]}`
 	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
 	c := &Client{messages: fake, model: "test-model"}
 
-	matrix, err := c.GenerateEvaluationMatrix(context.Background(), "grow revenue without overspending")
+	schema := SandboxSchema{Columns: []SandboxColumn{{Name: "revenue", Type: "DOUBLE"}, {Name: "cost", Type: "DOUBLE"}}}
+	matrix, err := c.GenerateEvaluationMatrix(context.Background(), "grow revenue without overspending", schema)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(matrix.Targets) != 1 || matrix.Targets[0].Field != "revenue" || matrix.Targets[0].Direction != domain.Maximize {
+	if len(matrix.Targets) != 1 || matrix.Targets[0].Direction != domain.Maximize || matrix.Targets[0].Aggregation != "avg" {
 		t.Fatalf("unexpected targets: %+v", matrix.Targets)
+	}
+	expr := matrix.Targets[0].ValueExpression()
+	if expr.Kind != domain.ComparisonKind || expr.Op != "=" || expr.Left == nil || expr.Left.Column != "revenue" {
+		t.Fatalf("value expression did not round-trip into a comparison: %+v", expr)
 	}
 	if len(matrix.Constraints) != 1 || matrix.Constraints[0].Field != "cost" || matrix.Constraints[0].Op != domain.LessThanOrEqual || matrix.Constraints[0].Value != 100 {
 		t.Fatalf("unexpected constraints: %+v", matrix.Constraints)
@@ -78,14 +89,15 @@ func TestGenerateEvaluationMatrix(t *testing.T) {
 }
 
 func TestGenerateEvaluationMatrixSkipsLeadingThinkingBlock(t *testing.T) {
-	body := `{"targets":[{"field":"latency","direction":"minimize"}],"constraints":[]}`
+	body := `{"targets":[{"field":"latency","direction":"minimize","aggregation":"avg",` +
+		`"value":{"kind":"column_ref","column":"latency"}}],"constraints":[]}`
 	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn,
 		thinkingBlockJSON("considering the goal"),
 		textBlockJSON(body),
 	)}
 	c := &Client{messages: fake, model: "test-model"}
 
-	matrix, err := c.GenerateEvaluationMatrix(context.Background(), "cut latency")
+	matrix, err := c.GenerateEvaluationMatrix(context.Background(), "cut latency", SandboxSchema{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -94,21 +106,42 @@ func TestGenerateEvaluationMatrixSkipsLeadingThinkingBlock(t *testing.T) {
 	}
 }
 
+func TestRepairEvaluationMatrix(t *testing.T) {
+	body := `{"targets":[{"field":"revenue","direction":"maximize","aggregation":"sum",` +
+		`"value":{"kind":"column_ref","column":"revenue"}}],"constraints":[]}`
+	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
+	c := &Client{messages: fake, model: "test-model"}
+
+	prior := domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}}
+	schema := SandboxSchema{Columns: []SandboxColumn{{Name: "revenue", Type: "DOUBLE"}}}
+	matrix, err := c.RepairEvaluationMatrix(context.Background(), "grow revenue", schema, prior, "numeric aggregation over non-numeric column")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if matrix.Targets[0].Aggregation != "sum" {
+		t.Fatalf("expected the repaired matrix, got %+v", matrix.Targets)
+	}
+	// The repair prompt must embed the prior fitted matrix and the sandbox error.
+	user := fake.got.Messages[0].Content[0].OfText.Text
+	if !strings.Contains(user, `"aggregation":"avg"`) {
+		t.Fatalf("repair prompt did not embed the prior matrix: %q", user)
+	}
+	if !strings.Contains(user, "numeric aggregation over non-numeric column") {
+		t.Fatalf("repair prompt did not embed the validation error: %q", user)
+	}
+}
+
 func TestProposeInterventionTreeRoot(t *testing.T) {
-	body := `{"objective_aggregation":"sum","objective_field":"revenue",` +
-		`"candidates":[{"filters":[{"field":"region","op":"gte","value":1}]},{"filters":[]}]}`
+	body := `{"candidates":[{"filters":[{"field":"region","op":"gte","value":1}]},{"filters":[]}]}`
 	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
 	c := &Client{messages: fake, model: "test-model"}
 
 	schema := SandboxSchema{Columns: []SandboxColumn{{Name: "revenue", Type: "DOUBLE"}, {Name: "region", Type: "BIGINT"}}}
 	proposal, err := c.ProposeInterventionTree(context.Background(), "grow revenue",
-		domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize}}},
+		domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "sum"}}},
 		schema, TreeContext{IsRoot: true, Breadth: 3})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if proposal.ObjectiveAggregation != "sum" || proposal.ObjectiveField != "revenue" {
-		t.Fatalf("unexpected objective: %+v", proposal)
 	}
 	if len(proposal.Candidates) != 2 {
 		t.Fatalf("expected 2 candidates, got %d", len(proposal.Candidates))
@@ -131,7 +164,7 @@ func TestCompleteMapsStopReasons(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeMessages{resp: message(t, tc.stop)}
 			c := &Client{messages: fake, model: "test-model"}
-			if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal"); !errors.Is(err, tc.want) {
+			if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}); !errors.Is(err, tc.want) {
 				t.Fatalf("error = %v, want wrapped %v", err, tc.want)
 			}
 		})
@@ -141,7 +174,7 @@ func TestCompleteMapsStopReasons(t *testing.T) {
 func TestGenerateEvaluationMatrixPropagatesRequestError(t *testing.T) {
 	fake := &fakeMessages{err: errors.New("boom")}
 	c := &Client{messages: fake, model: "test-model"}
-	if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal"); err == nil {
+	if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}); err == nil {
 		t.Fatalf("expected an error when the request fails")
 	}
 }

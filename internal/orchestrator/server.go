@@ -41,7 +41,8 @@ const (
 // claudeClient is the two structured-output Claude calls the loop needs, named
 // for the collaborator (the `claude` field) rather than either single method.
 type claudeClient interface {
-	GenerateEvaluationMatrix(ctx context.Context, goalText string) (domain.EvaluationMatrix, error)
+	GenerateEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema) (domain.EvaluationMatrix, error)
+	RepairEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema, prior domain.EvaluationMatrix, validationErr string) (domain.EvaluationMatrix, error)
 	ProposeInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema llm.SandboxSchema, node llm.TreeContext) (llm.Proposal, error)
 }
 

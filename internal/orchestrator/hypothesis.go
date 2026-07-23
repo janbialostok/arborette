@@ -15,7 +15,11 @@ import (
 	"github.com/arborette/arborette/internal/store"
 )
 
-var errNonNumericValue = errors.New("sandbox returned a non-numeric objective value")
+var (
+	errNonNumericValue    = errors.New("sandbox returned a non-numeric objective value")
+	errNoObjective        = errors.New("evaluation matrix has no target to pin as the objective")
+	errMissingAggregation = errors.New("evaluation matrix target carries no aggregation; re-register the goal to fit a measurable objective")
+)
 
 // loopTimeout bounds a whole hypothesis run. The loop runs on a background
 // context (decoupled from the SSE stream), so without a deadline a wedged
@@ -23,12 +27,14 @@ var errNonNumericValue = errors.New("sandbox returned a non-numeric objective va
 const loopTimeout = 10 * time.Minute
 
 // objective is the run's fixed measurement, held constant across the whole tree:
-// one aggregation over one target field, with the direction that decides what
-// "improvement" means. Pinning it once is what makes the stop-on-no-improvement
+// one aggregation over one value expression, with the direction that decides what
+// "improvement" means. label is the rendered key the measured value is carried
+// under end to end. Pinning it once is what makes the stop-on-no-improvement
 // comparison meaningful — every value compared is the same measurement.
 type objective struct {
 	aggregation string
-	field       string
+	expr        domain.Expression
+	label       string
 	direction   domain.TargetDirection
 }
 
@@ -57,10 +63,14 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal) {
 		s.hub.Complete(id)
 	}()
 
-	introspect, err := s.sandbox.Introspect(ctx, IntrospectRequest{
-		DataSourceRef: goal.DataSourceRef,
-		Targets:       goal.EvaluationMatrix.Targets,
-	})
+	obj, err := pinObjective(goal.EvaluationMatrix)
+	if err != nil {
+		log.Printf("orchestrator: hypothesis loop %q: pin objective: %v", id, err)
+		s.branchFailure(ctx, id, nil, err)
+		return
+	}
+
+	introspect, err := s.sandbox.Introspect(ctx, IntrospectRequest{DataSourceRef: goal.DataSourceRef})
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: introspect: %v", id, err)
 		s.branchFailure(ctx, id, nil, err)
@@ -75,23 +85,16 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal) {
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
-	obj := pinObjective(root, goal.EvaluationMatrix)
 
 	// Root baseline: the objective measured with no filters. Deeper baselines
 	// reuse the parent's outcome value (cumulative nesting makes that valid).
-	baseResp, err := s.sandbox.Execute(ctx, ExecuteRequest{
-		DataSourceRef: goal.DataSourceRef,
-		Type:          domain.InterventionQuery,
-		Aggregation:   obj.aggregation,
-		Target:        domain.Target{Field: obj.field, Direction: obj.direction},
-		Filters:       nil,
-	})
+	baseResp, err := s.sandbox.Execute(ctx, executeRequestFor(goal, obj, nil))
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: root baseline: %v", id, err)
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
-	baseline, ok := numericValue(baseResp.Value, obj.field)
+	baseline, ok := numericValue(baseResp.Value, obj.label)
 	if !ok {
 		s.branchFailure(ctx, id, nil, errNonNumericValue)
 		return
@@ -110,18 +113,12 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 	id := goal.OptimizationFunctionID
 	effective := concatFilters(parentFilters, cand.Filters)
 
-	resp, err := s.sandbox.Execute(ctx, ExecuteRequest{
-		DataSourceRef: goal.DataSourceRef,
-		Type:          domain.InterventionQuery,
-		Aggregation:   obj.aggregation,
-		Target:        domain.Target{Field: obj.field, Direction: obj.direction},
-		Filters:       effective,
-	})
+	resp, err := s.sandbox.Execute(ctx, executeRequestFor(goal, obj, effective))
 	if err != nil {
 		s.branchFailure(ctx, id, effective, err)
 		return
 	}
-	value, ok := numericValue(resp.Value, obj.field)
+	value, ok := numericValue(resp.Value, obj.label)
 	if !ok {
 		s.branchFailure(ctx, id, effective, errNonNumericValue)
 		return
@@ -136,7 +133,7 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 	if !improves(baseline, value, obj.direction) {
 		return
 	}
-	if !constraintsSatisfied(goal.EvaluationMatrix.Constraints, obj.field, value) {
+	if !constraintsSatisfied(goal.EvaluationMatrix.Constraints, objectiveField(obj), value) {
 		s.branchFailure(ctx, id, effective, errors.New("candidate violates a hard constraint on the objective field"))
 		return
 	}
@@ -145,12 +142,11 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 	}
 
 	child, err := s.claude.ProposeInterventionTree(ctx, goal.GoalText, goal.EvaluationMatrix, schema, llm.TreeContext{
-		Breadth:              defaultBreadth,
-		ObjectiveField:       obj.field,
-		ObjectiveAggregation: obj.aggregation,
-		Direction:            obj.direction,
-		ParentFilters:        effective,
-		PriorValue:           &value,
+		Breadth:        defaultBreadth,
+		ObjectiveLabel: obj.label,
+		Direction:      obj.direction,
+		ParentFilters:  effective,
+		PriorValue:     &value,
 	})
 	if err != nil {
 		s.branchFailure(ctx, id, effective, err)
@@ -170,7 +166,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 	state := domain.State{ID: stateID, Properties: map[string]any{
 		"data_source_ref":       goal.DataSourceRef,
 		"objective_aggregation": obj.aggregation,
-		"objective_field":       obj.field,
+		"objective_label":       obj.label,
 		"effective_filters":     parentFilters,
 		"value":                 baseline,
 	}}
@@ -181,7 +177,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 	interventionID := uuid.NewString()
 	intervention := domain.Intervention{ID: interventionID, Type: domain.InterventionQuery, Properties: map[string]any{
 		"objective_aggregation": obj.aggregation,
-		"objective_field":       obj.field,
+		"objective_label":       obj.label,
 		"new_filters":           cand.Filters,
 		"effective_filters":     effective,
 	}}
@@ -190,7 +186,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 	}
 
 	outcomeID := uuid.NewString()
-	outcome := domain.Outcome{ID: outcomeID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{obj.field: value}}
+	outcome := domain.Outcome{ID: outcomeID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{obj.label: value}}
 	if err := s.repo.CreateOutcome(ctx, outcome); err != nil {
 		return err
 	}
@@ -242,26 +238,76 @@ func (s *Server) branchFailure(ctx context.Context, id string, filters []domain.
 	s.hub.Publish(id, Event{Type: "branch_failure", Payload: map[string]any{"error": cause.Error()}})
 }
 
-// pinObjective fixes the run's objective from the root proposal, falling back to
-// the Evaluation Matrix's first target and a count aggregation when the model
-// does not choose. Targets is unordered, so the run pins one field once.
-func pinObjective(root llm.Proposal, matrix domain.EvaluationMatrix) objective {
-	field := root.ObjectiveField
-	if field == "" && len(matrix.Targets) > 0 {
-		field = matrix.Targets[0].Field
+// pinObjective fixes the run's objective from the Evaluation Matrix's first
+// target: the aggregation, value expression, direction, and rendered label the
+// whole tree measures against. A matrix with no target, or a legacy target with
+// no aggregation, is a terminal failure directing re-registration — there is no
+// count fallback, because a silently-substituted aggregation would mis-measure.
+func pinObjective(matrix domain.EvaluationMatrix) (objective, error) {
+	if len(matrix.Targets) == 0 {
+		return objective{}, errNoObjective
 	}
-	agg := root.ObjectiveAggregation
-	if !domain.IsAggregation(agg) {
-		agg = "count"
+	t := matrix.Targets[0]
+	if t.Aggregation == "" {
+		return objective{}, errMissingAggregation
 	}
-	direction := domain.Maximize
-	for _, t := range matrix.Targets {
-		if t.Field == field {
-			direction = t.Direction
-			break
-		}
+	expr := t.ValueExpression()
+	return objective{
+		aggregation: t.Aggregation,
+		expr:        expr,
+		label:       domain.RenderObjectiveLabel(t.Aggregation, expr),
+		direction:   t.Direction,
+	}, nil
+}
+
+// executeRequestFor builds the execute request measuring the pinned objective
+// under filters, shared so every call site pins the objective identically.
+func executeRequestFor(goal store.Goal, obj objective, filters []domain.Constraint) ExecuteRequest {
+	return ExecuteRequest{
+		DataSourceRef:   goal.DataSourceRef,
+		Type:            domain.InterventionQuery,
+		Aggregation:     obj.aggregation,
+		Target:          domain.Target{Direction: obj.direction},
+		ValueExpression: &obj.expr,
+		ObjectiveLabel:  obj.label,
+		Filters:         filters,
 	}
-	return objective{aggregation: agg, field: field, direction: direction}
+}
+
+// dryRunObjective validates a fitted matrix by executing its pinned objective
+// against the sandbox with no filters — the same request the root baseline runs,
+// pinned identically. A nil return means the objective compiles and measures; a
+// non-nil error is either a pin failure or the sandbox's execute error.
+func (s *Server) dryRunObjective(ctx context.Context, ref string, matrix domain.EvaluationMatrix) error {
+	obj, err := pinObjective(matrix)
+	if err != nil {
+		return err
+	}
+	_, err = s.sandbox.Execute(ctx, executeRequestFor(store.Goal{DataSourceRef: ref}, obj, nil))
+	return err
+}
+
+// isObjectiveValidationFailure reports whether a dry-run error is a repairable
+// objective-fit failure: a missing/absent aggregation the model can supply, or a
+// sandbox 400 compile/type error. A sandbox 4xx≠400, 5xx, or transport error is a
+// fault, not an unfixable objective.
+func isObjectiveValidationFailure(err error) bool {
+	if errors.Is(err, errNoObjective) || errors.Is(err, errMissingAggregation) {
+		return true
+	}
+	var se *SandboxError
+	return errors.As(err, &se) && se.Status == http.StatusBadRequest
+}
+
+// objectiveField is the constraint field a hard constraint can be checked
+// against: the objective's column only when it is a bare ColumnRef. A compound
+// expression has no single column, so it yields "" and matches no constraint
+// (expression-based constraints are deferred).
+func objectiveField(obj objective) string {
+	if obj.expr.Kind == domain.ColumnRefKind {
+		return obj.expr.Column
+	}
+	return ""
 }
 
 // improves reports whether value moves the objective in the desired direction
@@ -303,10 +349,10 @@ func constraintsSatisfied(constraints []domain.Constraint, field string, value f
 	return true
 }
 
-// numericValue extracts the objective value keyed by field. A nil value (an
-// empty aggregate) or a non-number is not usable.
-func numericValue(value map[string]any, field string) (float64, bool) {
-	raw, ok := value[field]
+// numericValue extracts the objective value keyed by the objective label. A nil
+// value (an empty aggregate) or a non-number is not usable.
+func numericValue(value map[string]any, label string) (float64, bool) {
+	raw, ok := value[label]
 	if !ok || raw == nil {
 		return 0, false
 	}

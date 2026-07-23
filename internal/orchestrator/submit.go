@@ -32,10 +32,12 @@ var (
 	errNoImportDir = errors.New("on-disk import is not configured")
 )
 
-// handleSubmitGoal registers an analyst goal: it ingests the data source into
-// the object store, generates the Evaluation Matrix from the goal text, validates
-// the target→column bindings, persists the goal, and audits the submission. It
-// does not start Phase 1 — the hypothesis loop is a separate explicit trigger.
+// handleSubmitGoal registers an analyst goal: it ingests the data source into the
+// object store, introspects the source as a precondition, fits the Evaluation
+// Matrix to that schema, validates the fitted objective by a dry-run against the
+// sandbox (with one schema-aware repair on a compile failure), then persists the
+// goal and audits the submission. It does not start Phase 1 — the hypothesis loop
+// is a separate explicit trigger.
 func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
@@ -55,24 +57,44 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	matrix, err := s.claude.GenerateEvaluationMatrix(ctx, goal)
+	// Introspect first, as a hard precondition: the schema fits the objective to
+	// real columns, and an unreadable/unsupported/missing source is surfaced now
+	// rather than at run time.
+	introspect, err := s.sandbox.Introspect(ctx, IntrospectRequest{DataSourceRef: ref})
+	if err != nil {
+		s.writeIntakeErr(w, err)
+		return
+	}
+	schema := toSandboxSchema(introspect.Schema)
+
+	matrix, err := s.claude.GenerateEvaluationMatrix(ctx, goal, schema)
 	if err != nil {
 		log.Printf("orchestrator: generate evaluation matrix: %v", err)
 		writeErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
 		return
 	}
 
-	// Validate target→column bindings at intake. Bindings are validate/log-only:
-	// there is no persistence path, and the sandbox re-resolves Target.Field at
-	// execute time. An introspection failure here is non-fatal.
-	if resp, ierr := s.sandbox.Introspect(ctx, IntrospectRequest{DataSourceRef: ref, Targets: matrix.Targets}); ierr == nil {
-		for _, b := range resp.TargetBindings {
-			if !b.Matched {
-				log.Printf("orchestrator: goal target %q has no matching column in %q", b.Target, ref)
-			}
+	// Validate the fitted objective by executing it against the sandbox with no
+	// filters (the exact request the root baseline will run). A sandbox fault
+	// (pre- or post-repair) is surfaced as-is, never labeled an unfixable objective.
+	verr := s.dryRunObjective(ctx, ref, matrix)
+	if isObjectiveValidationFailure(verr) {
+		repaired, rerr := s.claude.RepairEvaluationMatrix(ctx, goal, schema, matrix, verr.Error())
+		if rerr != nil {
+			log.Printf("orchestrator: repair evaluation matrix: %v", rerr)
+			writeErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
+			return
 		}
-	} else {
-		log.Printf("orchestrator: introspect validation for %q: %v", ref, ierr)
+		matrix = repaired
+		verr = s.dryRunObjective(ctx, ref, matrix)
+		if isObjectiveValidationFailure(verr) {
+			writeErr(w, http.StatusUnprocessableEntity, "could not fit the goal to the data source: "+verr.Error())
+			return
+		}
+	}
+	if verr != nil {
+		s.writeIntakeErr(w, verr)
+		return
 	}
 
 	optID := uuid.NewString()
@@ -171,6 +193,29 @@ func contentTypeForPath(path string) string {
 	default:
 		return "application/octet-stream"
 	}
+}
+
+// writeIntakeErr maps a sandbox intake error (introspection precondition or a
+// non-repairable dry-run outcome) to a status. A sandbox 400 is analyst-fixable
+// (unreadable/unsupported source; message surfaced), a 404 is a missing source,
+// and any 5xx or transport error is a sandbox fault surfaced as 502 — a masked
+// sandbox 500 must never read as an analyst-fixable 4xx.
+func (s *Server) writeIntakeErr(w http.ResponseWriter, err error) {
+	var se *SandboxError
+	if errors.As(err, &se) {
+		switch {
+		case se.Status == http.StatusBadRequest:
+			writeErr(w, http.StatusBadRequest, se.Message)
+		case se.Status == http.StatusNotFound:
+			writeErr(w, http.StatusNotFound, se.Message)
+		default:
+			log.Printf("orchestrator: sandbox fault during intake: %v", err)
+			writeErr(w, http.StatusBadGateway, "sandbox unavailable")
+		}
+		return
+	}
+	log.Printf("orchestrator: intake sandbox call: %v", err)
+	writeErr(w, http.StatusBadGateway, "sandbox unavailable")
 }
 
 // writeIngestErr maps an ingestion error to a status: validation and escape

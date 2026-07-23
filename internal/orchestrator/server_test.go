@@ -80,24 +80,102 @@ func (f *fakeHeur) Trace(_ context.Context, _ string) ([]graph.CausalTriplet, er
 }
 
 type fakeClaude struct {
-	matrix    domain.EvaluationMatrix
-	matrixErr error
+	matrix      domain.EvaluationMatrix
+	matrixErr   error
+	repair      domain.EvaluationMatrix
+	repairErr   error
+	repairCalls int
+	proposal    llm.Proposal
+	gotSchema   llm.SandboxSchema
+	gotNodes    []llm.TreeContext
 }
 
-func (f *fakeClaude) GenerateEvaluationMatrix(_ context.Context, _ string) (domain.EvaluationMatrix, error) {
+func (f *fakeClaude) GenerateEvaluationMatrix(_ context.Context, _ string, schema llm.SandboxSchema) (domain.EvaluationMatrix, error) {
+	f.gotSchema = schema
 	return f.matrix, f.matrixErr
 }
-func (f *fakeClaude) ProposeInterventionTree(_ context.Context, _ string, _ domain.EvaluationMatrix, _ llm.SandboxSchema, _ llm.TreeContext) (llm.Proposal, error) {
-	return llm.Proposal{}, nil
+func (f *fakeClaude) RepairEvaluationMatrix(_ context.Context, _ string, _ llm.SandboxSchema, _ domain.EvaluationMatrix, _ string) (domain.EvaluationMatrix, error) {
+	f.repairCalls++
+	return f.repair, f.repairErr
+}
+func (f *fakeClaude) ProposeInterventionTree(_ context.Context, _ string, _ domain.EvaluationMatrix, _ llm.SandboxSchema, node llm.TreeContext) (llm.Proposal, error) {
+	f.gotNodes = append(f.gotNodes, node)
+	return f.proposal, nil
 }
 
-type fakeSandbox struct{ introspect IntrospectResponse }
+// fakeRepo is a no-op graph.Repository that records the nodes writeTriplet
+// persists, so a loop test can assert the objective-label keying end to end.
+type fakeRepo struct {
+	states   []domain.State
+	outcomes []domain.Outcome
+}
+
+func (f *fakeRepo) CreateState(_ context.Context, s domain.State) error {
+	f.states = append(f.states, s)
+	return nil
+}
+func (f *fakeRepo) CreateIntervention(_ context.Context, _ domain.Intervention) error { return nil }
+func (f *fakeRepo) CreateOutcome(_ context.Context, o domain.Outcome) error {
+	f.outcomes = append(f.outcomes, o)
+	return nil
+}
+func (f *fakeRepo) GetState(_ context.Context, _ string) (domain.State, error) {
+	return domain.State{}, nil
+}
+func (f *fakeRepo) GetIntervention(_ context.Context, _ string) (domain.Intervention, error) {
+	return domain.Intervention{}, nil
+}
+func (f *fakeRepo) GetOutcome(_ context.Context, _ string) (domain.Outcome, error) {
+	return domain.Outcome{}, nil
+}
+func (f *fakeRepo) GetMetaHeuristic(_ context.Context, _ string) (domain.MetaHeuristic, error) {
+	return domain.MetaHeuristic{}, nil
+}
+func (f *fakeRepo) CreatePreConditionFor(_ context.Context, _, _ string) error { return nil }
+func (f *fakeRepo) CreateProduced(_ context.Context, _, _ string, _ domain.ProducedEdge) error {
+	return nil
+}
+func (f *fakeRepo) CreateMetaHeuristic(_ context.Context, _ domain.MetaHeuristic, _ []string) error {
+	return nil
+}
+func (f *fakeRepo) ClearEmbeddingPending(_ context.Context, _ string) error { return nil }
+func (f *fakeRepo) ListEmbeddingPending(_ context.Context) ([]domain.MetaHeuristic, error) {
+	return nil, nil
+}
+func (f *fakeRepo) UpdateOutcomeVerification(_ context.Context, _ string, _ domain.VerificationStatus, _ float64) error {
+	return nil
+}
+func (f *fakeRepo) TraceCausalChain(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
+	return nil, nil
+}
+
+// fakeSandbox scripts per-call Execute results so the intake dry-run and the loop
+// can be driven through their success and failure branches. Execute returns the
+// response/error at the current call index, defaulting to an empty 200 once the
+// script is exhausted.
+type fakeSandbox struct {
+	introspect    IntrospectResponse
+	introspectErr error
+	execResps     []ExecuteResponse
+	execErrs      []error
+	execCalls     int
+}
 
 func (f *fakeSandbox) Introspect(_ context.Context, _ IntrospectRequest) (IntrospectResponse, error) {
-	return f.introspect, nil
+	return f.introspect, f.introspectErr
 }
 func (f *fakeSandbox) Execute(_ context.Context, _ ExecuteRequest) (ExecuteResponse, error) {
-	return ExecuteResponse{}, nil
+	i := f.execCalls
+	f.execCalls++
+	var resp ExecuteResponse
+	if i < len(f.execResps) {
+		resp = f.execResps[i]
+	}
+	var err error
+	if i < len(f.execErrs) {
+		err = f.execErrs[i]
+	}
+	return resp, err
 }
 
 type fakeLauncher struct {
@@ -113,7 +191,13 @@ func (f *fakeLauncher) Launch(_ context.Context, jobName string, args map[string
 }
 
 func newTestServer(goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
-	return NewServer(nil, goals, audits, objects, heur, claude, sandbox,
+	return newTestServerRepo(nil, goals, audits, objects, heur, claude, sandbox)
+}
+
+// newTestServerRepo is newTestServer with an explicit graph.Repository, for loop
+// tests that assert the nodes writeTriplet persists.
+func newTestServerRepo(repo graph.Repository, goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
+	return NewServer(repo, goals, audits, objects, heur, claude, sandbox,
 		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, "", "arborette-sleepcycle")
 }
 
@@ -174,8 +258,13 @@ func TestSubmitGoalValidation(t *testing.T) {
 func TestSubmitGoalSuccess(t *testing.T) {
 	goals := &fakeGoals{}
 	audits := &fakeAudits{}
-	claude := &fakeClaude{matrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize}}}}
-	sandbox := &fakeSandbox{introspect: IntrospectResponse{TargetBindings: []TargetBinding{{Target: "revenue", Column: "revenue", Matched: true}}}}
+	// A fitted matrix carries an aggregation; the objective degenerates to a bare
+	// ColumnRef over the field, so the dry-run pins and measures avg(revenue).
+	claude := &fakeClaude{matrix: fittedMatrix()}
+	sandbox := &fakeSandbox{
+		introspect: revenueSchema(),
+		execResps:  []ExecuteResponse{{Value: map[string]any{"avg(revenue)": 10.0}}},
+	}
 	srv := newTestServer(goals, audits, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
 
 	body, contentType := multipartBody(t, map[string]string{"goal": "grow revenue"}, "file", "data.csv", "revenue\n10\n")
@@ -201,6 +290,13 @@ func TestSubmitGoalSuccess(t *testing.T) {
 	}
 	if len(audits.records) != 1 || audits.records[0].Actor != "analyst-test" {
 		t.Fatalf("expected one audit record stamped with the stub identity: %+v", audits.records)
+	}
+	// The introspected schema is fitted to the objective, not the goal text alone.
+	if len(claude.gotSchema.Columns) != 1 || claude.gotSchema.Columns[0].Name != "revenue" {
+		t.Fatalf("matrix generation was not given the introspected schema: %+v", claude.gotSchema)
+	}
+	if claude.repairCalls != 0 {
+		t.Fatalf("a valid objective must not trigger repair, got %d calls", claude.repairCalls)
 	}
 }
 

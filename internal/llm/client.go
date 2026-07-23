@@ -54,13 +54,15 @@ func NewClient(apiKey, model string) *Client {
 	return &Client{messages: &sdk.Messages, model: anthropic.Model(model)}
 }
 
-// GenerateEvaluationMatrix translates an analyst's plain-English goal into the
-// structured Evaluation Matrix, from the goal text alone (introspection is a
-// separate validation step). The response is constrained to the matrix schema
-// and unmarshalled straight into domain.EvaluationMatrix's json shape.
-func (c *Client) GenerateEvaluationMatrix(ctx context.Context, goalText string) (domain.EvaluationMatrix, error) {
-	body, err := c.complete(ctx, anthropic.OutputConfigEffortHigh, evaluationMatrixSchema(),
-		evaluationMatrixSystem, "Analyst goal:\n"+goalText)
+// GenerateEvaluationMatrix fits an analyst's plain-English goal to the data
+// source's schema, resolving the objective to real columns and expressing it as
+// a structured aggregation + value expression + direction per target. The
+// response is constrained to the schema-aware matrix schema and unmarshalled
+// straight into domain.EvaluationMatrix's json shape.
+func (c *Client) GenerateEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema) (domain.EvaluationMatrix, error) {
+	user := "Analyst goal:\n" + goalText + "\n\nAvailable columns:\n" + columnSummary(schema)
+	body, err := c.complete(ctx, anthropic.OutputConfigEffortHigh, evaluationMatrixSchema(schema),
+		evaluationMatrixSystem, user)
 	if err != nil {
 		return domain.EvaluationMatrix{}, err
 	}
@@ -71,18 +73,37 @@ func (c *Client) GenerateEvaluationMatrix(ctx context.Context, goalText string) 
 	return matrix, nil
 }
 
-// ProposeInterventionTree proposes one node of the hypothesis tree. At the root
-// it also pins the run's fixed objective (aggregation + target field); at deeper
-// nodes it re-proposes filters only, against the pinned objective and the
-// parent's cumulative filter set. Candidate filters and the objective target are
-// constrained to the introspected columns, and the aggregation to the Sandbox's
-// allowlist.
-func (c *Client) ProposeInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) (Proposal, error) {
-	objectiveFields := make([]string, 0, len(matrix.Targets))
-	for _, t := range matrix.Targets {
-		objectiveFields = append(objectiveFields, t.Field)
+// RepairEvaluationMatrix re-fits the objective after the fitted matrix failed the
+// Sandbox's dry-run validation: it re-generates the matrix with the prior fitted
+// matrix and the Sandbox's exact validation error in the prompt, so the model can
+// correct the specific incompatibility. One attempt only.
+func (c *Client) RepairEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema, prior domain.EvaluationMatrix, validationErr string) (domain.EvaluationMatrix, error) {
+	priorJSON, err := json.Marshal(prior)
+	if err != nil {
+		return domain.EvaluationMatrix{}, fmt.Errorf("marshal prior matrix: %w", err)
 	}
-	body, err := c.complete(ctx, anthropic.OutputConfigEffortXhigh, interventionTreeSchema(schema, node.IsRoot, objectiveFields),
+	user := "Analyst goal:\n" + goalText + "\n\nAvailable columns:\n" + columnSummary(schema) +
+		"\nThis fitted objective failed to compile against the data source:\n" + string(priorJSON) +
+		"\n\nThe sandbox rejected it with:\n" + validationErr +
+		"\n\nReturn a corrected Evaluation Matrix whose objective compiles and measures."
+	body, err := c.complete(ctx, anthropic.OutputConfigEffortHigh, evaluationMatrixSchema(schema),
+		evaluationMatrixRepairSystem, user)
+	if err != nil {
+		return domain.EvaluationMatrix{}, err
+	}
+	var matrix domain.EvaluationMatrix
+	if err := json.Unmarshal([]byte(body), &matrix); err != nil {
+		return domain.EvaluationMatrix{}, fmt.Errorf("parse evaluation matrix: %w", err)
+	}
+	return matrix, nil
+}
+
+// ProposeInterventionTree proposes one node of the hypothesis tree: a set of
+// candidate interventions that vary filters only, against the matrix-pinned
+// objective and the parent's cumulative filter set. Candidate filters are
+// constrained to the introspected columns.
+func (c *Client) ProposeInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) (Proposal, error) {
+	body, err := c.complete(ctx, anthropic.OutputConfigEffortXhigh, interventionTreeSchema(schema),
 		interventionTreeSystem, treePrompt(goalText, matrix, schema, node))
 	if err != nil {
 		return Proposal{}, err
@@ -91,23 +112,17 @@ func (c *Client) ProposeInterventionTree(ctx context.Context, goalText string, m
 	if err := json.Unmarshal([]byte(body), &wire); err != nil {
 		return Proposal{}, fmt.Errorf("parse intervention proposal: %w", err)
 	}
-	proposal := Proposal{
-		ObjectiveField:       wire.ObjectiveField,
-		ObjectiveAggregation: wire.ObjectiveAggregation,
-		Candidates:           make([]CandidateIntervention, 0, len(wire.Candidates)),
-	}
+	proposal := Proposal{Candidates: make([]CandidateIntervention, 0, len(wire.Candidates))}
 	for _, cand := range wire.Candidates {
 		proposal.Candidates = append(proposal.Candidates, CandidateIntervention{Filters: cand.Filters})
 	}
 	return proposal, nil
 }
 
-// proposalWire mirrors the intervention-tree structured-output body. Candidates
-// carry filters only; the objective fields are populated at the root only.
+// proposalWire mirrors the intervention-tree structured-output body: candidates
+// carrying filters only.
 type proposalWire struct {
-	ObjectiveAggregation string `json:"objective_aggregation"`
-	ObjectiveField       string `json:"objective_field"`
-	Candidates           []struct {
+	Candidates []struct {
 		Filters []domain.Constraint `json:"filters"`
 	} `json:"candidates"`
 }
@@ -155,16 +170,25 @@ func textBlock(msg *anthropic.Message) (string, error) {
 	return "", errNoText
 }
 
-const evaluationMatrixSystem = "You translate an analyst's plain-English optimization goal into a " +
-	"structured Evaluation Matrix. Return targets to maximize or minimize and any hard-constraint " +
-	"boundaries the goal states. Base the matrix on the goal text alone. Field names should be the " +
-	"data-source fields the goal refers to."
+const evaluationMatrixSystem = "You fit an analyst's plain-English optimization goal to a specific tabular data " +
+	"source, given its columns and types. Return targets to maximize or minimize and any hard-constraint " +
+	"boundaries the goal states. Resolve the objective to the actual columns — matching intent, not just names — " +
+	"and express each target as an aggregation (count/sum/avg/min/max) over a value expression, with an " +
+	"optimization direction. A plain numeric target is a bare column_ref value expression; a boolean or " +
+	"categorical target is a cast or comparison indicator (e.g. a rate of transported passengers is avg over the " +
+	"comparison Transported = True). Only reference columns present in the provided schema."
+
+const evaluationMatrixRepairSystem = "You fit an analyst's optimization goal to a specific tabular data source. A " +
+	"previously fitted objective failed to compile against the data. Given the prior fitted matrix and the exact " +
+	"validation error, return a corrected Evaluation Matrix whose objective compiles and measures — resolve the " +
+	"objective to the actual columns and types, and express it as an aggregation over a value expression with an " +
+	"optimization direction. Only reference columns present in the provided schema."
 
 const interventionTreeSystem = "You propose candidate interventions for an empirical hypothesis tree over a " +
 	"tabular data source. Each candidate is a set of hard-constraint filters that segments the data; the run " +
-	"measures a single fixed objective aggregate over each segment. At the root, also choose the objective " +
-	"aggregation and target field. Only reference columns that exist in the provided schema. Candidates vary " +
-	"filters only — never re-propose the aggregation or target field at deeper nodes."
+	"measures a single fixed objective aggregate over each segment. The objective is already fixed. Only " +
+	"reference columns that exist in the provided schema. Candidates vary filters only — never re-propose the " +
+	"objective."
 
 // treePrompt assembles the per-node user message: the goal, the matrix, the
 // available columns, and — at deeper nodes — the pinned objective, the parent's
@@ -175,12 +199,11 @@ func treePrompt(goalText string, matrix domain.EvaluationMatrix, schema SandboxS
 	fmt.Fprintf(&b, "Evaluation Matrix:\n%s\n\n", matrixSummary(matrix))
 	fmt.Fprintf(&b, "Available columns:\n%s\n\n", columnSummary(schema))
 	if node.IsRoot {
-		fmt.Fprintf(&b, "This is the root node. Choose the objective aggregation (one of "+
-			"count/sum/avg/min/max) and target field, then propose up to %d candidate interventions "+
-			"(filters only) that segment the data toward the objective.\n", node.Breadth)
+		fmt.Fprintf(&b, "This is the root node. Propose up to %d candidate interventions (filters only) that "+
+			"segment the data toward the objective.\n", node.Breadth)
 		return b.String()
 	}
-	fmt.Fprintf(&b, "Fixed objective: %s of %q, to %s.\n", node.ObjectiveAggregation, node.ObjectiveField, node.Direction)
+	fmt.Fprintf(&b, "Fixed objective: %s, to %s.\n", node.ObjectiveLabel, node.Direction)
 	fmt.Fprintf(&b, "Parent's effective filters (your proposals nest cumulatively on top of these):\n%s\n",
 		filterSummary(node.ParentFilters))
 	if node.PriorValue != nil {
@@ -194,7 +217,7 @@ func treePrompt(goalText string, matrix domain.EvaluationMatrix, schema SandboxS
 func matrixSummary(matrix domain.EvaluationMatrix) string {
 	var b strings.Builder
 	for _, t := range matrix.Targets {
-		fmt.Fprintf(&b, "- %s %s\n", t.Direction, t.Field)
+		fmt.Fprintf(&b, "- %s %s\n", t.Direction, domain.RenderObjectiveLabel(t.Aggregation, t.ValueExpression()))
 	}
 	for _, c := range matrix.Constraints {
 		fmt.Fprintf(&b, "- constraint: %s %s %v\n", c.Field, c.Op, c.Value)

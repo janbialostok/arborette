@@ -76,6 +76,17 @@ type ExecuteResponse struct {
 	Value map[string]any `json:"value"`
 }
 
+// SandboxError is a non-200 response from the sandbox, carrying the HTTP status
+// and the decoded {error} body (or a status fallback when the body is empty).
+// Callers classify by Status: a 400 is an analyst-fixable compile/validation
+// failure whose Message is the authoritative reason; a 5xx is a sandbox fault.
+type SandboxError struct {
+	Status  int
+	Message string
+}
+
+func (e *SandboxError) Error() string { return e.Message }
+
 // SandboxClient calls the Sandbox Execution HTTP service. It is built with
 // primitive args (infra-constructor convention).
 type SandboxClient struct {
@@ -127,7 +138,14 @@ func (c *SandboxClient) post(ctx context.Context, path string, in, out any) erro
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("sandbox %s returned status %d", path, resp.StatusCode)
+		message := fmt.Sprintf("sandbox %s returned status %d", path, resp.StatusCode)
+		var body struct {
+			Error string `json:"error"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&body) == nil && body.Error != "" {
+			message = body.Error
+		}
+		return &SandboxError{Status: resp.StatusCode, Message: message}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("decode sandbox %s response: %w", path, err)

@@ -77,7 +77,7 @@ func TestSubmitGoalErrorPaths(t *testing.T) {
 	t.Run("persist failure", func(t *testing.T) {
 		goals := &fakeGoals{insertErr: errors.New("db down")}
 		srv := newTestServer(goals, &fakeAudits{}, &fakeObjects{}, &fakeHeur{},
-			&fakeClaude{matrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize}}}}, &fakeSandbox{})
+			&fakeClaude{matrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}}}, &fakeSandbox{})
 		body, ct := multipartBody(t, map[string]string{"goal": "g"}, "file", "data.csv", "a\n")
 		req := httptest.NewRequest(http.MethodPost, "/goals", body)
 		req.Header.Set("Content-Type", ct)

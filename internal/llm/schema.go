@@ -1,6 +1,10 @@
 package llm
 
-import "github.com/arborette/arborette/internal/domain"
+import (
+	"strconv"
+
+	"github.com/arborette/arborette/internal/domain"
+)
 
 // SandboxSchema is the column set the sandbox introspected for a data source,
 // dependency-free so the llm package does not import the sandbox client. The
@@ -18,25 +22,23 @@ type SandboxColumn struct {
 }
 
 // TreeContext carries the fixed objective and the parent's cumulative filter
-// state into a proposal call. At the root (IsRoot) the model chooses the
-// objective; at deeper nodes the pinned objective is passed back so refinement
-// re-proposes filters against the same measurement.
+// state into a proposal call. The objective is pinned from the matrix before any
+// proposal, so both root and deeper nodes re-propose filters against the same
+// measurement; ObjectiveLabel is the rendered objective the deep-node prompt
+// references.
 type TreeContext struct {
-	IsRoot               bool
-	Breadth              int
-	ObjectiveField       string
-	ObjectiveAggregation string
-	Direction            domain.TargetDirection
-	ParentFilters        []domain.Constraint
-	PriorValue           *float64
+	IsRoot         bool
+	Breadth        int
+	ObjectiveLabel string
+	Direction      domain.TargetDirection
+	ParentFilters  []domain.Constraint
+	PriorValue     *float64
 }
 
-// Proposal is one node's model output: the run's fixed objective (set only at
-// the root) plus candidate interventions that vary filters only.
+// Proposal is one node's model output: candidate interventions that vary filters
+// only. The objective is pinned from the matrix, never proposed here.
 type Proposal struct {
-	ObjectiveField       string
-	ObjectiveAggregation string
-	Candidates           []CandidateIntervention
+	Candidates []CandidateIntervention
 }
 
 // CandidateIntervention is one proposed refinement, carrying filters only: the
@@ -45,39 +47,123 @@ type CandidateIntervention struct {
 	Filters []domain.Constraint
 }
 
+// maxExprDepth bounds the objective value-expression schema. Objective
+// expressions are shallow (a Cast over a Case over a Comparison over a ColumnRef
+// is depth 3), so a bounded, non-self-referential schema covers them without a
+// recursive schema the structured-output contract does not accept.
+const maxExprDepth = 3
+
 // evaluationMatrixSchema is the structured-output schema for GenerateEvaluationMatrix,
-// matching domain.EvaluationMatrix's json tags.
-func evaluationMatrixSchema() map[string]any {
-	return object(props{
+// matching domain.EvaluationMatrix's json tags. Each target carries its own
+// aggregation, optimization direction, and value expression so the fitted
+// objective is fully described by the matrix; there is no separate field, because
+// a compiled expression has no single column name and a plain-numeric objective
+// is a bare column_ref value expression. The value expression's column references
+// and constraint fields are constrained to the introspected column names, and the
+// aggregation to the allowlist the Sandbox accepts.
+func evaluationMatrixSchema(schema SandboxSchema) map[string]any {
+	cols := columnEnum(schema)
+	defs := map[string]any{}
+	value := expressionRef(cols, maxExprDepth, defs)
+	root := object(props{
 		"targets": arrayOf(object(props{
-			"field":     stringProp(),
-			"direction": enumSchema(directionEnum()),
-		}, "field", "direction")),
-		"constraints": arrayOf(constraintItem(nil)),
+			"direction":   enumSchema(directionEnum()),
+			"aggregation": enumSchema(aggregationEnum()),
+			"value":       value,
+		}, "direction", "aggregation", "value")),
+		"constraints": arrayOf(constraintItem(cols)),
 	}, "targets", "constraints")
+	root["$defs"] = defs
+	return root
+}
+
+// expressionRef defines the depth-N objective value-expression schema in defs (if
+// not already present) and returns a $ref to it. Each depth's composite variants
+// $ref the next-shallower depth, so the definitions form a bounded DAG — never
+// self-referential, which the structured-output contract rejects, and never
+// inlined per use, which would blow the schema size up exponentially.
+func expressionRef(cols []any, depth int, defs map[string]any) map[string]any {
+	name := "expr_d" + strconv.Itoa(depth)
+	if _, ok := defs[name]; !ok {
+		defs[name] = expressionDef(cols, depth, defs)
+	}
+	return map[string]any{"$ref": "#/$defs/" + name}
+}
+
+// expressionDef is the depth-N schema for a domain.Expression: an anyOf of
+// per-kind variants, each a closed object whose kind is a const discriminator and
+// whose every property is required, so the schema needs no optional properties. At
+// depth 0 only the leaf variants (column_ref, literal) are offered; each deeper
+// level also offers the composite variants, whose child expressions $ref the
+// next-shallower depth. Every variant unmarshals into the flat domain.Expression
+// fat node (unset kinds' fields stay zero). The Sandbox's dry-run enforces the
+// coarse-type rules the schema does not, so operators and cast targets stay
+// unconstrained strings here.
+func expressionDef(cols []any, depth int, defs map[string]any) map[string]any {
+	variants := []any{
+		object(props{
+			"kind":   constProp(string(domain.ColumnRefKind)),
+			"column": fieldProp(cols),
+		}, "kind", "column"),
+		object(props{
+			"kind":    constProp(string(domain.LiteralKind)),
+			"literal": literalSchema(),
+		}, "kind", "literal"),
+	}
+	if depth > 0 {
+		child := expressionRef(cols, depth-1, defs)
+		// Comparison and Arithmetic share the same binary shape, differing only by kind.
+		binaryVariant := func(kind string) map[string]any {
+			return object(props{
+				"kind":  constProp(kind),
+				"op":    stringProp(),
+				"left":  child,
+				"right": child,
+			}, "kind", "op", "left", "right")
+		}
+		variants = append(variants,
+			object(props{
+				"kind":      constProp(string(domain.CastKind)),
+				"operand":   child,
+				"cast_type": stringProp(),
+			}, "kind", "operand", "cast_type"),
+			binaryVariant(string(domain.ComparisonKind)),
+			binaryVariant(string(domain.ArithmeticKind)),
+			object(props{
+				"kind": constProp(string(domain.CaseKind)),
+				"cases": arrayOf(object(props{
+					"when": child,
+					"then": child,
+				}, "when", "then")),
+				"else": child,
+			}, "kind", "cases", "else"),
+		)
+	}
+	return map[string]any{"anyOf": variants}
+}
+
+// literalSchema is the schema for a domain.LiteralValue: an anyOf of single-field
+// variants, so "exactly one of number/string/bool is set" is expressed without any
+// optional property. The Sandbox rejects an empty literal.
+func literalSchema() map[string]any {
+	return map[string]any{"anyOf": []any{
+		object(props{"number": map[string]any{"type": "number"}}, "number"),
+		object(props{"string": stringProp()}, "string"),
+		object(props{"bool": map[string]any{"type": "boolean"}}, "bool"),
+	}}
 }
 
 // interventionTreeSchema is the structured-output schema for ProposeInterventionTree.
-// At the root it also asks for the objective aggregation and target field; at
-// deeper nodes those fields are omitted and only candidates are returned. Filter
-// fields are constrained to the introspected column names, and the root's
-// objective field to the Evaluation Matrix's targets so the run always pins a
-// target with a known optimization direction. The aggregation is constrained to
-// the allowlist the Sandbox accepts.
-func interventionTreeSchema(schema SandboxSchema, isRoot bool, objectiveFields []string) map[string]any {
+// The objective is pinned from the matrix before any proposal, so root and deep
+// nodes share one candidates-only schema. Filter fields are constrained to the
+// introspected column names.
+func interventionTreeSchema(schema SandboxSchema) map[string]any {
 	cols := columnEnum(schema)
-	properties := props{
+	return object(props{
 		"candidates": arrayOf(object(props{
 			"filters": arrayOf(constraintItem(cols)),
 		}, "filters")),
-	}
-	required := []string{"candidates"}
-	if isRoot {
-		properties["objective_aggregation"] = enumSchema(aggregationEnum())
-		properties["objective_field"] = fieldProp(toAny(objectiveFields))
-		required = []string{"objective_aggregation", "objective_field", "candidates"}
-	}
-	return object(properties, required...)
+	}, "candidates")
 }
 
 // constraintItem is the schema for one hard-constraint filter. cols, when
@@ -120,6 +206,12 @@ func fieldProp(values []any) map[string]any {
 
 func enumSchema(values []any) map[string]any {
 	return map[string]any{"type": "string", "enum": values}
+}
+
+// constProp is a string property fixed to a single value, discriminating an anyOf
+// variant.
+func constProp(value string) map[string]any {
+	return map[string]any{"type": "string", "const": value}
 }
 
 // columnEnum returns the introspected column names as an enum value list, or nil
