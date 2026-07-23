@@ -1,4 +1,4 @@
-.PHONY: build test up down migrate-up migrate-down
+.PHONY: build test up down migrate-up migrate-down web-dev web-build
 
 # Host env for runs that talk to the compose stack from the host (not from
 # inside the network): the published ports on localhost.
@@ -27,3 +27,11 @@ migrate-up:
 
 migrate-down:
 	set -a; . ./.env; set +a; $(HOST_ENV) go run ./cmd/migrate down
+
+# Web UI (Node/Next.js, in ./web). web-dev runs the dev server against a running
+# orchestrator; ORCHESTRATOR_URL defaults to the compose orchestrator's host port.
+web-dev:
+	cd web && ORCHESTRATOR_URL=$${ORCHESTRATOR_URL:-http://localhost:8080} npm run dev
+
+web-build:
+	cd web && npm ci && npm run build

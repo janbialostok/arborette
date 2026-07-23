@@ -16,6 +16,12 @@
   `anthropic-sdk-go` to v1.40.0, breaking the orchestrator's structured-output
   usage. The MCP APIs in use (`AddTool`, `ToolHandlerFor`, the streamable handler,
   in-memory transports) are identical across v0.8.0 and v1.3.1.
+- The web UI (`web/`) is a separate Node/Next.js deployable, not part of the Go
+  module. It is pinned to **Next.js ≥15 (App Router) on Node 22** with a
+  committed `web/package-lock.json`. Keep Next at ≥15: the TypeScript
+  `next.config.ts` and the uncached-by-default GET Route Handlers both break on
+  Next 14. It ships as its own image (`web/Dockerfile`, `output: 'standalone'`)
+  with a `./web` build context — never the repo root.
 
 ## Testing
 

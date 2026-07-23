@@ -199,6 +199,28 @@ services:
       orchestrator:
         condition: service_started
 
+  web:
+    # Self-contained build context: the web app lives entirely under ./web, so a
+    # ./web context keeps the Dockerfile's COPY paths conventional. environment
+    # pins ORCHESTRATOR_URL/PORT so a host-override in .env (e.g. localhost) never
+    # leaks into the container.
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    env_file: [.env]
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      PORT: "8083"
+    # Container always binds the fixed internal 8083 (pinned above); WEBUI_PORT
+    # from .env chooses the published host port, defaulting to 8083.
+    ports:
+      - "${WEBUI_PORT:-8083}:8083"
+    depends_on:
+      # The orchestrator (the only service the web UI talks to) defines no
+      # healthcheck, so gate on start, not health.
+      orchestrator:
+        condition: service_started
+
 volumes:
   neo4j_data:
   postgres_data:

@@ -1,0 +1,123 @@
+@import "tailwindcss";
+
+/* Instrument-panel palette: deep ink canvas, phosphor-green signal accent, warm
+   coral for negative deltas, amber for non-terminal warnings. One brand accent
+   (signal); neg/warn are semantic status colors only. */
+@theme {
+  --color-bg: #0a0b0e;
+  --color-surface: #111318;
+  --color-surface-2: #171a21;
+  --color-line: #23262f;
+  --color-line-strong: #323848;
+  --color-fg: #e8eaf0;
+  --color-muted: #9096a3;
+  --color-faint: #626777;
+
+  --color-signal: #7bf1a8;
+  --color-signal-ink: #04160c;
+  --color-neg: #ff7a66;
+  --color-warn: #f5c451;
+
+  --font-sans: var(--font-hanken), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, "SFMono-Regular", monospace;
+
+  --radius-panel: 14px;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  /* Grain + a faint top-lit gradient give the canvas depth without chrome. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background:
+      radial-gradient(120% 80% at 50% -10%, rgba(123, 241, 168, 0.06), transparent 55%),
+      radial-gradient(90% 60% at 100% 0%, rgba(90, 120, 255, 0.05), transparent 60%);
+    pointer-events: none;
+  }
+  ::selection {
+    background: var(--color-signal);
+    color: var(--color-signal-ink);
+  }
+  ::placeholder {
+    color: var(--color-faint);
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-strong) transparent;
+  }
+}
+
+/* Numeric readouts use tabular figures so streaming values don't reflow. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes bar-grow {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(123, 241, 168, 0.5);
+  }
+  50% {
+    opacity: 0.55;
+    box-shadow: 0 0 0 6px rgba(123, 241, 168, 0);
+  }
+}
+
+@keyframes flash-warn {
+  from {
+    background-color: rgba(245, 196, 81, 0.14);
+  }
+  to {
+    background-color: rgba(245, 196, 81, 0.04);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .animate-rise {
+    animation: rise 0.42s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  }
+  .animate-bar {
+    transform-origin: left;
+    animation: bar-grow 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  }
+  .animate-flash {
+    animation: flash-warn 1.1s ease-out both;
+  }
+  .pulse-live {
+    animation: pulse-dot 1.6s ease-in-out infinite;
+  }
+}
