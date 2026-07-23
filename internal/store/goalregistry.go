@@ -62,3 +62,34 @@ func (g *GoalRegistry) Get(ctx context.Context, optimizationFunctionID string) (
 	}
 	return goal, nil
 }
+
+// List returns every registered goal, newest first, unmarshalling each
+// Evaluation Matrix from jsonb.
+func (g *GoalRegistry) List(ctx context.Context) ([]Goal, error) {
+	rows, err := g.pool.Query(ctx,
+		"SELECT optimization_function_id, goal_text, evaluation_matrix, datasource_ref, created_at "+
+			"FROM goal_registry ORDER BY created_at DESC",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list goals: %w", err)
+	}
+	defer rows.Close()
+
+	var goals []Goal
+	for rows.Next() {
+		var goal Goal
+		var matrix []byte
+		if err := rows.Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix,
+			&goal.DataSourceRef, &goal.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan goal row: %w", err)
+		}
+		if err := json.Unmarshal(matrix, &goal.EvaluationMatrix); err != nil {
+			return nil, fmt.Errorf("unmarshal evaluation matrix: %w", err)
+		}
+		goals = append(goals, goal)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate goal rows: %w", err)
+	}
+	return goals, nil
+}

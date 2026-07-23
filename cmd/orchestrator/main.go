@@ -54,14 +54,25 @@ func main() {
 
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
 	goals := store.NewGoalRegistry(pool)
+	runs := store.NewRuns(pool)
 	audits := store.NewAuditLog(pool)
 	embeddings := store.NewEmbeddingStore(pool)
 	heur := heuristics.NewService(provider, embeddings, repo)
 	claude := llm.NewClient(cfg.Anthropic.APIKey, cfg.Anthropic.Model)
 	sandbox := orchestrator.NewSandboxClient(cfg.Orchestrator.SandboxURL, nil)
 
+	// Runs whose loop was abandoned by a prior crash or shutdown never ran their
+	// terminal write; settle them to failed at boot so they don't strand at
+	// running. Non-fatal -- a stale row is a display nuisance, not a reason to
+	// refuse to serve. Correct only for a single orchestrator instance.
+	if n, err := runs.FailOrphaned(ctx, "orchestrator restarted"); err != nil {
+		log.Printf("orchestrator: reconcile orphaned runs: %v", err)
+	} else if n > 0 {
+		log.Printf("orchestrator: reconciled %d orphaned run(s) to failed", n)
+	}
+
 	srv := orchestrator.NewServer(
-		repo, goals, audits, objects, heur, claude, sandbox,
+		repo, goals, runs, audits, objects, heur, claude, sandbox,
 		orchestrator.NewHub(), orchestrator.StubLauncher{},
 		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID},
 		cfg.Orchestrator.LocalImportDir, cfg.Orchestrator.SleepCycleJobName,

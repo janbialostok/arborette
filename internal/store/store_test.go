@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/arborette/arborette/internal/config"
 	"github.com/arborette/arborette/internal/domain"
@@ -219,6 +220,232 @@ func TestGoalRegistryGrants(t *testing.T) {
 		testutil.NewID(t),
 	); err == nil {
 		t.Fatal("expected service INSERT on goal_registry to be denied")
+	}
+}
+
+// seedGoal inserts a minimal registered goal a run row can reference, returning
+// its id.
+func seedGoal(t *testing.T, ctx context.Context, p *store.Pool) string {
+	t.Helper()
+	goalID := testutil.NewID(t)
+	if err := store.NewGoalRegistry(p).Insert(ctx, store.Goal{
+		OptimizationFunctionID: goalID,
+		GoalText:               "grow revenue",
+		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
+		DataSourceRef:          "s3://arborette/data.csv",
+	}); err != nil {
+		t.Fatalf("seed goal: %v", err)
+	}
+	return goalID
+}
+
+func TestRunsLifecycle(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	runs := store.NewRuns(p)
+	goalID := seedGoal(t, ctx, p)
+
+	runID := testutil.NewID(t)
+	if err := runs.Create(ctx, runID, goalID); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	latest, err := runs.LatestByGoal(ctx, []string{goalID})
+	if err != nil {
+		t.Fatalf("latest by goal: %v", err)
+	}
+	if run, ok := latest[goalID]; !ok || run.Status != store.RunRunning || run.EndedAt != nil || run.FailureReason != nil {
+		t.Fatalf("expected a running run with no end/reason: %+v (ok=%v)", run, ok)
+	}
+
+	if err := runs.SetStatus(ctx, runID, store.RunCompleted, ""); err != nil {
+		t.Fatalf("set status: %v", err)
+	}
+	latest, err = runs.LatestByGoal(ctx, []string{goalID})
+	if err != nil {
+		t.Fatalf("latest by goal: %v", err)
+	}
+	if run := latest[goalID]; run.Status != store.RunCompleted || run.EndedAt == nil || run.FailureReason != nil {
+		t.Fatalf("completed run should have ended_at set and NULL reason: %+v", run)
+	}
+
+	// A newer run for the same goal wins the latest-by-goal read. The sleep keeps
+	// the two started_at defaults distinct so the DESC ordering is deterministic.
+	time.Sleep(2 * time.Millisecond)
+	newerID := testutil.NewID(t)
+	if err := runs.Create(ctx, newerID, goalID); err != nil {
+		t.Fatalf("create newer run: %v", err)
+	}
+	latest, err = runs.LatestByGoal(ctx, []string{goalID})
+	if err != nil {
+		t.Fatalf("latest by goal: %v", err)
+	}
+	if latest[goalID].RunID != newerID {
+		t.Fatalf("latest run = %q, want the newer %q", latest[goalID].RunID, newerID)
+	}
+
+	// A goal with no runs is absent from the map; an empty id set returns empty.
+	if _, ok := latest[testutil.NewID(t)]; ok {
+		t.Fatal("a goal with no runs must be absent from the map")
+	}
+	empty, err := runs.LatestByGoal(ctx, nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty goalIDs = (%v, %v), want (empty map, nil)", empty, err)
+	}
+}
+
+func TestGoalRegistryList(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	registry := store.NewGoalRegistry(p)
+
+	olderID := testutil.NewID(t)
+	if err := registry.Insert(ctx, store.Goal{OptimizationFunctionID: olderID, GoalText: "older",
+		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
+		DataSourceRef:    "ref"}); err != nil {
+		t.Fatalf("insert older: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond) // keep created_at distinct so DESC ordering is deterministic
+	newerID := testutil.NewID(t)
+	if err := registry.Insert(ctx, store.Goal{OptimizationFunctionID: newerID, GoalText: "newer",
+		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "cost", Direction: domain.Minimize, Aggregation: "sum"}}},
+		DataSourceRef:    "ref"}); err != nil {
+		t.Fatalf("insert newer: %v", err)
+	}
+
+	goals, err := registry.List(ctx)
+	if err != nil {
+		t.Fatalf("list goals: %v", err)
+	}
+	// The shared database may hold other goals, so assert relative order and the
+	// per-row matrix round-trip for the two this test inserted.
+	pos := make(map[string]int, len(goals))
+	byID := make(map[string]store.Goal, len(goals))
+	for i, g := range goals {
+		pos[g.OptimizationFunctionID] = i
+		byID[g.OptimizationFunctionID] = g
+	}
+	oi, ok1 := pos[olderID]
+	ni, ok2 := pos[newerID]
+	if !ok1 || !ok2 {
+		t.Fatalf("both inserted goals must appear in the list")
+	}
+	if ni >= oi {
+		t.Fatalf("newest-first: newer (%d) must precede older (%d)", ni, oi)
+	}
+	if m := byID[newerID].EvaluationMatrix; len(m.Targets) != 1 || m.Targets[0].Aggregation != "sum" {
+		t.Fatalf("newer goal matrix not round-tripped: %+v", m)
+	}
+}
+
+func TestRunsFailOrphaned(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	runs := store.NewRuns(p)
+	goalID := seedGoal(t, ctx, p)
+
+	runningID, doneID := testutil.NewID(t), testutil.NewID(t)
+	if err := runs.Create(ctx, runningID, goalID); err != nil {
+		t.Fatalf("create running run: %v", err)
+	}
+	if err := runs.Create(ctx, doneID, goalID); err != nil {
+		t.Fatalf("create done run: %v", err)
+	}
+	if err := runs.SetStatus(ctx, doneID, store.RunCompleted, ""); err != nil {
+		t.Fatalf("complete run: %v", err)
+	}
+
+	// FailOrphaned is a global sweep; the shared test database may hold running
+	// rows from other tests, so assert it reconciled at least our one and verify
+	// the observable effect per row rather than an exact table-wide count.
+	n, err := runs.FailOrphaned(ctx, "orchestrator restarted")
+	if err != nil {
+		t.Fatalf("fail orphaned: %v", err)
+	}
+	if n < 1 {
+		t.Fatalf("reconciled %d runs, want at least the running one", n)
+	}
+
+	var status, reason string
+	if err := p.QueryRow(ctx, "SELECT status, failure_reason FROM runs WHERE run_id = $1", runningID).Scan(&status, &reason); err != nil {
+		t.Fatalf("read reconciled run: %v", err)
+	}
+	if status != "failed" || reason != "orchestrator restarted" {
+		t.Fatalf("reconciled run = (%q, %q), want (failed, orchestrator restarted)", status, reason)
+	}
+	var doneStatus string
+	if err := p.QueryRow(ctx, "SELECT status FROM runs WHERE run_id = $1", doneID).Scan(&doneStatus); err != nil {
+		t.Fatalf("read completed run: %v", err)
+	}
+	if doneStatus != "completed" {
+		t.Fatalf("a settled run must be untouched, got %q", doneStatus)
+	}
+}
+
+func TestRunsSetStatusFailedAndMultiGoal(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	runs := store.NewRuns(p)
+	goalA := seedGoal(t, ctx, p)
+	goalB := seedGoal(t, ctx, p)
+
+	runA, runB := testutil.NewID(t), testutil.NewID(t)
+	if err := runs.Create(ctx, runA, goalA); err != nil {
+		t.Fatalf("create run A: %v", err)
+	}
+	if err := runs.Create(ctx, runB, goalB); err != nil {
+		t.Fatalf("create run B: %v", err)
+	}
+	if err := runs.SetStatus(ctx, runA, store.RunFailed, "field not present in schema: X"); err != nil {
+		t.Fatalf("set failed: %v", err)
+	}
+
+	latest, err := runs.LatestByGoal(ctx, []string{goalA, goalB})
+	if err != nil {
+		t.Fatalf("latest by goal: %v", err)
+	}
+	// Each goal keys to its own latest run: A failed with the persisted reason,
+	// B still running with none.
+	if a := latest[goalA]; a.RunID != runA || a.Status != store.RunFailed || a.FailureReason == nil || *a.FailureReason != "field not present in schema: X" {
+		t.Fatalf("goal A latest should be its failed run with the reason: %+v", a)
+	}
+	if b := latest[goalB]; b.RunID != runB || b.Status != store.RunRunning || b.FailureReason != nil {
+		t.Fatalf("goal B latest should be its running run with no reason: %+v", b)
+	}
+}
+
+func TestRunsGrants(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+
+	orchestrator := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	runs := store.NewRuns(orchestrator)
+	goalID := seedGoal(t, ctx, orchestrator)
+
+	// orchestrator: INSERT + UPDATE + SELECT are granted.
+	runID := testutil.NewID(t)
+	if err := runs.Create(ctx, runID, goalID); err != nil {
+		t.Fatalf("orchestrator create run: %v", err)
+	}
+	if err := runs.SetStatus(ctx, runID, store.RunCompleted, ""); err != nil {
+		t.Fatalf("orchestrator set status: %v", err)
+	}
+
+	// service: SELECT on runs is granted; write is not.
+	service := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	var count int
+	if err := service.QueryRow(ctx, "SELECT count(*) FROM runs").Scan(&count); err != nil {
+		t.Fatalf("service select runs: %v", err)
+	}
+	if _, err := service.Exec(ctx,
+		"INSERT INTO runs (run_id, optimization_function_id, status) VALUES ($1,$2,'running')",
+		testutil.NewID(t), goalID,
+	); err == nil {
+		t.Fatal("expected service INSERT on runs to be denied")
 	}
 }
 

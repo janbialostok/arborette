@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -26,6 +27,12 @@ var (
 // dependency would leak the goroutine indefinitely.
 const loopTimeout = 10 * time.Minute
 
+// statusWriteTimeout bounds the run's terminal status write. It runs on a
+// context detached from the loop's own deadline/cancellation, so a run whose
+// loopTimeout expired still records its terminal status instead of stranding at
+// running.
+const statusWriteTimeout = 5 * time.Second
+
 // objective is the run's fixed measurement, held constant across the whole tree:
 // one aggregation over one value expression, with the direction that decides what
 // "improvement" means. label is the rendered key the measured value is carried
@@ -46,19 +53,54 @@ func (s *Server) handleTriggerLoop(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Create the run row synchronously, before launching the loop, so a client
+	// that immediately subscribes and lists always sees a running row rather than
+	// racing the goroutine, and a create failure surfaces as a 5xx here.
+	runID := uuid.NewString()
+	if err := s.runs.Create(r.Context(), runID, goal.OptimizationFunctionID); err != nil {
+		log.Printf("orchestrator: create run for %q: %v", goal.OptimizationFunctionID, err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), loopTimeout)
 		defer cancel()
-		s.runLoop(ctx, goal)
+		s.runLoop(ctx, goal, runID)
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]any{"optimization_function_id": goal.OptimizationFunctionID})
 }
 
 // runLoop drives the hypothesis tree: introspect the data source, pin the
 // objective and measure the root baseline, then expand each root candidate.
-func (s *Server) runLoop(ctx context.Context, goal store.Goal) {
+func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 	id := goal.OptimizationFunctionID
+	// termErr holds a terminal (root) failure; nil means the run completed. Only
+	// the root-failure sites below set it, so a per-candidate branch failure (a
+	// separate function with no access to it) never flips the run to failed.
+	var termErr error
 	defer func() {
+		// A panic unwinds through this defer with termErr still nil; recover so a
+		// crashed run is marked failed rather than mislabeled completed, and one
+		// run's panic cannot bring down the orchestrator. Otherwise, a
+		// timeout/cancellation that fired anywhere in the run -- including
+		// mid-expansion, where per-candidate failures are non-terminal -- also
+		// means the run did not complete.
+		if r := recover(); r != nil {
+			termErr = fmt.Errorf("hypothesis loop panicked: %v", r)
+		} else if termErr == nil && ctx.Err() != nil {
+			termErr = ctx.Err()
+		}
+		// Detached from the loop's own deadline/cancellation so the write lands
+		// even when the loop terminated because that context expired.
+		writeCtx, cancel := context.WithTimeout(context.Background(), statusWriteTimeout)
+		defer cancel()
+		status, reason := store.RunCompleted, ""
+		if termErr != nil {
+			status, reason = store.RunFailed, termErr.Error()
+		}
+		if err := s.runs.SetStatus(writeCtx, runID, status, reason); err != nil {
+			log.Printf("orchestrator: hypothesis loop %q: set run status: %v", id, err)
+		}
 		s.hub.Publish(id, Event{Type: "loop_complete"})
 		s.hub.Complete(id)
 	}()
@@ -66,6 +108,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal) {
 	obj, err := pinObjective(goal.EvaluationMatrix)
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: pin objective: %v", id, err)
+		termErr = err
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
@@ -73,6 +116,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal) {
 	introspect, err := s.sandbox.Introspect(ctx, IntrospectRequest{DataSourceRef: goal.DataSourceRef})
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: introspect: %v", id, err)
+		termErr = err
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
@@ -82,6 +126,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal) {
 		llm.TreeContext{IsRoot: true, Breadth: defaultBreadth})
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: root proposal: %v", id, err)
+		termErr = err
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
@@ -91,11 +136,13 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal) {
 	baseResp, err := s.sandbox.Execute(ctx, executeRequestFor(goal, obj, nil))
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: root baseline: %v", id, err)
+		termErr = err
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
 	baseline, ok := numericValue(baseResp.Value, obj.label)
 	if !ok {
+		termErr = errNonNumericValue
 		s.branchFailure(ctx, id, nil, errNonNumericValue)
 		return
 	}

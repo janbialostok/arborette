@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -117,6 +118,58 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+}
+
+// goalListItemDTO is the web-UI projection of a goal plus its latest run status
+// (or a synthetic "no run").
+type goalListItemDTO struct {
+	OptimizationFunctionID string    `json:"optimization_function_id"`
+	GoalText               string    `json:"goal_text"`
+	CreatedAt              time.Time `json:"created_at"`
+	Status                 string    `json:"status"`
+	FailureReason          string    `json:"failure_reason,omitempty"`
+}
+
+// handleListGoals serves each goal's latest run status durably, after the fact —
+// the counterpart to the ephemeral live stream. A goal never triggered gets a
+// synthetic "no run".
+func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	goals, err := s.goals.List(ctx)
+	if err != nil {
+		log.Printf("orchestrator: list goals: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	ids := make([]string, 0, len(goals))
+	for _, g := range goals {
+		ids = append(ids, g.OptimizationFunctionID)
+	}
+	latest, err := s.runs.LatestByGoal(ctx, ids)
+	if err != nil {
+		log.Printf("orchestrator: latest runs by goal: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	out := make([]goalListItemDTO, 0, len(goals))
+	for _, g := range goals {
+		item := goalListItemDTO{
+			OptimizationFunctionID: g.OptimizationFunctionID,
+			GoalText:               g.GoalText,
+			CreatedAt:              g.CreatedAt,
+			Status:                 "no run",
+		}
+		if run, ok := latest[g.OptimizationFunctionID]; ok {
+			item.Status = string(run.Status)
+			if run.FailureReason != nil {
+				item.FailureReason = *run.FailureReason
+			}
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ingest resolves the request's data source to an object-store ref via one of

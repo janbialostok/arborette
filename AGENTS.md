@@ -37,3 +37,15 @@
   `.env` leaves `S3_ENDPOINT` unset (compose injects the in-network `minio:9000`),
   so without the override the S3 client targets real AWS and fails with a
   misleading `InvalidAccessKeyId` rather than an endpoint error.
+- The integration suite shares one Postgres database (hence `-p 1`), so tests must
+  tolerate rows other tests leave behind: never assert a table-**global** count
+  (e.g. a status-sweep's affected-row count) — assert per-row effects instead. When
+  asserting an `ORDER BY` over `now()`-defaulted timestamps, `time.Sleep` a couple
+  ms between inserts so the ordering is deterministic.
+- To smoke-test a backend service change over HTTP without rebuilding its (stale)
+  compose container, build and run the binary against the live stack: `go build`
+  the `cmd/<svc>` binary, then run it with the same localhost overrides `make test`
+  uses plus `SANDBOX_URL=http://localhost:8081` and a free `ORCHESTRATOR_PORT` (the
+  compose container already holds 8080), sourcing `.env` for credentials — then
+  `curl` the endpoint. Boot-time work (migrations already applied, reconciliation
+  sweeps) runs too, so the local process exercises the real startup path.

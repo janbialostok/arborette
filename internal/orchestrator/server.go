@@ -54,6 +54,16 @@ type sandboxExecutor interface {
 type goalStore interface {
 	Insert(ctx context.Context, goal store.Goal) error
 	Get(ctx context.Context, optimizationFunctionID string) (store.Goal, error)
+	List(ctx context.Context) ([]store.Goal, error)
+}
+
+// runStore is the run-lifecycle surface the loop and the objectives list need.
+// FailOrphaned is deliberately absent: boot-time reconciliation calls it on the
+// concrete store in cmd/orchestrator, not through the Server.
+type runStore interface {
+	Create(ctx context.Context, runID, optimizationFunctionID string) error
+	SetStatus(ctx context.Context, runID string, status store.RunStatus, failureReason string) error
+	LatestByGoal(ctx context.Context, goalIDs []string) (map[string]store.Run, error)
 }
 
 type auditStore interface {
@@ -74,6 +84,7 @@ type heuristicsService interface {
 type Server struct {
 	repo              graph.Repository
 	goals             goalStore
+	runs              runStore
 	audits            auditStore
 	objects           objectStore
 	heur              heuristicsService
@@ -91,6 +102,7 @@ type Server struct {
 func NewServer(
 	repo graph.Repository,
 	goals goalStore,
+	runs runStore,
 	audits auditStore,
 	objects objectStore,
 	heur heuristicsService,
@@ -104,6 +116,7 @@ func NewServer(
 	return &Server{
 		repo:              repo,
 		goals:             goals,
+		runs:              runs,
 		audits:            audits,
 		objects:           objects,
 		heur:              heur,
@@ -121,6 +134,7 @@ func NewServer(
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /goals", s.handleSubmitGoal)
+	mux.HandleFunc("GET /goals", s.handleListGoals)
 	mux.HandleFunc("POST /goals/{id}/hypothesis-loop", s.handleTriggerLoop)
 	mux.HandleFunc("GET /goals/{id}/stream", s.handleStream)
 	mux.HandleFunc("POST /goals/{id}/sleep-cycle", s.handleTriggerSleepCycle)

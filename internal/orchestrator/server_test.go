@@ -28,6 +28,8 @@ type fakeGoals struct {
 	get       store.Goal
 	getErr    error
 	insertErr error
+	list      []store.Goal
+	listErr   error
 }
 
 func (f *fakeGoals) Insert(_ context.Context, g store.Goal) error {
@@ -39,6 +41,42 @@ func (f *fakeGoals) Insert(_ context.Context, g store.Goal) error {
 }
 func (f *fakeGoals) Get(_ context.Context, _ string) (store.Goal, error) {
 	return f.get, f.getErr
+}
+func (f *fakeGoals) List(_ context.Context) ([]store.Goal, error) {
+	return f.list, f.listErr
+}
+
+// setStatusCall records one SetStatus invocation, including the caller's context
+// error at call time so a test can assert the terminal write ran on a live
+// (detached) context rather than the loop's cancelled one.
+type setStatusCall struct {
+	runID  string
+	status store.RunStatus
+	reason string
+	ctxErr error
+}
+
+type fakeRuns struct {
+	created     []string
+	createErr   error
+	statusCalls []setStatusCall
+	latest      map[string]store.Run
+	latestErr   error
+}
+
+func (f *fakeRuns) Create(_ context.Context, runID, _ string) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
+	f.created = append(f.created, runID)
+	return nil
+}
+func (f *fakeRuns) SetStatus(ctx context.Context, runID string, status store.RunStatus, reason string) error {
+	f.statusCalls = append(f.statusCalls, setStatusCall{runID: runID, status: status, reason: reason, ctxErr: ctx.Err()})
+	return nil
+}
+func (f *fakeRuns) LatestByGoal(_ context.Context, _ []string) (map[string]store.Run, error) {
+	return f.latest, f.latestErr
 }
 
 type fakeAudits struct{ records []store.AuditRecord }
@@ -197,7 +235,7 @@ func newTestServer(goals goalStore, audits auditStore, objects objectStore, heur
 // newTestServerRepo is newTestServer with an explicit graph.Repository, for loop
 // tests that assert the nodes writeTriplet persists.
 func newTestServerRepo(repo graph.Repository, goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
-	return NewServer(repo, goals, audits, objects, heur, claude, sandbox,
+	return NewServer(repo, goals, &fakeRuns{}, audits, objects, heur, claude, sandbox,
 		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, "", "arborette-sleepcycle")
 }
 
@@ -314,6 +352,71 @@ func TestTriggerEndpointsUnknownGoal(t *testing.T) {
 	}
 }
 
+func TestListGoals(t *testing.T) {
+	t.Run("joins goals to their latest run status, synthesizing no run", func(t *testing.T) {
+		failReason := "field not present in schema: X"
+		goals := &fakeGoals{list: []store.Goal{
+			{OptimizationFunctionID: "g1", GoalText: "grow revenue"},
+			{OptimizationFunctionID: "g2", GoalText: "cut cost"},
+		}}
+		srv := newTestServer(goals, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
+		srv.runs = &fakeRuns{latest: map[string]store.Run{
+			"g1": {Status: store.RunFailed, FailureReason: &failReason},
+		}}
+
+		req := httptest.NewRequest(http.MethodGet, "/goals", nil)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+		}
+		var out []goalListItemDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(out) != 2 {
+			t.Fatalf("expected 2 items, got %d", len(out))
+		}
+		if out[0].OptimizationFunctionID != "g1" || out[0].Status != "failed" || out[0].FailureReason != failReason {
+			t.Fatalf("g1 should carry its failed status + reason: %+v", out[0])
+		}
+		if out[1].Status != "no run" || out[1].FailureReason != "" {
+			t.Fatalf("g2 with no run should be synthesized: %+v", out[1])
+		}
+	})
+
+	t.Run("empty registry is a non-nil array", func(t *testing.T) {
+		srv := newTestServer(&fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
+		req := httptest.NewRequest(http.MethodGet, "/goals", nil)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if body := strings.TrimSpace(rec.Body.String()); body != "[]" {
+			t.Fatalf("empty list body = %q, want []", body)
+		}
+	})
+
+	t.Run("a goal-list error is a 500", func(t *testing.T) {
+		srv := newTestServer(&fakeGoals{listErr: errors.New("db down")}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
+		req := httptest.NewRequest(http.MethodGet, "/goals", nil)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", rec.Code)
+		}
+	})
+
+	t.Run("a latest-runs error is a 500", func(t *testing.T) {
+		srv := newTestServer(&fakeGoals{list: []store.Goal{{OptimizationFunctionID: "g1"}}}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
+		srv.runs = &fakeRuns{latestErr: errors.New("db down")}
+		req := httptest.NewRequest(http.MethodGet, "/goals", nil)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", rec.Code)
+		}
+	})
+}
+
 func TestHeuristicSearch(t *testing.T) {
 	heur := &fakeHeur{matches: []heuristics.Match{
 		{MetaHeuristic: domain.MetaHeuristic{ID: "mh-1", Definition: "scale reads"}},
@@ -374,7 +477,7 @@ func TestIngestLocalReadsWithinMount(t *testing.T) {
 		t.Fatalf("write file: %v", err)
 	}
 	objects := &fakeObjects{}
-	srv := NewServer(nil, &fakeGoals{}, &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{},
+	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{},
 		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, dir, "job")
 
 	ref, err := srv.ingestLocal(context.Background(), "data.csv")
@@ -397,7 +500,7 @@ func TestIngestLocalRejectsSymlinkEscape(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 	objects := &fakeObjects{}
-	srv := NewServer(nil, &fakeGoals{}, &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{},
+	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{},
 		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, mount, "job")
 
 	if _, err := srv.ingestLocal(context.Background(), "link.csv"); !errors.Is(err, errPathEscape) {

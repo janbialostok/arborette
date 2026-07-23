@@ -90,7 +90,7 @@ func TestSubmitGoalErrorPaths(t *testing.T) {
 
 	t.Run("on-disk file not found maps to 404", func(t *testing.T) {
 		dir := t.TempDir()
-		srv := NewServer(nil, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{},
+		srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{},
 			NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, dir, "job")
 		if _, err := srv.ingestLocal(t.Context(), "missing.csv"); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("error = %v, want os.ErrNotExist", err)
@@ -132,6 +132,38 @@ func TestTriggerSleepCycle(t *testing.T) {
 		rec := serve(srv, http.MethodPost, "/goals/g1/sleep-cycle", "", "")
 		if rec.Code != http.StatusInternalServerError {
 			t.Fatalf("status = %d, want 500", rec.Code)
+		}
+	})
+}
+
+func TestTriggerLoopCreatesRun(t *testing.T) {
+	goalWithMatrix := store.Goal{OptimizationFunctionID: "g1",
+		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}}}
+
+	t.Run("create failure returns 500 without recording a run", func(t *testing.T) {
+		runs := &fakeRuns{createErr: errors.New("db down")}
+		srv := newTestServer(&fakeGoals{get: goalWithMatrix}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
+		srv.runs = runs
+		rec := serve(srv, http.MethodPost, "/goals/g1/hypothesis-loop", "", "")
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", rec.Code)
+		}
+		if len(runs.created) != 0 {
+			t.Fatalf("a failed Create must not record a run: %v", runs.created)
+		}
+	})
+
+	t.Run("success returns 202 and creates one running row", func(t *testing.T) {
+		runs := &fakeRuns{}
+		srv := newTestServer(&fakeGoals{get: goalWithMatrix}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
+		srv.runs = runs
+		rec := serve(srv, http.MethodPost, "/goals/g1/hypothesis-loop", "", "")
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202 (body %q)", rec.Code, rec.Body.String())
+		}
+		// Create is synchronous, before the goroutine launches, so this is race-free.
+		if len(runs.created) != 1 {
+			t.Fatalf("expected exactly one run created, got %v", runs.created)
 		}
 	})
 }

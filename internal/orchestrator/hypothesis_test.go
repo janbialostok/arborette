@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/arborette/arborette/internal/domain"
@@ -120,7 +121,7 @@ func TestRunLoopSuccessKeysByObjectiveLabel(t *testing.T) {
 
 	goal := store.Goal{OptimizationFunctionID: "g1", DataSourceRef: "ref",
 		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}}}
-	srv.runLoop(context.Background(), goal)
+	srv.runLoop(context.Background(), goal, "run-1")
 
 	// The measured value is read and persisted under the rendered objective label
 	// (the same key the execute request carries), not a bare column field.
@@ -153,7 +154,7 @@ func TestRunLoopImprovingCandidateExpandsWithPinnedLabel(t *testing.T) {
 
 	goal := store.Goal{OptimizationFunctionID: "g1", DataSourceRef: "ref",
 		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}}}
-	srv.runLoop(context.Background(), goal)
+	srv.runLoop(context.Background(), goal, "run-1")
 
 	if len(repo.outcomes) != 2 {
 		t.Fatalf("expected two triplets (candidate + expanded child), got %d", len(repo.outcomes))
@@ -179,7 +180,7 @@ func TestRunLoopTerminalOnMissingAggregation(t *testing.T) {
 
 	goal := store.Goal{OptimizationFunctionID: "g1", DataSourceRef: "ref",
 		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize}}}}
-	srv.runLoop(context.Background(), goal)
+	srv.runLoop(context.Background(), goal, "run-1")
 
 	// A legacy matrix fails at pin time — before any sandbox call.
 	if sandbox.execCalls != 0 {
@@ -194,6 +195,116 @@ func TestRunLoopTerminalOnMissingAggregation(t *testing.T) {
 	if !found {
 		t.Fatalf("expected a hypothesis_branch_failure audit, got %+v", audits.records)
 	}
+}
+
+// revenueGoal is the standard maximize-avg(revenue) goal the status-transition
+// tests drive the loop with.
+func revenueGoal() store.Goal {
+	return store.Goal{OptimizationFunctionID: "g1", DataSourceRef: "ref",
+		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}}}
+}
+
+// panicSandbox panics on Introspect so a loop test can exercise the deferred
+// recover path (a crash mid-run must settle failed, not propagate).
+type panicSandbox struct{ msg string }
+
+func (p panicSandbox) Introspect(context.Context, IntrospectRequest) (IntrospectResponse, error) {
+	panic(p.msg)
+}
+func (p panicSandbox) Execute(context.Context, ExecuteRequest) (ExecuteResponse, error) {
+	return ExecuteResponse{}, nil
+}
+
+func assertOneStatus(t *testing.T, runs *fakeRuns, status store.RunStatus, reason string) {
+	t.Helper()
+	if len(runs.statusCalls) != 1 {
+		t.Fatalf("expected one SetStatus call, got %d: %+v", len(runs.statusCalls), runs.statusCalls)
+	}
+	if c := runs.statusCalls[0]; c.status != status || c.reason != reason {
+		t.Fatalf("SetStatus = (%q, %q), want (%q, %q)", c.status, c.reason, status, reason)
+	}
+}
+
+func TestRunLoopStatusTransitions(t *testing.T) {
+	revenueSchema := IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{{Name: "revenue", Type: "DOUBLE"}}}}
+
+	t.Run("clean run settles completed", func(t *testing.T) {
+		runs := &fakeRuns{}
+		claude := &fakeClaude{proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: nil}}}}
+		sandbox := &fakeSandbox{introspect: revenueSchema, execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}}, // baseline
+			{Value: map[string]any{"avg(revenue)": 8.0}},  // candidate: no improvement → stop
+		}}
+		srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+		srv.runs = runs
+		srv.runLoop(context.Background(), revenueGoal(), "run-1")
+		assertOneStatus(t, runs, store.RunCompleted, "")
+	})
+
+	t.Run("root failure settles failed with the real reason", func(t *testing.T) {
+		runs := &fakeRuns{}
+		sandbox := &fakeSandbox{introspectErr: &SandboxError{Status: http.StatusBadRequest, Message: "field not present in schema: X"}}
+		srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, sandbox)
+		srv.runs = runs
+		srv.runLoop(context.Background(), revenueGoal(), "run-1")
+		assertOneStatus(t, runs, store.RunFailed, "field not present in schema: X")
+	})
+
+	t.Run("every candidate branch-failing still settles completed", func(t *testing.T) {
+		runs := &fakeRuns{}
+		claude := &fakeClaude{proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: nil}}}}
+		sandbox := &fakeSandbox{introspect: revenueSchema,
+			execResps: []ExecuteResponse{{Value: map[string]any{"avg(revenue)": 10.0}}}, // baseline only
+			execErrs:  []error{nil, errors.New("candidate boom")},                       // candidate Execute fails (non-terminal)
+		}
+		srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+		srv.runs = runs
+		srv.runLoop(context.Background(), revenueGoal(), "run-1")
+		assertOneStatus(t, runs, store.RunCompleted, "")
+	})
+
+	t.Run("timeout after baseline settles failed via ctx promotion", func(t *testing.T) {
+		runs := &fakeRuns{}
+		claude := &fakeClaude{proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: nil}}}}
+		sandbox := &fakeSandbox{introspect: revenueSchema,
+			execResps: []ExecuteResponse{{Value: map[string]any{"avg(revenue)": 10.0}}},
+			execErrs:  []error{nil, context.DeadlineExceeded},
+		}
+		srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+		srv.runs = runs
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // loop ctx cancelled: a per-candidate failure is non-terminal, but the run did not complete
+		srv.runLoop(ctx, revenueGoal(), "run-1")
+		assertOneStatus(t, runs, store.RunFailed, context.Canceled.Error())
+	})
+
+	t.Run("terminal write runs on a live detached context", func(t *testing.T) {
+		runs := &fakeRuns{}
+		sandbox := &fakeSandbox{introspectErr: &SandboxError{Status: http.StatusBadRequest, Message: "boom"}}
+		srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, sandbox)
+		srv.runs = runs
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		srv.runLoop(ctx, revenueGoal(), "run-1")
+		if len(runs.statusCalls) != 1 {
+			t.Fatalf("expected one SetStatus call, got %d", len(runs.statusCalls))
+		}
+		// The write must run on the detached writeCtx, not the cancelled loop ctx —
+		// otherwise a regression reusing the loop ctx would surface here.
+		if runs.statusCalls[0].ctxErr != nil {
+			t.Fatalf("terminal write ran on a cancelled context: %v", runs.statusCalls[0].ctxErr)
+		}
+	})
+
+	t.Run("a panic settles failed and is contained", func(t *testing.T) {
+		runs := &fakeRuns{}
+		srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, panicSandbox{msg: "boom"})
+		srv.runs = runs
+		// Must not propagate — the deferred recover contains it; the test crashes
+		// here if the recover regressed.
+		srv.runLoop(context.Background(), revenueGoal(), "run-1")
+		assertOneStatus(t, runs, store.RunFailed, "hypothesis loop panicked: boom")
+	})
 }
 
 func TestImproves(t *testing.T) {
