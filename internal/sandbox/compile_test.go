@@ -46,6 +46,27 @@ func target(field string) domain.Target {
 	return domain.Target{Field: field, Direction: domain.Maximize}
 }
 
+func boolConstraint(field string, op domain.ConstraintOp, v bool) domain.Constraint {
+	return domain.Constraint{Field: field, Op: op, Operand: &domain.LiteralValue{Bool: &v}}
+}
+
+func strConstraint(field string, op domain.ConstraintOp, v string) domain.Constraint {
+	return domain.Constraint{Field: field, Op: op, Operand: &domain.LiteralValue{String: &v}}
+}
+
+func numConstraint(field string, op domain.ConstraintOp, v float64) domain.Constraint {
+	return domain.Constraint{Field: field, Op: op, Operand: &domain.LiteralValue{Number: &v}}
+}
+
+func strMembers(field string, op domain.ConstraintOp, vs ...string) domain.Constraint {
+	m := make([]domain.LiteralValue, 0, len(vs))
+	for _, v := range vs {
+		v := v
+		m = append(m, domain.LiteralValue{String: &v})
+	}
+	return domain.Constraint{Field: field, Op: op, Members: m}
+}
+
 func TestCompileQueryRejections(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -346,6 +367,77 @@ func TestCompileObjectiveRejections(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if _, _, err := compileObjective(testTableFn, testCols(), "avg", c.expr, nil); !errors.Is(err, c.want) {
 				t.Fatalf("expected %v, got %v", c.want, err)
+			}
+		})
+	}
+}
+
+// TestCompileFiltersCoercedPredicates proves boolean/categorical/set filters compile
+// to bound predicates (values as ? params, never interpolated) and that a numeric
+// threshold still compiles unchanged.
+func TestCompileFiltersCoercedPredicates(t *testing.T) {
+	cases := []struct {
+		name     string
+		filter   domain.Constraint
+		wantSQL  string
+		wantArgs []any
+	}{
+		{"boolean eq", boolConstraint("flag", domain.Equal, true), `"flag" = ?`, []any{true}},
+		{"string eq", strConstraint("name", domain.Equal, "Europa"), `"name" = ?`, []any{"Europa"}},
+		{"string neq", strConstraint("name", domain.NotEqual, "Europa"), `"name" != ?`, []any{"Europa"}},
+		{"string in set", strMembers("name", domain.In, "Europa", "Mars"), `"name" IN (?, ?)`, []any{"Europa", "Mars"}},
+		{"string not_in set", strMembers("name", domain.NotIn, "Earth"), `"name" NOT IN (?)`, []any{"Earth"}},
+		{"numeric threshold", domain.Constraint{Field: "amount", Op: domain.LessThanOrEqual, Value: 5}, `"amount" <= ?`, []any{float64(5)}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			preds, args, err := compileFilters(testCols(), []domain.Constraint{c.filter})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(preds) != 1 || preds[0] != c.wantSQL {
+				t.Fatalf("predicate = %v, want %q", preds, c.wantSQL)
+			}
+			if len(args) != len(c.wantArgs) {
+				t.Fatalf("args = %v, want %v", args, c.wantArgs)
+			}
+			for i := range c.wantArgs {
+				if args[i] != c.wantArgs[i] {
+					t.Fatalf("arg %d = %v, want %v", i, args[i], c.wantArgs[i])
+				}
+			}
+			// Every value is a bound ?, never interpolated into the predicate.
+			for _, s := range []string{"Europa", "Mars", "Earth", "true"} {
+				if strings.Contains(preds[0], s) {
+					t.Fatalf("value %q interpolated into predicate: %q", s, preds[0])
+				}
+			}
+		})
+	}
+}
+
+// TestCompileFiltersRejections proves type-mismatched and malformed filters are
+// rejected at compile time (400), not left to fail mid-scan.
+func TestCompileFiltersRejections(t *testing.T) {
+	cases := []struct {
+		name   string
+		filter domain.Constraint
+		want   error
+	}{
+		{"string operand on numeric column", strConstraint("amount", domain.Equal, "young"), errTypeIncompatible},
+		{"number operand on string column", numConstraint("name", domain.Equal, 5), errTypeIncompatible},
+		{"numeric threshold on string column", domain.Constraint{Field: "name", Op: domain.LessThan, Value: 5}, errNonNumeric},
+		{"empty in set", domain.Constraint{Field: "name", Op: domain.In}, errTypeIncompatible},
+		{"member type mismatch", strMembers("amount", domain.In, "x"), errTypeIncompatible},
+		{"unknown filter column", strConstraint("ghost", domain.Equal, "x"), errUnknownField},
+		{"operator in no class", domain.Constraint{Field: "amount", Op: domain.ConstraintOp("bogus"), Value: 1}, errUnknownOperator},
+		{"equality with nil operand", domain.Constraint{Field: "name", Op: domain.Equal}, errTypeIncompatible},
+		{"membership with empty-literal member", domain.Constraint{Field: "name", Op: domain.In, Members: []domain.LiteralValue{{}}}, errTypeIncompatible},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, _, err := compileFilters(testCols(), []domain.Constraint{c.filter}); !errors.Is(err, c.want) {
+				t.Fatalf("error = %v, want %v", err, c.want)
 			}
 		})
 	}

@@ -35,13 +35,27 @@ var allowedAgg = map[string]string{
 	"count": "COUNT",
 }
 
-// allowedOp maps a hard-constraint operator to a fixed SQL comparison. Only these
-// four operators can appear in a compiled predicate.
+// allowedOp maps a numeric-threshold filter operator to a fixed SQL comparison.
+// Only these four operators can appear in a compiled threshold predicate.
 var allowedOp = map[domain.ConstraintOp]string{
 	domain.LessThan:           "<",
 	domain.LessThanOrEqual:    "<=",
 	domain.GreaterThan:        ">",
 	domain.GreaterThanOrEqual: ">=",
+}
+
+// allowedEqOp maps a scalar-equality filter operator to its SQL comparison; the
+// operand is a bound ? parameter, never interpolated.
+var allowedEqOp = map[domain.ConstraintOp]string{
+	domain.Equal:    "=",
+	domain.NotEqual: "!=",
+}
+
+// allowedMembershipOp maps a set-membership filter operator to its SQL form; each
+// member is a bound ? parameter inside the IN/NOT IN list.
+var allowedMembershipOp = map[domain.ConstraintOp]string{
+	domain.In:    "IN",
+	domain.NotIn: "NOT IN",
 }
 
 // allowedCompareOp is the Comparison node's operator allowlist, keyed by the raw
@@ -167,11 +181,12 @@ func aggregateSelect(sqlAgg, operand, tableFn string, predicates []string) strin
 	return query
 }
 
-// compileFilters compiles the hard-constraint filters shared by the legacy and
+// compileFilters compiles the intervention filters shared by the legacy and
 // expression execute paths into quoted, bound predicates. Each filter column is
-// schema-validated and numeric-guarded (a Constraint.Value is a float64, so a
-// comparison against a non-numeric column would reach DuckDB as a runtime cast
-// error); each threshold is a bound ? parameter, never interpolated.
+// schema-validated; each filter compiles by operator class (numeric threshold,
+// scalar equality, or set membership) with every value bound as a ? parameter,
+// never interpolated. Shared by compileQuery (legacy) and compileObjective, so both
+// execute paths gain the boolean/categorical/set capability.
 func compileFilters(cols []datasource.Column, filters []domain.Constraint) ([]string, []any, error) {
 	var predicates []string
 	var args []any
@@ -180,17 +195,66 @@ func compileFilters(cols []datasource.Column, filters []domain.Constraint) ([]st
 		if err != nil {
 			return nil, nil, err
 		}
-		if !isNumeric(filterCol.Type) {
-			return nil, nil, fmt.Errorf("%w: filter %q (%s)", errNonNumeric, filterCol.Name, filterCol.Type)
+		pred, filterArgs, err := compileFilter(filterCol, f)
+		if err != nil {
+			return nil, nil, err
 		}
-		op, ok := allowedOp[f.Op]
-		if !ok {
-			return nil, nil, fmt.Errorf("%w: %q", errUnknownOperator, f.Op)
-		}
-		predicates = append(predicates, quoteIdent(filterCol.Name)+" "+op+" ?")
-		args = append(args, f.Value)
+		predicates = append(predicates, pred)
+		args = append(args, filterArgs...)
 	}
 	return predicates, args, nil
+}
+
+// compileFilter compiles one filter into a bound predicate, coercing by operator
+// class the way compileExpr's comparison node does. A numeric threshold requires a
+// numeric column (as before) and binds Value; an eq/neq equality binds the typed
+// Operand after a coarse-type-equality check against the column; an in/not_in
+// membership binds each typed Member after the same check, rejecting an empty set.
+// The coarse-type reject (not checkCastable, which would permit e.g. numeric→boolean)
+// is the compile-time guard that keeps a mismatched operand — Age = 'young' or
+// HomePlanet < 5 — from reaching DuckDB as a mid-scan cast error.
+func compileFilter(col datasource.Column, f domain.Constraint) (string, []any, error) {
+	switch {
+	case f.IsNumericThresholdOp():
+		if !isNumeric(col.Type) {
+			return "", nil, fmt.Errorf("%w: filter %q (%s)", errNonNumeric, col.Name, col.Type)
+		}
+		return quoteIdent(col.Name) + " " + allowedOp[f.Op] + " ?", []any{f.Value}, nil
+
+	case f.IsEqualityOp():
+		val, valType, err := literalValue(f.Operand)
+		if err != nil {
+			return "", nil, err
+		}
+		colType := columnCoarseType(col.Type)
+		if valType != colType {
+			return "", nil, fmt.Errorf("%w: filter %q (%s) %s %s operand", errTypeIncompatible, col.Name, colType, f.Op, valType)
+		}
+		return quoteIdent(col.Name) + " " + allowedEqOp[f.Op] + " ?", []any{val}, nil
+
+	case f.IsMembershipOp():
+		if len(f.Members) == 0 {
+			return "", nil, fmt.Errorf("%w: filter %q has an empty %s set", errTypeIncompatible, col.Name, f.Op)
+		}
+		colType := columnCoarseType(col.Type)
+		placeholders := make([]string, 0, len(f.Members))
+		args := make([]any, 0, len(f.Members))
+		for i := range f.Members {
+			val, valType, err := literalValue(&f.Members[i])
+			if err != nil {
+				return "", nil, err
+			}
+			if valType != colType {
+				return "", nil, fmt.Errorf("%w: filter %q (%s) %s %s member", errTypeIncompatible, col.Name, colType, f.Op, valType)
+			}
+			placeholders = append(placeholders, "?")
+			args = append(args, val)
+		}
+		return quoteIdent(col.Name) + " " + allowedMembershipOp[f.Op] + " (" + strings.Join(placeholders, ", ") + ")", args, nil
+
+	default:
+		return "", nil, fmt.Errorf("%w: %q", errUnknownOperator, f.Op)
+	}
 }
 
 // compileObjective produces the read-only aggregate SELECT that measures an

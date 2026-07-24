@@ -26,8 +26,12 @@ var (
 
 // loopTimeout bounds a whole hypothesis run. The loop runs on a background
 // context (decoupled from the SSE stream), so without a deadline a wedged
-// dependency would leak the goroutine indefinitely.
-const loopTimeout = 10 * time.Minute
+// dependency would leak the goroutine indefinitely. It is sized for the depth-4
+// sequential fan-out — one sandbox Execute per node plus one Xhigh proposal per
+// improving internal node, all sequential — so a broad deep run reaches completed
+// rather than tripping the deadline and being flipped to failed via ctx.Err();
+// raise it in step with defaultDepth.
+const loopTimeout = 30 * time.Minute
 
 // statusWriteTimeout bounds the run's terminal status write. It runs on a
 // context detached from the loop's own deadline/cancellation, so a run whose
@@ -276,8 +280,23 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 		"baseline":        baseline,
 		"value":           value,
 		"effect_size":     value - baseline,
+		"objective_label": obj.label,
+		"direction":       string(obj.direction),
+		"filters":         renderConstraints(effective),
+		"new_filters":     renderConstraints(cand.Filters),
 	}})
 	return nil
+}
+
+// renderConstraints renders each filter to a predicate chip for the triplet SSE
+// payload, so the web card shows which segment the triplet measured. A non-nil
+// empty slice marshals to [] rather than null.
+func renderConstraints(filters []domain.Constraint) []string {
+	chips := make([]string, 0, len(filters))
+	for _, f := range filters {
+		chips = append(chips, domain.RenderConstraint(f))
+	}
+	return chips
 }
 
 // branchFailure records a branch-failure audit event and emits a failure SSE

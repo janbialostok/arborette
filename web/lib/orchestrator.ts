@@ -23,6 +23,14 @@ export interface TripletPayload {
   baseline: number;
   value: number;
   effect_size: number;
+  // The objective this triplet measured, its optimization direction, and the
+  // segment's effective/added filters rendered as predicate chips. `direction`
+  // decides which sign of effect_size is an improvement; `filters` is the segment
+  // the triplet measured, `new_filters` the filter this candidate added.
+  objective_label: string;
+  direction: "maximize" | "minimize";
+  filters: string[];
+  new_filters: string[];
 }
 
 export interface BranchFailurePayload {

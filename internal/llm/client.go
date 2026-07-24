@@ -9,6 +9,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -101,15 +102,7 @@ func (c *Client) ProposeInterventionTree(ctx context.Context, goalText string, m
 	if err != nil {
 		return Proposal{}, err
 	}
-	var wire proposalWire
-	if err := json.Unmarshal([]byte(body), &wire); err != nil {
-		return Proposal{}, fmt.Errorf("parse intervention proposal: %w", err)
-	}
-	proposal := Proposal{Candidates: make([]CandidateIntervention, 0, len(wire.Candidates))}
-	for _, cand := range wire.Candidates {
-		proposal.Candidates = append(proposal.Candidates, CandidateIntervention{Filters: cand.Filters})
-	}
-	return proposal, nil
+	return decodeProposal(body)
 }
 
 // RepairInterventionTree re-proposes a node's candidates after some referenced
@@ -118,12 +111,8 @@ func (c *Client) ProposeInterventionTree(ctx context.Context, goalText string, m
 // can re-propose using only real columns. The objective stays pinned from the
 // matrix, never proposed here.
 func (c *Client) RepairInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext, prior Proposal, validationErr string) (Proposal, error) {
-	priorJSON, err := json.Marshal(prior.Candidates)
-	if err != nil {
-		return Proposal{}, fmt.Errorf("marshal rejected candidates: %w", err)
-	}
 	user := treePrompt(goalText, matrix, schema, node) +
-		"\nThese proposed candidates referenced columns absent from the schema:\n" + string(priorJSON) +
+		"\nThese proposed candidates referenced columns absent from the schema:\n" + renderCandidates(prior.Candidates) +
 		"\n\nThe rejection:\n" + validationErr +
 		"\n\nRe-propose the candidates using only the listed columns, with their exact names."
 	body, err := c.complete(ctx, anthropic.OutputConfigEffortXhigh, interventionTreeSchema(schema),
@@ -131,23 +120,135 @@ func (c *Client) RepairInterventionTree(ctx context.Context, goalText string, ma
 	if err != nil {
 		return Proposal{}, err
 	}
+	return decodeProposal(body)
+}
+
+// proposalWire mirrors the intervention-tree structured-output body: candidates
+// carrying filters only. Each filter's value is polymorphic (a bare scalar or a flat
+// array), so it is captured as filterWire and decoded into a typed domain.Constraint.
+type proposalWire struct {
+	Candidates []struct {
+		Filters []filterWire `json:"filters"`
+	} `json:"candidates"`
+}
+
+// filterWire mirrors one intervention filter from the structured-output body: field,
+// op, and a polymorphic value. domain.LiteralValue is a JSON object and cannot
+// unmarshal a bare scalar, so the value is captured raw and token-sniffed in
+// toConstraint — a distinct decode path from evaluationMatrixWire, which stays
+// numeric.
+type filterWire struct {
+	Field string              `json:"field"`
+	Op    domain.ConstraintOp `json:"op"`
+	Value json.RawMessage     `json:"value"`
+}
+
+// decodeProposal parses an intervention-tree body and maps each candidate's filters
+// into typed domain.Constraints. A malformed body or a type-mismatched filter value
+// is a generation error, mapped by the caller like any other proposal parse failure.
+func decodeProposal(body string) (Proposal, error) {
 	var wire proposalWire
 	if err := json.Unmarshal([]byte(body), &wire); err != nil {
 		return Proposal{}, fmt.Errorf("parse intervention proposal: %w", err)
 	}
 	proposal := Proposal{Candidates: make([]CandidateIntervention, 0, len(wire.Candidates))}
 	for _, cand := range wire.Candidates {
-		proposal.Candidates = append(proposal.Candidates, CandidateIntervention{Filters: cand.Filters})
+		filters := make([]domain.Constraint, 0, len(cand.Filters))
+		for _, fw := range cand.Filters {
+			f, err := fw.toConstraint()
+			if err != nil {
+				return Proposal{}, fmt.Errorf("parse intervention proposal: %w", err)
+			}
+			filters = append(filters, f)
+		}
+		proposal.Candidates = append(proposal.Candidates, CandidateIntervention{Filters: filters})
 	}
 	return proposal, nil
 }
 
-// proposalWire mirrors the intervention-tree structured-output body: candidates
-// carrying filters only.
-type proposalWire struct {
-	Candidates []struct {
-		Filters []domain.Constraint `json:"filters"`
-	} `json:"candidates"`
+// toConstraint maps a filterWire into a typed domain.Constraint by sniffing the raw
+// JSON token of value: a JSON array feeds Members (in/not_in); a bare number/string/
+// bool scalar feeds Value (numeric thresholds) or Operand (eq/neq). A value whose
+// JSON shape does not match the operator class is a generation error.
+func (f filterWire) toConstraint() (domain.Constraint, error) {
+	c := domain.Constraint{Field: f.Field, Op: f.Op}
+	trimmed := bytes.TrimSpace(f.Value)
+	if len(trimmed) == 0 {
+		return domain.Constraint{}, fmt.Errorf("filter %q: empty value", f.Field)
+	}
+	isArray := trimmed[0] == '['
+	switch {
+	case c.IsMembershipOp():
+		if !isArray {
+			return domain.Constraint{}, fmt.Errorf("filter %q: %s requires a set value", f.Field, f.Op)
+		}
+		members, err := scalarLiterals(trimmed)
+		if err != nil {
+			return domain.Constraint{}, fmt.Errorf("filter %q: %w", f.Field, err)
+		}
+		c.Members = members
+	case c.IsNumericThresholdOp():
+		lit, err := scalarLiteral(trimmed)
+		if err != nil {
+			return domain.Constraint{}, fmt.Errorf("filter %q: %w", f.Field, err)
+		}
+		if lit.Number == nil {
+			return domain.Constraint{}, fmt.Errorf("filter %q: %s requires a numeric value", f.Field, f.Op)
+		}
+		c.Value = *lit.Number
+	case c.IsEqualityOp():
+		lit, err := scalarLiteral(trimmed)
+		if err != nil {
+			return domain.Constraint{}, fmt.Errorf("filter %q: %w", f.Field, err)
+		}
+		c.Operand = &lit
+	default:
+		return domain.Constraint{}, fmt.Errorf("filter %q: unsupported operator %q", f.Field, f.Op)
+	}
+	return c, nil
+}
+
+// scalarLiteral parses one JSON scalar (number, string, or boolean) into a typed
+// domain.LiteralValue; any other JSON shape (array, object, null) is an error.
+func scalarLiteral(raw json.RawMessage) (domain.LiteralValue, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return domain.LiteralValue{}, fmt.Errorf("parse scalar value: %w", err)
+	}
+	switch n := v.(type) {
+	case json.Number:
+		f, err := n.Float64()
+		if err != nil {
+			return domain.LiteralValue{}, fmt.Errorf("parse numeric value: %w", err)
+		}
+		return domain.LiteralValue{Number: &f}, nil
+	case string:
+		s := n
+		return domain.LiteralValue{String: &s}, nil
+	case bool:
+		b := n
+		return domain.LiteralValue{Bool: &b}, nil
+	default:
+		return domain.LiteralValue{}, fmt.Errorf("value is not a scalar")
+	}
+}
+
+func scalarLiterals(raw json.RawMessage) ([]domain.LiteralValue, error) {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("parse set value: %w", err)
+	}
+	lits := make([]domain.LiteralValue, 0, len(items))
+	for _, it := range items {
+		lit, err := scalarLiteral(it)
+		if err != nil {
+			return nil, err
+		}
+		lits = append(lits, lit)
+	}
+	return lits, nil
 }
 
 // evaluationMatrixWire mirrors the matrix structured-output body: each target's
@@ -271,18 +372,23 @@ const evaluationMatrixRepairSystem = "You fit an analyst's optimization goal to 
 const expressionShapeGuide = ` Each target's "value" field MUST be a JSON string containing a JSON object that encodes the value expression — not a bare object. That object is a discriminated union on a "kind" field, one of: column_ref {"kind":"column_ref","column":<name>}; literal {"kind":"literal","literal":{"number"|"string"|"bool":<value>}}; cast {"kind":"cast","operand":<expr>,"cast_type":<type>}; comparison {"kind":"comparison","op":<op>,"left":<expr>,"right":<expr>}; arithmetic {"kind":"arithmetic","op":<op>,"left":<expr>,"right":<expr>}; case {"kind":"case","cases":[{"when":<expr>,"then":<expr>}],"else":<expr>}. Nested expressions are the same object shape. A plain numeric objective is a bare column_ref, e.g. "value":"{\"kind\":\"column_ref\",\"column\":\"revenue\"}". A boolean rate is avg over a comparison, e.g. "value":"{\"kind\":\"comparison\",\"op\":\"=\",\"left\":{\"kind\":\"column_ref\",\"column\":\"Transported\"},\"right\":{\"kind\":\"literal\",\"literal\":{\"bool\":true}}}". A bucketed rate is avg over a case, e.g. avg(CASE WHEN age > 18 THEN 1 ELSE 0 END) is a case whose one branch compares age > 18 then literal 1, else literal 0. Reference only columns from the "Available columns" list inside the expression.`
 
 const interventionTreeSystem = "You propose candidate interventions for an empirical hypothesis tree over a " +
-	"tabular data source. Each candidate is a set of hard-constraint filters that segments the data; the run " +
+	"tabular data source. Each candidate is a set of filters that segments the data; the run " +
 	"measures a single fixed objective aggregate over each segment. The objective is already fixed. Filter fields " +
 	"must reference ONLY columns present in the provided \"Available columns\" list, using each column's exact " +
 	"name as written there — a name absent from the list will be rejected. Candidates vary filters only — never " +
-	"re-propose the objective."
+	"re-propose the objective." + filterShapeGuide
 
 const interventionTreeRepairSystem = "You propose candidate interventions for an empirical hypothesis tree over a " +
 	"tabular data source. A previous proposal referenced filter columns absent from the schema. Given the rejected " +
-	"candidates and the naming error, re-propose the candidates as hard-constraint filters that segment the data " +
+	"candidates and the naming error, re-propose the candidates as filters that segment the data " +
 	"toward the fixed objective. Filter fields must reference ONLY columns present in the provided \"Available " +
 	"columns\" list, using each column's exact name as written there. Candidates vary filters only — never " +
-	"re-propose the objective."
+	"re-propose the objective." + filterShapeGuide
+
+// filterShapeGuide grounds the intervention filter shape by column type, so the model
+// emits an operator and value that match the column and compile in the sandbox. It is
+// appended to the intervention-tree system prompts, à la expressionShapeGuide.
+const filterShapeGuide = ` Each filter is {"field":<column>,"op":<operator>,"value":<value>}. Choose the operator and value by the column's type: a numeric column uses "lt"/"lte"/"gt"/"gte" with a number (e.g. {"field":"Age","op":"lte","value":18}); a boolean column uses "eq"/"neq" with true or false (e.g. {"field":"CryoSleep","op":"eq","value":true}); a categorical/string column uses "eq"/"neq" with a string, or "in"/"not_in" with an array of strings (e.g. {"field":"HomePlanet","op":"in","value":["Europa","Mars"]}). The value is a bare JSON scalar for eq/neq and the threshold ops, and a JSON array for in/not_in — never a quoted-JSON string. Use only an operator and value type that match the column's type.`
 
 // treePrompt assembles the per-node user message: the goal, the matrix, the
 // available columns, and — at deeper nodes — the pinned objective, the parent's
@@ -314,7 +420,7 @@ func matrixSummary(matrix domain.EvaluationMatrix) string {
 		fmt.Fprintf(&b, "- %s %s\n", t.Direction, domain.RenderObjectiveLabel(t.Aggregation, t.ValueExpression()))
 	}
 	for _, c := range matrix.Constraints {
-		fmt.Fprintf(&b, "- constraint: %s %s %v\n", c.Field, c.Op, c.Value)
+		fmt.Fprintf(&b, "- constraint: %s\n", domain.RenderConstraint(c))
 	}
 	return b.String()
 }
@@ -333,7 +439,29 @@ func filterSummary(filters []domain.Constraint) string {
 	}
 	var b strings.Builder
 	for _, f := range filters {
-		fmt.Fprintf(&b, "- %s %s %v\n", f.Field, f.Op, f.Value)
+		fmt.Fprintf(&b, "- %s\n", domain.RenderConstraint(f))
 	}
 	return b.String()
+}
+
+// renderCandidates renders rejected candidates as readable filter chips for the
+// repair prompt, matching the flat filter shape the output schema demands rather than
+// domain.Constraint's internal json (value:0, operand:{...}).
+func renderCandidates(candidates []CandidateIntervention) string {
+	var b strings.Builder
+	for i, cand := range candidates {
+		fmt.Fprintf(&b, "- candidate %d: %s\n", i+1, renderFiltersInline(cand.Filters))
+	}
+	return b.String()
+}
+
+func renderFiltersInline(filters []domain.Constraint) string {
+	if len(filters) == 0 {
+		return "(none)"
+	}
+	parts := make([]string, 0, len(filters))
+	for _, f := range filters {
+		parts = append(parts, domain.RenderConstraint(f))
+	}
+	return strings.Join(parts, ", ")
 }

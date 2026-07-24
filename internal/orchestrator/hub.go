@@ -3,8 +3,11 @@ package orchestrator
 import "sync"
 
 // replayBufferSize bounds the per-run event history the hub retains for replay,
-// capping memory while covering the subscribe-after-trigger race.
-const replayBufferSize = 64
+// capping memory while covering the subscribe-after-trigger race. Sized above the
+// depth-4 worst-case event count (≈ breadth+breadth²+breadth³+breadth⁴ triplets plus
+// branch-failure/loop-complete frames) so a mid-run SSE reconnect replays the whole
+// run rather than dropping the earliest triplets from the feed.
+const replayBufferSize = 256
 
 // Event is one progress item published to a run's subscribers and serialized as
 // an SSE data frame.

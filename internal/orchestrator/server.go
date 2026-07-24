@@ -25,11 +25,13 @@ import (
 
 // Tree defaults are named constants so they are tunable against real sample data
 // without touching call sites: breadth candidate interventions per node, depth
-// refinement levels below the root. Worst case ≈ breadth + breadth² candidate
-// evaluations per run.
+// refinement levels below the root. Worst case ≈ breadth + breadth² + breadth³ +
+// breadth⁴ candidate evaluations per run at depth 4; improving-branch pruning bounds
+// the fan-out well below that in practice, but loopTimeout/replayBufferSize are sized
+// for the worst case.
 const (
 	defaultBreadth = 3
-	defaultDepth   = 2
+	defaultDepth   = 4
 )
 
 // The interfaces below are the narrow contracts the Server depends on, defined

@@ -2,11 +2,14 @@ import type { TripletPayload } from "@/lib/orchestrator";
 import { cn } from "@/components/ui";
 
 // EffectReadout renders one causal triplet as a diverging effect-size bar:
-// baseline at the center axis, the bar extending right for a positive delta
-// (green) or left for a negative one (coral), width normalized against the
-// largest-magnitude effect currently in the feed. effect_size is a signed
-// magnitude (value − baseline), not a judgement of good/bad — direction of
-// "improvement" depends on the objective, which the live stream doesn't carry.
+// baseline at the center axis, the bar extending right for a positive delta or
+// left for a negative one, width normalized against the largest-magnitude effect
+// currently in the feed. effect_size is a signed magnitude (value − baseline); the
+// stream now carries the objective `direction`, so the bar and number are colored
+// by whether the delta is an improvement (green) or a regression (coral) — for a
+// minimize objective a negative delta is the improvement. The segment's filters
+// render as predicate chips so the card shows which segment was measured, not just
+// the delta.
 export function EffectReadout({
   triplet,
   scale,
@@ -16,9 +19,12 @@ export function EffectReadout({
   scale: number;
   index: number;
 }) {
-  const { baseline, value, effect_size } = triplet;
-  const positive = effect_size > 0;
-  const negative = effect_size < 0;
+  const { baseline, value, effect_size, direction, filters } = triplet;
+  const improved =
+    direction === "minimize" ? effect_size < 0 : effect_size > 0;
+  const worsened =
+    direction === "minimize" ? effect_size > 0 : effect_size < 0;
+  const rightward = effect_size > 0;
   const pct = scale > 0 ? Math.min(Math.abs(effect_size) / scale, 1) * 50 : 0;
 
   return (
@@ -33,25 +39,38 @@ export function EffectReadout({
         <span
           className={cn(
             "font-mono text-lg font-semibold tabular",
-            positive && "text-signal",
-            negative && "text-neg",
-            !positive && !negative && "text-muted",
+            improved && "text-signal",
+            worsened && "text-neg",
+            !improved && !worsened && "text-muted",
           )}
         >
-          {positive ? "+" : ""}
+          {effect_size > 0 ? "+" : ""}
           {fmt(effect_size)}
         </span>
       </div>
+
+      {filters.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1">
+          {filters.map((f, i) => (
+            <span
+              key={i}
+              className="rounded border border-line bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-muted"
+            >
+              {f}
+            </span>
+          ))}
+        </div>
+      )}
 
       <div className="relative my-3 h-2 rounded-full bg-surface-2">
         <div className="absolute inset-y-0 left-1/2 w-px bg-line-strong" />
         <div
           className={cn(
             "animate-bar absolute inset-y-0 rounded-full",
-            positive ? "bg-signal" : "bg-neg",
+            improved ? "bg-signal" : "bg-neg",
           )}
           style={
-            positive
+            rightward
               ? { left: "50%", width: `${pct}%` }
               : { right: "50%", width: `${pct}%` }
           }

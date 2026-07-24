@@ -206,13 +206,138 @@ func TestRepairInterventionTree(t *testing.T) {
 	if len(proposal.Candidates) != 1 || proposal.Candidates[0].Filters[0].Field != "HomePlanet" {
 		t.Fatalf("expected the repaired candidate, got %+v", proposal.Candidates)
 	}
-	// The repair prompt must embed the rejected candidates and the naming error.
+	// The repair prompt must embed the rejected candidates (rendered in the flat
+	// filter shape the output schema demands, not domain.Constraint's internal json)
+	// and the naming error.
 	user := fake.got.Messages[0].Content[0].OfText.Text
-	if !strings.Contains(user, `"field":"home_world"`) {
-		t.Fatalf("repair prompt did not embed the rejected candidates: %q", user)
+	if !strings.Contains(user, "home_world >= 1") {
+		t.Fatalf("repair prompt did not embed the rejected candidates as rendered chips: %q", user)
 	}
 	if !strings.Contains(user, "these filter columns are not in the schema: home_world") {
 		t.Fatalf("repair prompt did not embed the naming error: %q", user)
+	}
+}
+
+// TestProposeInterventionTreeDecodesRicherFilters proves the filterWire decode maps a
+// proposal mixing eq/in/threshold filters into typed domain.Constraints by sniffing
+// the value's JSON token, and that the intervention system prompt grounds the shape.
+func TestProposeInterventionTreeDecodesRicherFilters(t *testing.T) {
+	body := `{"candidates":[{"filters":[` +
+		`{"field":"CryoSleep","op":"eq","value":true},` +
+		`{"field":"HomePlanet","op":"in","value":["Europa","Mars"]},` +
+		`{"field":"Age","op":"lte","value":18}` +
+		`]}]}`
+	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
+	c := &Client{messages: fake, model: "test-model"}
+
+	schema := SandboxSchema{Columns: []SandboxColumn{
+		{Name: "CryoSleep", Type: "BOOLEAN"}, {Name: "HomePlanet", Type: "VARCHAR"}, {Name: "Age", Type: "BIGINT"}}}
+	proposal, err := c.ProposeInterventionTree(context.Background(), "grow the transported rate",
+		domain.EvaluationMatrix{Targets: []domain.Target{{Field: "x", Direction: domain.Maximize, Aggregation: "avg"}}},
+		schema, TreeContext{IsRoot: true, Breadth: 3})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	filters := proposal.Candidates[0].Filters
+	if len(filters) != 3 {
+		t.Fatalf("want 3 filters, got %d", len(filters))
+	}
+	// bool scalar token → Operand.
+	if filters[0].Op != domain.Equal || filters[0].Operand == nil || filters[0].Operand.Bool == nil || !*filters[0].Operand.Bool {
+		t.Fatalf("bool eq not decoded to Operand: %+v", filters[0])
+	}
+	// array token → Members.
+	if filters[1].Op != domain.In || len(filters[1].Members) != 2 || filters[1].Members[0].String == nil || *filters[1].Members[0].String != "Europa" {
+		t.Fatalf("in-set not decoded to Members: %+v", filters[1])
+	}
+	// number scalar token under a threshold op → Value.
+	if filters[2].Op != domain.LessThanOrEqual || filters[2].Value != 18 || filters[2].Operand != nil || filters[2].Members != nil {
+		t.Fatalf("threshold not decoded to Value: %+v", filters[2])
+	}
+	// The intervention system prompt grounds the filter shape (filterShapeGuide).
+	if !strings.Contains(fake.got.System[0].Text, "not_in") {
+		t.Fatalf("intervention system prompt missing filterShapeGuide: %q", fake.got.System[0].Text)
+	}
+}
+
+// TestProposeInterventionTreeRejectsMismatchedValue proves a value whose JSON token
+// does not match the operator class is a generation error, mapped like any other
+// proposal parse failure.
+func TestProposeInterventionTreeRejectsMismatchedValue(t *testing.T) {
+	body := `{"candidates":[{"filters":[{"field":"Age","op":"lte","value":"young"}]}]}`
+	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
+	c := &Client{messages: fake, model: "test-model"}
+	if _, err := c.ProposeInterventionTree(context.Background(), "goal",
+		domain.EvaluationMatrix{Targets: []domain.Target{{Field: "x", Direction: domain.Maximize, Aggregation: "avg"}}},
+		SandboxSchema{}, TreeContext{IsRoot: true, Breadth: 3}); err == nil {
+		t.Fatalf("expected a generation error for a threshold op with a non-numeric value")
+	}
+}
+
+// TestFilterWireToConstraintRejectsShapeMismatch pins the op/value-shape agreement
+// that toConstraint alone enforces: the loose filterItem schema accepts a scalar or
+// an array for any op, so a membership op with a scalar, an equality op with an
+// array, a threshold with a non-number, an empty value, or a non-scalar shape must
+// each become a generation error rather than a mis-typed constraint.
+func TestFilterWireToConstraintRejectsShapeMismatch(t *testing.T) {
+	cases := []struct {
+		name string
+		fw   filterWire
+	}{
+		{"membership with scalar", filterWire{Field: "HomePlanet", Op: domain.In, Value: json.RawMessage(`"Europa"`)}},
+		{"equality with array", filterWire{Field: "HomePlanet", Op: domain.Equal, Value: json.RawMessage(`["Europa","Mars"]`)}},
+		{"threshold with string", filterWire{Field: "Age", Op: domain.LessThanOrEqual, Value: json.RawMessage(`"young"`)}},
+		{"threshold with array", filterWire{Field: "Age", Op: domain.LessThanOrEqual, Value: json.RawMessage(`[1]`)}},
+		{"empty value", filterWire{Field: "Age", Op: domain.Equal, Value: json.RawMessage("")}},
+		{"object value", filterWire{Field: "x", Op: domain.Equal, Value: json.RawMessage(`{"a":1}`)}},
+		{"membership with non-scalar member", filterWire{Field: "HomePlanet", Op: domain.In, Value: json.RawMessage(`[["x"]]`)}},
+		{"unknown operator", filterWire{Field: "x", Op: domain.ConstraintOp("bogus"), Value: json.RawMessage(`1`)}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := c.fw.toConstraint(); err == nil {
+				t.Fatalf("expected a generation error for %s", c.name)
+			}
+		})
+	}
+}
+
+// TestFilterWireToConstraintMembershipScalars confirms an array value decodes into
+// typed Members preserving element types.
+func TestFilterWireToConstraintMembershipScalars(t *testing.T) {
+	fw := filterWire{Field: "HomePlanet", Op: domain.NotIn, Value: json.RawMessage(`["Earth"]`)}
+	c, err := fw.toConstraint()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(c.Members) != 1 || c.Members[0].String == nil || *c.Members[0].String != "Earth" {
+		t.Fatalf("not_in members not decoded: %+v", c)
+	}
+}
+
+func TestRenderFiltersInlineEmpty(t *testing.T) {
+	if got := renderFiltersInline(nil); got != "(none)" {
+		t.Fatalf("renderFiltersInline(nil) = %q, want (none)", got)
+	}
+}
+
+// TestDecodeMatrixNumericConstraintUnchanged guards that the matrix hard constraints
+// stay numeric-only end to end: a numeric constraint decodes into a bare
+// {field, op, value} with no operand/members.
+func TestDecodeMatrixNumericConstraintUnchanged(t *testing.T) {
+	body := `{"targets":[{"direction":"maximize","aggregation":"avg",` +
+		`"value":"{\"kind\":\"column_ref\",\"column\":\"revenue\"}"}],` +
+		`"constraints":[{"field":"cost","op":"lte","value":100}]}`
+	matrix, err := decodeMatrix(body)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(matrix.Constraints) != 1 {
+		t.Fatalf("want 1 constraint, got %d", len(matrix.Constraints))
+	}
+	c := matrix.Constraints[0]
+	if c.Field != "cost" || c.Op != domain.LessThanOrEqual || c.Value != 100 || c.Operand != nil || c.Members != nil {
+		t.Fatalf("numeric matrix constraint not decoded unchanged: %+v", c)
 	}
 }
 

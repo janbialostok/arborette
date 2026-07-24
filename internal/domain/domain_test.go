@@ -209,6 +209,112 @@ func TestUnknownFilterColumns(t *testing.T) {
 	})
 }
 
+// TestLegacyConstraintRoundTrip guards the additive contract on Constraint: a
+// stored numeric-threshold constraint deserializes without error and re-marshals
+// byte-identically (no operand/members keys leak in, and value:0 is preserved).
+func TestLegacyConstraintRoundTrip(t *testing.T) {
+	legacy := `{"field":"revenue","op":"lte","value":100}`
+
+	var got Constraint
+	if err := json.Unmarshal([]byte(legacy), &got); err != nil {
+		t.Fatalf("unmarshal legacy constraint: %v", err)
+	}
+	if !got.IsNumericThresholdOp() {
+		t.Fatalf("lte should be a numeric threshold op")
+	}
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != legacy {
+		t.Fatalf("legacy constraint not byte-identical:\n got %s\nwant %s", b, legacy)
+	}
+}
+
+// TestFilterConstraintRoundTrip confirms the new equality/membership constraints
+// round-trip through their typed operand/members fields.
+func TestFilterConstraintRoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		c    Constraint
+	}{
+		{"bool eq", Constraint{Field: "CryoSleep", Op: Equal, Operand: &LiteralValue{Bool: ptr(true)}}},
+		{"string neq", Constraint{Field: "HomePlanet", Op: NotEqual, Operand: &LiteralValue{String: ptr("Europa")}}},
+		{"string in set", Constraint{Field: "HomePlanet", Op: In, Members: []LiteralValue{
+			{String: ptr("Europa")}, {String: ptr("Mars")}}}},
+		{"string not_in set", Constraint{Field: "HomePlanet", Op: NotIn, Members: []LiteralValue{
+			{String: ptr("Earth")}}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b, err := json.Marshal(c.c)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var got Constraint
+			if err := json.Unmarshal(b, &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !reflect.DeepEqual(got, c.c) {
+				t.Fatalf("round-trip mismatch:\n got %+v\nwant %+v", got, c.c)
+			}
+		})
+	}
+}
+
+// TestConstraintOpClass confirms the op-class accessors partition the operators so
+// consumers never hardcode the op sets.
+func TestConstraintOpClass(t *testing.T) {
+	cases := []struct {
+		op        ConstraintOp
+		threshold bool
+		equality  bool
+		member    bool
+	}{
+		{LessThan, true, false, false},
+		{GreaterThanOrEqual, true, false, false},
+		{Equal, false, true, false},
+		{NotEqual, false, true, false},
+		{In, false, false, true},
+		{NotIn, false, false, true},
+	}
+	for _, c := range cases {
+		t.Run(string(c.op), func(t *testing.T) {
+			con := Constraint{Op: c.op}
+			if con.IsNumericThresholdOp() != c.threshold ||
+				con.IsEqualityOp() != c.equality ||
+				con.IsMembershipOp() != c.member {
+				t.Fatalf("%s classes = (threshold %v, equality %v, member %v), want (%v, %v, %v)",
+					c.op, con.IsNumericThresholdOp(), con.IsEqualityOp(), con.IsMembershipOp(),
+					c.threshold, c.equality, c.member)
+			}
+		})
+	}
+}
+
+func TestRenderConstraint(t *testing.T) {
+	cases := []struct {
+		name string
+		c    Constraint
+		want string
+	}{
+		{"numeric threshold", Constraint{Field: "Age", Op: LessThanOrEqual, Value: 100}, "Age <= 100"},
+		{"bool eq", Constraint{Field: "CryoSleep", Op: Equal, Operand: &LiteralValue{Bool: ptr(true)}}, "CryoSleep = True"},
+		{"string neq", Constraint{Field: "HomePlanet", Op: NotEqual, Operand: &LiteralValue{String: ptr("Europa")}}, "HomePlanet != Europa"},
+		{"string in set", Constraint{Field: "HomePlanet", Op: In, Members: []LiteralValue{
+			{String: ptr("Europa")}, {String: ptr("Mars")}}}, "HomePlanet IN {Europa, Mars}"},
+		{"string not_in set", Constraint{Field: "HomePlanet", Op: NotIn, Members: []LiteralValue{
+			{String: ptr("Earth")}}}, "HomePlanet NOT IN {Earth}"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := RenderConstraint(c.c); got != c.want {
+				t.Fatalf("RenderConstraint = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestRenderObjectiveLabel(t *testing.T) {
 	cases := []struct {
 		name string

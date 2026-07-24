@@ -112,7 +112,8 @@ func TestInterventionTreeSchema(t *testing.T) {
 	}
 
 	// Candidate filter fields are plain strings (grounded via the prompt, validated
-	// after generation), while the op keeps its fixed-cardinality enum.
+	// after generation), while the op keeps its fixed-cardinality enum over the richer
+	// FilterOps and the value is a bounded scalar-union-plus-array anyOf.
 	filterItems := props["candidates"].(map[string]any)["items"].(map[string]any)
 	filterField := properties(t, filterItems)["filters"].(map[string]any)["items"].(map[string]any)
 	field := properties(t, filterField)["field"].(map[string]any)
@@ -122,8 +123,39 @@ func TestInterventionTreeSchema(t *testing.T) {
 	if _, hasEnum := field["enum"]; hasEnum {
 		t.Fatalf("candidate filter field must not be enum-constrained: %v", field)
 	}
-	if len(enumValues(t, properties(t, filterField)["op"])) != len(domain.ConstraintOps) {
-		t.Fatalf("op enum = %v, want the domain constraint-op set", enumValues(t, properties(t, filterField)["op"]))
+	op := enumValues(t, properties(t, filterField)["op"])
+	if len(op) != len(domain.FilterOps) {
+		t.Fatalf("op enum = %v, want the domain filter-op set (%d entries)", op, len(domain.FilterOps))
+	}
+
+	// The value is a bounded anyOf: number/string/boolean scalar, or a flat array of
+	// those scalars — non-recursive, no per-column enum, so the grammar stays small.
+	value := properties(t, filterField)["value"].(map[string]any)
+	variants, ok := value["anyOf"].([]any)
+	if !ok || len(variants) != 4 {
+		t.Fatalf("filter value must be a 4-variant anyOf (scalar union + array), got %v", value)
+	}
+	if _, hasEnum := value["enum"]; hasEnum {
+		t.Fatalf("filter value must not be enum-constrained: %v", value)
+	}
+	arrayVariant := variants[3].(map[string]any)
+	if arrayVariant["type"] != "array" {
+		t.Fatalf("filter value's fourth variant must be the flat array: %v", arrayVariant)
+	}
+}
+
+// TestConstraintItemStaysNumeric guards the schema split: the matrix hard-constraint
+// item (shared with evaluationMatrixSchema) keeps the numeric op enum and a plain
+// number value, so decodeMatrix never has to decode a richer op or value.
+func TestConstraintItemStaysNumeric(t *testing.T) {
+	item := constraintItem()
+	op := enumValues(t, properties(t, item)["op"])
+	if len(op) != len(domain.ConstraintOps) {
+		t.Fatalf("matrix constraint op enum = %v, want the numeric constraint-op set (%d entries)", op, len(domain.ConstraintOps))
+	}
+	value := properties(t, item)["value"].(map[string]any)
+	if value["type"] != "number" {
+		t.Fatalf("matrix constraint value must stay a plain number: %v", value)
 	}
 }
 

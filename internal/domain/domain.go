@@ -241,6 +241,54 @@ func renderLiteral(l *LiteralValue) string {
 	}
 }
 
+// RenderConstraint renders a constraint as a human-readable predicate chip (e.g.
+// "Age <= 100", "HomePlanet = Europa", "HomePlanet IN {Europa, Mars}").
+// Deterministic and dependency-free, mirroring renderExpr/renderLiteral, so the
+// orchestrator's SSE payload and the llm package's prompt summaries render a filter
+// identically.
+func RenderConstraint(c Constraint) string {
+	op := renderConstraintOp(c.Op)
+	switch {
+	case c.IsMembershipOp():
+		return c.Field + " " + op + " {" + renderMembers(c.Members) + "}"
+	case c.IsEqualityOp():
+		return c.Field + " " + op + " " + renderLiteral(c.Operand)
+	default:
+		return c.Field + " " + op + " " + strconv.FormatFloat(c.Value, 'g', -1, 64)
+	}
+}
+
+func renderConstraintOp(op ConstraintOp) string {
+	switch op {
+	case LessThan:
+		return "<"
+	case LessThanOrEqual:
+		return "<="
+	case GreaterThan:
+		return ">"
+	case GreaterThanOrEqual:
+		return ">="
+	case Equal:
+		return "="
+	case NotEqual:
+		return "!="
+	case In:
+		return "IN"
+	case NotIn:
+		return "NOT IN"
+	default:
+		return string(op)
+	}
+}
+
+func renderMembers(members []LiteralValue) string {
+	parts := make([]string, 0, len(members))
+	for i := range members {
+		parts = append(parts, renderLiteral(&members[i]))
+	}
+	return strings.Join(parts, ", ")
+}
+
 // MaxObjectiveExpressionDepth caps how deeply an objective value expression may
 // nest. Real objectives are shallow — the deepest expected shape is avg over a
 // case-bucket over a comparison over a column_ref, which ExpressionDepth counts as
@@ -277,7 +325,10 @@ func childDepth(e *Expression) int {
 	return ExpressionDepth(*e)
 }
 
-// ConstraintOp expresses a hard-constraint boundary comparison.
+// ConstraintOp expresses a comparison used by both the matrix's numeric
+// hard-constraint boundaries (lt/lte/gt/gte only) and the intervention filters,
+// which additionally segment boolean/categorical columns via equality (eq/neq)
+// and set membership (in/not_in).
 type ConstraintOp string
 
 const (
@@ -285,13 +336,39 @@ const (
 	LessThanOrEqual    ConstraintOp = "lte"
 	GreaterThan        ConstraintOp = "gt"
 	GreaterThanOrEqual ConstraintOp = "gte"
+	Equal              ConstraintOp = "eq"
+	NotEqual           ConstraintOp = "neq"
+	In                 ConstraintOp = "in"
+	NotIn              ConstraintOp = "not_in"
 )
 
-// Constraint is a hard boundary a candidate intervention must respect.
+// Constraint is a hard boundary a candidate intervention must respect. A numeric
+// threshold uses Value (Op ∈ lt/lte/gt/gte); a boolean/categorical equality uses
+// Operand (Op ∈ eq/neq); a set membership uses Members (Op ∈ in/not_in). Value
+// stays present (not omitempty) so a legacy numeric-threshold constraint round-trips
+// byte-identical; Operand/Members are omitempty so they are absent unless set.
 type Constraint struct {
-	Field string       `json:"field"`
-	Op    ConstraintOp `json:"op"`
-	Value float64      `json:"value"`
+	Field   string         `json:"field"`
+	Op      ConstraintOp   `json:"op"`
+	Value   float64        `json:"value"`
+	Operand *LiteralValue  `json:"operand,omitempty"`
+	Members []LiteralValue `json:"members,omitempty"`
+}
+
+// IsNumericThresholdOp reports whether the operator is a numeric threshold
+// (lt/lte/gt/gte).
+func (c Constraint) IsNumericThresholdOp() bool {
+	return c.Op == LessThan || c.Op == LessThanOrEqual || c.Op == GreaterThan || c.Op == GreaterThanOrEqual
+}
+
+// IsEqualityOp reports whether the operator is a scalar equality (eq/neq).
+func (c Constraint) IsEqualityOp() bool {
+	return c.Op == Equal || c.Op == NotEqual
+}
+
+// IsMembershipOp reports whether the operator is set membership (in/not_in).
+func (c Constraint) IsMembershipOp() bool {
+	return c.Op == In || c.Op == NotIn
 }
 
 // Aggregations is the canonical set of aggregate functions a query intervention
@@ -310,10 +387,19 @@ func IsAggregation(agg string) bool {
 	return false
 }
 
-// ConstraintOps is the canonical set of hard-constraint comparison operators, so
-// the structured-output schema enum derives from the same values the typed
-// ConstraintOp constants define rather than re-hardcoding them.
+// ConstraintOps is the canonical set of matrix hard-constraint comparison
+// operators, so the structured-output schema enum derives from the same values the
+// typed ConstraintOp constants define rather than re-hardcoding them. It stays
+// numeric-only because the matrix hard constraints are numeric boundaries on the
+// objective aggregate; the richer intervention-filter ops live in FilterOps.
 var ConstraintOps = []ConstraintOp{LessThan, LessThanOrEqual, GreaterThan, GreaterThanOrEqual}
+
+// FilterOps is the canonical set of intervention-filter operators: the numeric
+// threshold ops plus equality and set membership for boolean/categorical columns.
+// It is the single source the intervention-filter structured-output schema enum
+// derives from, kept separate from ConstraintOps so the richer ops never leak into
+// the matrix hard-constraint schema.
+var FilterOps = []ConstraintOp{LessThan, LessThanOrEqual, GreaterThan, GreaterThanOrEqual, Equal, NotEqual, In, NotIn}
 
 // UnknownFilterColumns returns the constraint fields that match no column in the
 // provided set under case-insensitive comparison (mirroring the sandbox compiler's

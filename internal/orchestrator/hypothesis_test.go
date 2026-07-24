@@ -137,6 +137,76 @@ func TestRunLoopSuccessKeysByObjectiveLabel(t *testing.T) {
 	}
 }
 
+func TestRunLoopTripletPayloadCarriesSegmentAndDirection(t *testing.T) {
+	repo := &fakeRepo{}
+	claude := &fakeClaude{proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{
+		{Filters: []domain.Constraint{{Field: "CryoSleep", Op: domain.Equal, Operand: &domain.LiteralValue{Bool: boolPtr(true)}}}},
+	}}}
+	sandbox := &fakeSandbox{
+		introspect: IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{
+			{Name: "Transported", Type: "BOOLEAN"}, {Name: "CryoSleep", Type: "BOOLEAN"}}}},
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(Transported = True)": 0.5}}, // root baseline
+			{Value: map[string]any{"avg(Transported = True)": 0.4}}, // candidate (no improvement → stop)
+		},
+	}
+	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+
+	valueExpr := domain.Expression{Kind: domain.ComparisonKind, Op: "=",
+		Left:  &domain.Expression{Kind: domain.ColumnRefKind, Column: "Transported"},
+		Right: &domain.Expression{Kind: domain.LiteralKind, Literal: &domain.LiteralValue{Bool: boolPtr(true)}}}
+	goal := store.Goal{OptimizationFunctionID: "g1", DataSourceRef: "ref",
+		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{
+			{Field: "Transported", Direction: domain.Maximize, Aggregation: "avg", Value: &valueExpr}}}}
+
+	// Subscribe before the run so the triplet event is captured; runLoop publishes and
+	// Completes synchronously, which closes the channel and ends the range.
+	_, ch, cancel := srv.hub.Subscribe("g1")
+	defer cancel()
+	srv.runLoop(context.Background(), goal, "run-1")
+
+	var triplet map[string]any
+	for ev := range ch {
+		if ev.Type == "triplet" {
+			triplet = ev.Payload
+		}
+	}
+	if triplet == nil {
+		t.Fatal("no triplet event was published")
+	}
+	if triplet["objective_label"] != "avg(Transported = True)" {
+		t.Fatalf("triplet objective_label = %v, want avg(Transported = True)", triplet["objective_label"])
+	}
+	if triplet["direction"] != "maximize" {
+		t.Fatalf("triplet direction = %v, want maximize", triplet["direction"])
+	}
+	filters, ok := triplet["filters"].([]string)
+	if !ok || len(filters) != 1 || filters[0] != "CryoSleep = True" {
+		t.Fatalf("triplet filters = %v, want [CryoSleep = True]", triplet["filters"])
+	}
+	newFilters, ok := triplet["new_filters"].([]string)
+	if !ok || len(newFilters) != 1 || newFilters[0] != "CryoSleep = True" {
+		t.Fatalf("triplet new_filters = %v, want [CryoSleep = True]", triplet["new_filters"])
+	}
+}
+
+// TestRenderConstraintsEmpty pins the []-not-null contract the web
+// TripletPayload.filters (string[]) depends on: a non-nil empty slice so an empty
+// segment renders as [] rather than null (which would break filters.length/.map).
+func TestRenderConstraintsEmpty(t *testing.T) {
+	chips := renderConstraints(nil)
+	if chips == nil {
+		t.Fatal("renderConstraints(nil) must return a non-nil slice so it marshals to []")
+	}
+	b, err := json.Marshal(chips)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != "[]" {
+		t.Fatalf("empty chips marshaled to %s, want []", b)
+	}
+}
+
 func TestRunLoopImprovingCandidateExpandsWithPinnedLabel(t *testing.T) {
 	repo := &fakeRepo{}
 	// Every proposal returns one candidate. The root candidate improves (12 > 10),
@@ -613,6 +683,11 @@ func TestConstraintsSatisfied(t *testing.T) {
 	// aggregate and must not cause a false violation.
 	if !constraintsSatisfied([]domain.Constraint{{Field: "other", Op: domain.LessThan, Value: 1}}, "revenue", 5) {
 		t.Fatal("constraint on a non-objective field should be treated as satisfied")
+	}
+	// A non-numeric op on the objective field is unverifiable from a single aggregate
+	// and falls through to satisfied — the switch has no default case.
+	if !constraintsSatisfied([]domain.Constraint{{Field: "revenue", Op: domain.Equal, Operand: &domain.LiteralValue{Bool: boolPtr(true)}}}, "revenue", 5) {
+		t.Fatal("a non-numeric-op constraint on the objective field should be treated as satisfied")
 	}
 	for _, tc := range []struct {
 		op    domain.ConstraintOp

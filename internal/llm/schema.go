@@ -81,20 +81,50 @@ func evaluationMatrixSchema(_ SandboxSchema) map[string]any {
 func interventionTreeSchema(_ SandboxSchema) map[string]any {
 	return object(props{
 		"candidates": arrayOf(object(props{
-			"filters": arrayOf(constraintItem()),
+			"filters": arrayOf(filterItem()),
 		}, "filters")),
 	}, "candidates")
 }
 
-// constraintItem is the schema for one hard-constraint filter. The field is a plain
+// constraintItem is the schema for one matrix hard-constraint. The field is a plain
 // string (grounded via the prompt, validated after generation); only the op keeps
-// its fixed-cardinality enum.
+// its fixed-cardinality enum. It stays numeric-only because it is shared with
+// evaluationMatrixSchema, whose evaluationMatrixWire decodes the value straight into
+// a float64 — growing it would break decodeMatrix and leak the richer ops into the
+// matrix hard constraints. The intervention filters use filterItem instead.
 func constraintItem() map[string]any {
 	return object(props{
 		"field": stringProp(),
-		"op":    enumSchema(constraintOpEnum()),
+		"op":    enumSchema(opEnum(domain.ConstraintOps)),
 		"value": map[string]any{"type": "number"},
 	}, "field", "op", "value")
+}
+
+// filterItem is the schema for one intervention-tree filter. The field is a plain
+// string (grounded via the prompt, validated after generation); the op is a bounded
+// enum over the richer FilterOps; the value is a bounded anyOf — a scalar
+// (number/string/boolean) or a flat typed array — so a boolean/categorical/set
+// filter is expressible without a per-column enum or recursion, keeping the compiled
+// grammar small. filterWire (client.go) decodes the polymorphic value into a typed
+// domain.Constraint by sniffing the raw JSON token.
+func filterItem() map[string]any {
+	return object(props{
+		"field": stringProp(),
+		"op":    enumSchema(opEnum(domain.FilterOps)),
+		"value": map[string]any{"anyOf": append(scalarValueSchemas(),
+			map[string]any{"type": "array", "items": map[string]any{"anyOf": scalarValueSchemas()}})},
+	}, "field", "op", "value")
+}
+
+// scalarValueSchemas is the number/string/boolean union reused by filterItem's value
+// (as the leading bare-scalar variants and as the array element type). Each call
+// returns a fresh slice, so appending the array variant does not mutate the reuse.
+func scalarValueSchemas() []any {
+	return []any{
+		map[string]any{"type": "number"},
+		map[string]any{"type": "string"},
+		map[string]any{"type": "boolean"},
+	}
 }
 
 // props is a JSON-schema property map.
@@ -127,9 +157,12 @@ func directionEnum() []any {
 
 func aggregationEnum() []any { return toAny(domain.Aggregations) }
 
-func constraintOpEnum() []any {
-	out := make([]any, 0, len(domain.ConstraintOps))
-	for _, op := range domain.ConstraintOps {
+// opEnum boxes a constraint-op slice into the []any enum the structured-output
+// schema wants, so the matrix (ConstraintOps) and filter (FilterOps) enums derive
+// from one helper rather than duplicating the map-and-box loop.
+func opEnum(ops []domain.ConstraintOp) []any {
+	out := make([]any, 0, len(ops))
+	for _, op := range ops {
 		out = append(out, string(op))
 	}
 	return out
