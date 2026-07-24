@@ -76,7 +76,8 @@ func (c *Client) GenerateEvaluationMatrix(ctx context.Context, goalText string, 
 // RepairEvaluationMatrix re-fits the objective after the fitted matrix failed the
 // Sandbox's dry-run validation: it re-generates the matrix with the prior fitted
 // matrix and the Sandbox's exact validation error in the prompt, so the model can
-// correct the specific incompatibility. One attempt only.
+// correct the specific incompatibility. One generation per call; the caller bounds
+// how many times it retries.
 func (c *Client) RepairEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema, prior domain.EvaluationMatrix, validationErr string) (domain.EvaluationMatrix, error) {
 	priorJSON, err := json.Marshal(prior)
 	if err != nil {
@@ -105,6 +106,36 @@ func (c *Client) RepairEvaluationMatrix(ctx context.Context, goalText string, sc
 func (c *Client) ProposeInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) (Proposal, error) {
 	body, err := c.complete(ctx, anthropic.OutputConfigEffortXhigh, interventionTreeSchema(schema),
 		interventionTreeSystem, treePrompt(goalText, matrix, schema, node))
+	if err != nil {
+		return Proposal{}, err
+	}
+	var wire proposalWire
+	if err := json.Unmarshal([]byte(body), &wire); err != nil {
+		return Proposal{}, fmt.Errorf("parse intervention proposal: %w", err)
+	}
+	proposal := Proposal{Candidates: make([]CandidateIntervention, 0, len(wire.Candidates))}
+	for _, cand := range wire.Candidates {
+		proposal.Candidates = append(proposal.Candidates, CandidateIntervention{Filters: cand.Filters})
+	}
+	return proposal, nil
+}
+
+// RepairInterventionTree re-proposes a node's candidates after some referenced
+// filter columns were absent from the schema: it re-generates the proposal with
+// the rejected candidates and the exact naming error in the prompt, so the model
+// can re-propose using only real columns. The objective stays pinned from the
+// matrix, never proposed here.
+func (c *Client) RepairInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext, prior Proposal, validationErr string) (Proposal, error) {
+	priorJSON, err := json.Marshal(prior.Candidates)
+	if err != nil {
+		return Proposal{}, fmt.Errorf("marshal rejected candidates: %w", err)
+	}
+	user := treePrompt(goalText, matrix, schema, node) +
+		"\nThese proposed candidates referenced columns absent from the schema:\n" + string(priorJSON) +
+		"\n\nThe rejection:\n" + validationErr +
+		"\n\nRe-propose the candidates using only the listed columns, with their exact names."
+	body, err := c.complete(ctx, anthropic.OutputConfigEffortXhigh, interventionTreeSchema(schema),
+		interventionTreeRepairSystem, user)
 	if err != nil {
 		return Proposal{}, err
 	}
@@ -176,19 +207,29 @@ const evaluationMatrixSystem = "You fit an analyst's plain-English optimization 
 	"and express each target as an aggregation (count/sum/avg/min/max) over a value expression, with an " +
 	"optimization direction. A plain numeric target is a bare column_ref value expression; a boolean or " +
 	"categorical target is a cast or comparison indicator (e.g. a rate of transported passengers is avg over the " +
-	"comparison Transported = True). Only reference columns present in the provided schema."
+	"comparison Transported = True). Reference ONLY columns present in the provided \"Available columns\" list, " +
+	"and use each column's exact name as written there — a name absent from the list will not compile."
 
 const evaluationMatrixRepairSystem = "You fit an analyst's optimization goal to a specific tabular data source. A " +
 	"previously fitted objective failed to compile against the data. Given the prior fitted matrix and the exact " +
 	"validation error, return a corrected Evaluation Matrix whose objective compiles and measures — resolve the " +
 	"objective to the actual columns and types, and express it as an aggregation over a value expression with an " +
-	"optimization direction. Only reference columns present in the provided schema."
+	"optimization direction. Reference ONLY columns present in the provided \"Available columns\" list, and use " +
+	"each column's exact name as written there — a name absent from the list will not compile."
 
 const interventionTreeSystem = "You propose candidate interventions for an empirical hypothesis tree over a " +
 	"tabular data source. Each candidate is a set of hard-constraint filters that segments the data; the run " +
-	"measures a single fixed objective aggregate over each segment. The objective is already fixed. Only " +
-	"reference columns that exist in the provided schema. Candidates vary filters only — never re-propose the " +
-	"objective."
+	"measures a single fixed objective aggregate over each segment. The objective is already fixed. Filter fields " +
+	"must reference ONLY columns present in the provided \"Available columns\" list, using each column's exact " +
+	"name as written there — a name absent from the list will be rejected. Candidates vary filters only — never " +
+	"re-propose the objective."
+
+const interventionTreeRepairSystem = "You propose candidate interventions for an empirical hypothesis tree over a " +
+	"tabular data source. A previous proposal referenced filter columns absent from the schema. Given the rejected " +
+	"candidates and the naming error, re-propose the candidates as hard-constraint filters that segment the data " +
+	"toward the fixed objective. Filter fields must reference ONLY columns present in the provided \"Available " +
+	"columns\" list, using each column's exact name as written there. Candidates vary filters only — never " +
+	"re-propose the objective."
 
 // treePrompt assembles the per-node user message: the goal, the matrix, the
 // available columns, and — at deeper nodes — the pinned objective, the parent's

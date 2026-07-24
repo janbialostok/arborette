@@ -151,6 +151,34 @@ func TestProposeInterventionTreeRoot(t *testing.T) {
 	}
 }
 
+func TestRepairInterventionTree(t *testing.T) {
+	body := `{"candidates":[{"filters":[{"field":"HomePlanet","op":"gte","value":1}]}]}`
+	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
+	c := &Client{messages: fake, model: "test-model"}
+
+	schema := SandboxSchema{Columns: []SandboxColumn{{Name: "HomePlanet", Type: "VARCHAR"}}}
+	prior := Proposal{Candidates: []CandidateIntervention{{Filters: []domain.Constraint{
+		{Field: "home_world", Op: domain.GreaterThanOrEqual, Value: 1},
+	}}}}
+	proposal, err := c.RepairInterventionTree(context.Background(), "grow revenue",
+		domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "sum"}}},
+		schema, TreeContext{IsRoot: true, Breadth: 3}, prior, "these filter columns are not in the schema: home_world")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(proposal.Candidates) != 1 || proposal.Candidates[0].Filters[0].Field != "HomePlanet" {
+		t.Fatalf("expected the repaired candidate, got %+v", proposal.Candidates)
+	}
+	// The repair prompt must embed the rejected candidates and the naming error.
+	user := fake.got.Messages[0].Content[0].OfText.Text
+	if !strings.Contains(user, `"field":"home_world"`) {
+		t.Fatalf("repair prompt did not embed the rejected candidates: %q", user)
+	}
+	if !strings.Contains(user, "these filter columns are not in the schema: home_world") {
+		t.Fatalf("repair prompt did not embed the naming error: %q", user)
+	}
+}
+
 func TestCompleteMapsStopReasons(t *testing.T) {
 	cases := []struct {
 		name string

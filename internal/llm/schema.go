@@ -58,20 +58,23 @@ const maxExprDepth = 3
 // aggregation, optimization direction, and value expression so the fitted
 // objective is fully described by the matrix; there is no separate field, because
 // a compiled expression has no single column name and a plain-numeric objective
-// is a bare column_ref value expression. The value expression's column references
-// and constraint fields are constrained to the introspected column names, and the
-// aggregation to the allowlist the Sandbox accepts.
-func evaluationMatrixSchema(schema SandboxSchema) map[string]any {
-	cols := columnEnum(schema)
+// is a bare column_ref value expression. Column references and constraint fields
+// are left as plain strings — the model is grounded to the real columns via the
+// prompt and validated against the schema after generation — so this schema is
+// independent of SandboxSchema.Columns. Only the fixed-cardinality enums remain
+// (direction, aggregation, constraint op), keeping the compiled decoding grammar
+// small regardless of dataset width and making the schema statically cacheable.
+// The schema argument is unused, retained for symmetry with the caller.
+func evaluationMatrixSchema(_ SandboxSchema) map[string]any {
 	defs := map[string]any{}
-	value := expressionRef(cols, maxExprDepth, defs)
+	value := expressionRef(maxExprDepth, defs)
 	root := object(props{
 		"targets": arrayOf(object(props{
 			"direction":   enumSchema(directionEnum()),
 			"aggregation": enumSchema(aggregationEnum()),
 			"value":       value,
 		}, "direction", "aggregation", "value")),
-		"constraints": arrayOf(constraintItem(cols)),
+		"constraints": arrayOf(constraintItem()),
 	}, "targets", "constraints")
 	root["$defs"] = defs
 	return root
@@ -82,10 +85,10 @@ func evaluationMatrixSchema(schema SandboxSchema) map[string]any {
 // $ref the next-shallower depth, so the definitions form a bounded DAG — never
 // self-referential, which the structured-output contract rejects, and never
 // inlined per use, which would blow the schema size up exponentially.
-func expressionRef(cols []any, depth int, defs map[string]any) map[string]any {
+func expressionRef(depth int, defs map[string]any) map[string]any {
 	name := "expr_d" + strconv.Itoa(depth)
 	if _, ok := defs[name]; !ok {
-		defs[name] = expressionDef(cols, depth, defs)
+		defs[name] = expressionDef(depth, defs)
 	}
 	return map[string]any{"$ref": "#/$defs/" + name}
 }
@@ -99,11 +102,11 @@ func expressionRef(cols []any, depth int, defs map[string]any) map[string]any {
 // fat node (unset kinds' fields stay zero). The Sandbox's dry-run enforces the
 // coarse-type rules the schema does not, so operators and cast targets stay
 // unconstrained strings here.
-func expressionDef(cols []any, depth int, defs map[string]any) map[string]any {
+func expressionDef(depth int, defs map[string]any) map[string]any {
 	variants := []any{
 		object(props{
 			"kind":   constProp(string(domain.ColumnRefKind)),
-			"column": fieldProp(cols),
+			"column": stringProp(),
 		}, "kind", "column"),
 		object(props{
 			"kind":    constProp(string(domain.LiteralKind)),
@@ -111,7 +114,7 @@ func expressionDef(cols []any, depth int, defs map[string]any) map[string]any {
 		}, "kind", "literal"),
 	}
 	if depth > 0 {
-		child := expressionRef(cols, depth-1, defs)
+		child := expressionRef(depth-1, defs)
 		// Comparison and Arithmetic share the same binary shape, differing only by kind.
 		binaryVariant := func(kind string) map[string]any {
 			return object(props{
@@ -155,22 +158,24 @@ func literalSchema() map[string]any {
 
 // interventionTreeSchema is the structured-output schema for ProposeInterventionTree.
 // The objective is pinned from the matrix before any proposal, so root and deep
-// nodes share one candidates-only schema. Filter fields are constrained to the
-// introspected column names.
-func interventionTreeSchema(schema SandboxSchema) map[string]any {
-	cols := columnEnum(schema)
+// nodes share one candidates-only schema. Filter fields are plain strings, grounded
+// to the real columns via the prompt and validated after generation, so the schema
+// is independent of SandboxSchema.Columns (static per code version). The schema
+// argument is unused, retained for symmetry with the caller.
+func interventionTreeSchema(_ SandboxSchema) map[string]any {
 	return object(props{
 		"candidates": arrayOf(object(props{
-			"filters": arrayOf(constraintItem(cols)),
+			"filters": arrayOf(constraintItem()),
 		}, "filters")),
 	}, "candidates")
 }
 
-// constraintItem is the schema for one hard-constraint filter. cols, when
-// non-nil, restricts the field to the introspected column names.
-func constraintItem(cols []any) map[string]any {
+// constraintItem is the schema for one hard-constraint filter. The field is a plain
+// string (grounded via the prompt, validated after generation); only the op keeps
+// its fixed-cardinality enum.
+func constraintItem() map[string]any {
 	return object(props{
-		"field": fieldProp(cols),
+		"field": stringProp(),
 		"op":    enumSchema(constraintOpEnum()),
 		"value": map[string]any{"type": "number"},
 	}, "field", "op", "value")
@@ -196,14 +201,6 @@ func arrayOf(items map[string]any) map[string]any {
 
 func stringProp() map[string]any { return map[string]any{"type": "string"} }
 
-// fieldProp is a string property optionally constrained to an enum of values.
-func fieldProp(values []any) map[string]any {
-	if len(values) == 0 {
-		return stringProp()
-	}
-	return map[string]any{"type": "string", "enum": values}
-}
-
 func enumSchema(values []any) map[string]any {
 	return map[string]any{"type": "string", "enum": values}
 }
@@ -212,19 +209,6 @@ func enumSchema(values []any) map[string]any {
 // variant.
 func constProp(value string) map[string]any {
 	return map[string]any{"type": "string", "const": value}
-}
-
-// columnEnum returns the introspected column names as an enum value list, or nil
-// when the schema carries no columns (leaving fields unconstrained).
-func columnEnum(schema SandboxSchema) []any {
-	if len(schema.Columns) == 0 {
-		return nil
-	}
-	names := make([]any, 0, len(schema.Columns))
-	for _, c := range schema.Columns {
-		names = append(names, c.Name)
-	}
-	return names
 }
 
 func directionEnum() []any {

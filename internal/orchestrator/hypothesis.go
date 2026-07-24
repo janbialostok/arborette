@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,6 +33,12 @@ const loopTimeout = 10 * time.Minute
 // loopTimeout expired still records its terminal status instead of stranding at
 // running.
 const statusWriteTimeout = 5 * time.Second
+
+// maxProposalRepairs bounds how many times a node's proposal is re-requested when
+// candidates reference columns absent from the schema (see domain.UnknownFilterColumns
+// for the grounding check). After the bound, any still-invalid candidate is dropped
+// so the run always terminates.
+const maxProposalRepairs = 3
 
 // objective is the run's fixed measurement, held constant across the whole tree:
 // one aggregation over one value expression, with the direction that decides what
@@ -122,7 +129,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 	}
 	schema := toSandboxSchema(introspect.Schema)
 
-	root, err := s.claude.ProposeInterventionTree(ctx, goal.GoalText, goal.EvaluationMatrix, schema,
+	rootCandidates, err := s.proposeValidCandidates(ctx, goal, schema,
 		llm.TreeContext{IsRoot: true, Breadth: defaultBreadth})
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: root proposal: %v", id, err)
@@ -147,7 +154,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		return
 	}
 
-	for _, cand := range root.Candidates {
+	for _, cand := range rootCandidates {
 		s.processCandidate(ctx, goal, obj, schema, nil, baseline, cand, 1)
 	}
 }
@@ -188,7 +195,7 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 		return
 	}
 
-	child, err := s.claude.ProposeInterventionTree(ctx, goal.GoalText, goal.EvaluationMatrix, schema, llm.TreeContext{
+	children, err := s.proposeValidCandidates(ctx, goal, schema, llm.TreeContext{
 		Breadth:        defaultBreadth,
 		ObjectiveLabel: obj.label,
 		Direction:      obj.direction,
@@ -199,7 +206,7 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 		s.branchFailure(ctx, id, effective, err)
 		return
 	}
-	for _, c := range child.Candidates {
+	for _, c := range children {
 		s.processCandidate(ctx, goal, obj, schema, effective, value, c, depth+1)
 	}
 }
@@ -283,6 +290,82 @@ func (s *Server) branchFailure(ctx context.Context, id string, filters []domain.
 		log.Printf("orchestrator: append audit: %v", err)
 	}
 	s.hub.Publish(id, Event{Type: "branch_failure", Payload: map[string]any{"error": cause.Error()}})
+}
+
+// proposeValidCandidates proposes one node's candidates and repairs any that
+// reference columns absent from the schema, re-proposing only the invalid ones
+// against the naming error. Earlier-round valid candidates accumulate and are never
+// re-proposed, so no candidate is dropped or duplicated. A transport error from the
+// initial proposal is returned as-is, so callers keep the terminal-at-root /
+// non-terminal-in-child distinction; a repair-call transport error is best-effort —
+// it keeps the candidates already validated and records the fault as a branch
+// failure rather than sinking the run. After the repair bound, still-invalid
+// candidates are dropped and a branch failure naming the unknown columns is recorded
+// (siblings continue); if none remain valid, the returned slice is empty and that
+// branch stops expanding.
+func (s *Server) proposeValidCandidates(ctx context.Context, goal store.Goal, schema llm.SandboxSchema, node llm.TreeContext) ([]llm.CandidateIntervention, error) {
+	id := goal.OptimizationFunctionID
+	proposal, err := s.claude.ProposeInterventionTree(ctx, goal.GoalText, goal.EvaluationMatrix, schema, node)
+	if err != nil {
+		return nil, err
+	}
+	cols := columnNames(schema)
+	valid, invalid, unknown := splitByColumns(proposal.Candidates, cols)
+
+	for attempts := 0; len(invalid) > 0 && attempts < maxProposalRepairs; attempts++ {
+		repaired, rerr := s.claude.RepairInterventionTree(ctx, goal.GoalText, goal.EvaluationMatrix, schema, node,
+			llm.Proposal{Candidates: invalid}, unknownColumnsMessage(unknown))
+		if rerr != nil {
+			log.Printf("orchestrator: hypothesis loop %q: repair intervention tree: %v", id, rerr)
+			s.branchFailure(ctx, id, node.ParentFilters, rerr)
+			return valid, nil
+		}
+		newValid, newInvalid, newUnknown := splitByColumns(repaired.Candidates, cols)
+		valid = append(valid, newValid...)
+		invalid, unknown = newInvalid, newUnknown
+	}
+
+	if len(invalid) > 0 {
+		s.branchFailure(ctx, id, node.ParentFilters,
+			fmt.Errorf("dropped %d candidate(s) referencing unknown columns: %s", len(invalid), strings.Join(unknown, ", ")))
+	}
+	return valid, nil
+}
+
+// splitByColumns partitions candidates into those whose filter columns all exist in
+// the schema and those referencing at least one unknown column, collecting the
+// unknown column names (deduplicated, first-seen) for the repair prompt.
+func splitByColumns(candidates []llm.CandidateIntervention, columns []string) (valid, invalid []llm.CandidateIntervention, unknown []string) {
+	seen := map[string]bool{}
+	for _, cand := range candidates {
+		miss := domain.UnknownFilterColumns(cand.Filters, columns)
+		if len(miss) == 0 {
+			valid = append(valid, cand)
+			continue
+		}
+		invalid = append(invalid, cand)
+		for _, u := range miss {
+			key := strings.ToLower(u)
+			if !seen[key] {
+				seen[key] = true
+				unknown = append(unknown, u)
+			}
+		}
+	}
+	return valid, invalid, unknown
+}
+
+func columnNames(schema llm.SandboxSchema) []string {
+	names := make([]string, 0, len(schema.Columns))
+	for _, c := range schema.Columns {
+		names = append(names, c.Name)
+	}
+	return names
+}
+
+func unknownColumnsMessage(unknown []string) string {
+	return "these filter columns are not in the schema: " + strings.Join(unknown, ", ") +
+		"; re-propose using only columns from the Available columns list"
 }
 
 // pinObjective fixes the run's objective from the Evaluation Matrix's first

@@ -102,6 +102,55 @@ func TestTargetWithExpressionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUnknownFilterColumns(t *testing.T) {
+	columns := []string{"Revenue", "Region", "HomePlanet"}
+
+	t.Run("matches case-insensitively", func(t *testing.T) {
+		filters := []Constraint{
+			{Field: "revenue", Op: GreaterThan, Value: 1},
+			{Field: "REGION", Op: LessThan, Value: 2},
+		}
+		if got := UnknownFilterColumns(filters, columns); got != nil {
+			t.Fatalf("case-insensitive matches should be known, got unknown %v", got)
+		}
+	})
+
+	t.Run("reports unknown fields in first-seen order", func(t *testing.T) {
+		filters := []Constraint{
+			{Field: "Revenue", Op: GreaterThan, Value: 1},
+			{Field: "Cabin", Op: LessThan, Value: 2},
+			{Field: "Age", Op: GreaterThan, Value: 3},
+		}
+		got := UnknownFilterColumns(filters, columns)
+		if len(got) != 2 || got[0] != "Cabin" || got[1] != "Age" {
+			t.Fatalf("unknown = %v, want [Cabin Age]", got)
+		}
+	})
+
+	t.Run("deduplicates unknown fields case-insensitively", func(t *testing.T) {
+		filters := []Constraint{
+			{Field: "Cabin", Op: GreaterThan, Value: 1},
+			{Field: "cabin", Op: LessThan, Value: 2},
+		}
+		if got := UnknownFilterColumns(filters, columns); len(got) != 1 || got[0] != "Cabin" {
+			t.Fatalf("unknown = %v, want [Cabin] (deduplicated)", got)
+		}
+	})
+
+	t.Run("empty schema makes every filtered field unknown", func(t *testing.T) {
+		filters := []Constraint{{Field: "Revenue", Op: GreaterThan, Value: 1}}
+		if got := UnknownFilterColumns(filters, nil); len(got) != 1 || got[0] != "Revenue" {
+			t.Fatalf("unknown = %v, want [Revenue]", got)
+		}
+	})
+
+	t.Run("no filters yields no unknowns", func(t *testing.T) {
+		if got := UnknownFilterColumns(nil, columns); got != nil {
+			t.Fatalf("no filters should yield no unknowns, got %v", got)
+		}
+	})
+}
+
 func TestRenderObjectiveLabel(t *testing.T) {
 	cases := []struct {
 		name string

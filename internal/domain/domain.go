@@ -278,3 +278,36 @@ func IsAggregation(agg string) bool {
 // the structured-output schema enum derives from the same values the typed
 // ConstraintOp constants define rather than re-hardcoding them.
 var ConstraintOps = []ConstraintOp{LessThan, LessThanOrEqual, GreaterThan, GreaterThanOrEqual}
+
+// UnknownFilterColumns returns the constraint fields that match no column in the
+// provided set under case-insensitive comparison (mirroring the sandbox compiler's
+// own strings.EqualFold column matching), deduplicated in first-seen order. It is
+// CGO-free so the orchestrator can pre-check a proposal's filter columns before
+// dispatching it to the sandbox, without importing the CGO-locked sandbox compiler.
+// The structured-output schema leaves filter fields as free strings, so this is the
+// deterministic check that grounds a proposal to the real columns.
+func UnknownFilterColumns(filters []Constraint, columns []string) []string {
+	seen := map[string]bool{}
+	var unknown []string
+	for _, f := range filters {
+		if columnKnown(f.Field, columns) {
+			continue
+		}
+		key := strings.ToLower(f.Field)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		unknown = append(unknown, f.Field)
+	}
+	return unknown
+}
+
+func columnKnown(field string, columns []string) bool {
+	for _, c := range columns {
+		if strings.EqualFold(field, c) {
+			return true
+		}
+	}
+	return false
+}

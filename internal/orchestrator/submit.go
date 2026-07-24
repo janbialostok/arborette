@@ -25,6 +25,10 @@ const (
 	maxUploadBytes  = 512 << 20
 )
 
+// maxObjectiveRepairs bounds how many schema-aware repair attempts registration
+// makes against the sandbox dry-run before declaring the goal unfittable (422).
+const maxObjectiveRepairs = 3
+
 // Ingestion-path sentinels, mapped to statuses by writeIngestErr.
 var (
 	errNoSource    = errors.New("a data source (file upload or import_path) is required")
@@ -79,7 +83,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	// filters (the exact request the root baseline will run). A sandbox fault
 	// (pre- or post-repair) is surfaced as-is, never labeled an unfixable objective.
 	verr := s.dryRunObjective(ctx, ref, matrix)
-	if isObjectiveValidationFailure(verr) {
+	for attempts := 0; isObjectiveValidationFailure(verr) && attempts < maxObjectiveRepairs; attempts++ {
 		repaired, rerr := s.claude.RepairEvaluationMatrix(ctx, goal, schema, matrix, verr.Error())
 		if rerr != nil {
 			log.Printf("orchestrator: repair evaluation matrix: %v", rerr)
@@ -88,10 +92,10 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		}
 		matrix = repaired
 		verr = s.dryRunObjective(ctx, ref, matrix)
-		if isObjectiveValidationFailure(verr) {
-			writeErr(w, http.StatusUnprocessableEntity, "could not fit the goal to the data source: "+verr.Error())
-			return
-		}
+	}
+	if isObjectiveValidationFailure(verr) {
+		writeErr(w, http.StatusUnprocessableEntity, "could not fit the goal to the data source: "+verr.Error())
+		return
 	}
 	if verr != nil {
 		s.writeIntakeErr(w, verr)

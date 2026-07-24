@@ -1,6 +1,8 @@
 package llm
 
 import (
+	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -119,8 +121,9 @@ func TestEvaluationMatrixSchema(t *testing.T) {
 
 	// The value expression is a $ref into $defs; the resolved depth-N schema is an
 	// anyOf of per-kind variants. At the top depth all six kinds are offered; the
-	// column_ref variant is a closed object requiring kind+column, with column
-	// enum-constrained to the schema.
+	// column_ref variant is a closed object requiring kind+column, with column a
+	// plain string (grounded via the prompt, validated after generation — no enum,
+	// so the compiled grammar does not scale with dataset width).
 	defs := s["$defs"].(map[string]any)
 	value := resolveRef(t, defs, tprops["value"])
 	variants := anyOfVariants(t, value)
@@ -135,8 +138,12 @@ func TestEvaluationMatrixSchema(t *testing.T) {
 	if !creq["kind"] || !creq["column"] {
 		t.Fatalf("column_ref variant must require kind and column: %v", creq)
 	}
-	if len(enumValues(t, properties(t, colRef)["column"])) != 2 {
-		t.Fatalf("column enum = %v, want the 2 columns", enumValues(t, properties(t, colRef)["column"]))
+	column := properties(t, colRef)["column"].(map[string]any)
+	if column["type"] != "string" {
+		t.Fatalf("column must be a plain string schema: %v", column)
+	}
+	if _, hasEnum := column["enum"]; hasEnum {
+		t.Fatalf("column must not be enum-constrained (width-independence): %v", column)
 	}
 	// The literal variant models "exactly one of number/string/bool" as its own
 	// three-way anyOf.
@@ -177,20 +184,52 @@ func TestInterventionTreeSchema(t *testing.T) {
 		t.Fatal("no node must expose objective_field")
 	}
 
-	// Candidate filter fields are constrained to the introspected columns.
+	// Candidate filter fields are plain strings (grounded via the prompt, validated
+	// after generation), while the op keeps its fixed-cardinality enum.
 	filterItems := props["candidates"].(map[string]any)["items"].(map[string]any)
 	filterField := properties(t, filterItems)["filters"].(map[string]any)["items"].(map[string]any)
-	if len(enumValues(t, properties(t, filterField)["field"])) != 2 {
-		t.Fatalf("candidate filter field enum = %v, want the 2 columns", enumValues(t, properties(t, filterField)["field"]))
+	field := properties(t, filterField)["field"].(map[string]any)
+	if field["type"] != "string" {
+		t.Fatalf("candidate filter field must be a plain string schema: %v", field)
+	}
+	if _, hasEnum := field["enum"]; hasEnum {
+		t.Fatalf("candidate filter field must not be enum-constrained: %v", field)
+	}
+	if len(enumValues(t, properties(t, filterField)["op"])) != len(domain.ConstraintOps) {
+		t.Fatalf("op enum = %v, want the domain constraint-op set", enumValues(t, properties(t, filterField)["op"]))
 	}
 }
 
-func TestColumnEnumUnconstrainedWhenEmpty(t *testing.T) {
-	// With no introspected columns, filter fields stay unconstrained (no enum),
-	// rather than emitting an empty enum the model could never satisfy.
-	item := constraintItem(columnEnum(SandboxSchema{}))
-	field := properties(t, item)["field"].(map[string]any)
-	if _, hasEnum := field["enum"]; hasEnum {
-		t.Fatalf("empty schema should leave the filter field unconstrained: %v", field)
+// TestSchemaWidthIndependent pins the load-bearing property of this change: both
+// structured-output schemas are byte-identical regardless of column count, so the
+// compiled decoding grammar never grows with dataset width and the schema stays
+// eligible for the structured-output compile cache.
+func TestSchemaWidthIndependent(t *testing.T) {
+	narrow := SandboxSchema{Columns: []SandboxColumn{{Name: "a"}, {Name: "b"}}}
+	wide := SandboxSchema{Columns: make([]SandboxColumn, 200)}
+	for i := range wide.Columns {
+		wide.Columns[i] = SandboxColumn{Name: "col" + strconv.Itoa(i)}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		build func(SandboxSchema) map[string]any
+	}{
+		{"evaluation matrix", evaluationMatrixSchema},
+		{"intervention tree", interventionTreeSchema},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n, err := json.Marshal(tc.build(narrow))
+			if err != nil {
+				t.Fatalf("marshal narrow: %v", err)
+			}
+			w, err := json.Marshal(tc.build(wide))
+			if err != nil {
+				t.Fatalf("marshal wide: %v", err)
+			}
+			if string(n) != string(w) {
+				t.Fatalf("schema is not width-independent:\n narrow %s\n wide   %s", n, w)
+			}
+		})
 	}
 }

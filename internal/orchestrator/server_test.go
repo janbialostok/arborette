@@ -118,14 +118,21 @@ func (f *fakeHeur) Trace(_ context.Context, _ string) ([]graph.CausalTriplet, er
 }
 
 type fakeClaude struct {
-	matrix      domain.EvaluationMatrix
-	matrixErr   error
-	repair      domain.EvaluationMatrix
-	repairErr   error
-	repairCalls int
-	proposal    llm.Proposal
-	gotSchema   llm.SandboxSchema
-	gotNodes    []llm.TreeContext
+	matrix           domain.EvaluationMatrix
+	matrixErr        error
+	repair           domain.EvaluationMatrix
+	repairErr        error
+	repairCalls      int
+	proposal         llm.Proposal
+	proposalErr      error
+	childProposal    *llm.Proposal
+	gotSchema        llm.SandboxSchema
+	gotNodes         []llm.TreeContext
+	treeRepair       llm.Proposal
+	treeRepairErr    error
+	treeRepairCalls  int
+	treeRepairPrior  []llm.Proposal
+	treeRepairErrMsg []string
 }
 
 func (f *fakeClaude) GenerateEvaluationMatrix(_ context.Context, _ string, schema llm.SandboxSchema) (domain.EvaluationMatrix, error) {
@@ -138,7 +145,19 @@ func (f *fakeClaude) RepairEvaluationMatrix(_ context.Context, _ string, _ llm.S
 }
 func (f *fakeClaude) ProposeInterventionTree(_ context.Context, _ string, _ domain.EvaluationMatrix, _ llm.SandboxSchema, node llm.TreeContext) (llm.Proposal, error) {
 	f.gotNodes = append(f.gotNodes, node)
+	if f.proposalErr != nil {
+		return llm.Proposal{}, f.proposalErr
+	}
+	if !node.IsRoot && f.childProposal != nil {
+		return *f.childProposal, nil
+	}
 	return f.proposal, nil
+}
+func (f *fakeClaude) RepairInterventionTree(_ context.Context, _ string, _ domain.EvaluationMatrix, _ llm.SandboxSchema, _ llm.TreeContext, prior llm.Proposal, validationErr string) (llm.Proposal, error) {
+	f.treeRepairCalls++
+	f.treeRepairPrior = append(f.treeRepairPrior, prior)
+	f.treeRepairErrMsg = append(f.treeRepairErrMsg, validationErr)
+	return f.treeRepair, f.treeRepairErr
 }
 
 // fakeRepo is a no-op graph.Repository that records the nodes writeTriplet

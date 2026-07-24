@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/arborette/arborette/internal/domain"
@@ -194,6 +195,278 @@ func TestRunLoopTerminalOnMissingAggregation(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a hypothesis_branch_failure audit, got %+v", audits.records)
+	}
+}
+
+func TestRunLoopRepairsInvalidColumnCandidate(t *testing.T) {
+	repo := &fakeRepo{}
+	// The root proposal references a column absent from the schema; the repair
+	// returns a candidate on a real column. The invalid candidate must never reach
+	// the sandbox — only the baseline and the repaired candidate execute.
+	claude := &fakeClaude{
+		proposal:   llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: []domain.Constraint{{Field: "unknown_col", Op: domain.GreaterThan, Value: 1}}}}},
+		treeRepair: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: []domain.Constraint{{Field: "revenue", Op: domain.GreaterThan, Value: 1}}}}},
+	}
+	sandbox := &fakeSandbox{
+		introspect: IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{{Name: "revenue", Type: "DOUBLE"}}}},
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}}, // root baseline
+			{Value: map[string]any{"avg(revenue)": 8.0}},  // repaired candidate (no improvement → stop)
+		},
+	}
+	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if claude.treeRepairCalls != 1 {
+		t.Fatalf("expected one intervention-tree repair, got %d", claude.treeRepairCalls)
+	}
+	// Only the invalid candidate is re-proposed — the accumulate-valid loop never
+	// re-proposes candidates that already passed.
+	if len(claude.treeRepairPrior) != 1 || claude.treeRepairPrior[0].Candidates[0].Filters[0].Field != "unknown_col" {
+		t.Fatalf("repair must re-propose only the invalid candidate: %+v", claude.treeRepairPrior)
+	}
+	// Baseline + the one repaired candidate — the invalid candidate never executed.
+	if sandbox.execCalls != 2 {
+		t.Fatalf("expected exactly baseline + repaired-candidate executes, got %d", sandbox.execCalls)
+	}
+	if len(repo.outcomes) != 1 {
+		t.Fatalf("expected one triplet from the repaired candidate, got %d", len(repo.outcomes))
+	}
+}
+
+func TestRunLoopDropsUncorrectableCandidatesAndCompletes(t *testing.T) {
+	runs := &fakeRuns{}
+	audits := &fakeAudits{}
+	// Both the proposal and every repair reference unknown columns, so after the
+	// repair bound the node has no valid candidate. The run drops them, records a
+	// branch failure, and still settles completed.
+	claude := &fakeClaude{
+		proposal:   llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: []domain.Constraint{{Field: "unknown_col", Op: domain.GreaterThan, Value: 1}}}}},
+		treeRepair: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: []domain.Constraint{{Field: "still_unknown", Op: domain.GreaterThan, Value: 1}}}}},
+	}
+	sandbox := &fakeSandbox{
+		introspect: IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{{Name: "revenue", Type: "DOUBLE"}}}},
+		execResps:  []ExecuteResponse{{Value: map[string]any{"avg(revenue)": 10.0}}}, // baseline only
+	}
+	srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, audits, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runs = runs
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if claude.treeRepairCalls != maxProposalRepairs {
+		t.Fatalf("expected %d repair attempts before dropping, got %d", maxProposalRepairs, claude.treeRepairCalls)
+	}
+	found := false
+	for _, r := range audits.records {
+		if r.Action == "hypothesis_branch_failure" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a hypothesis_branch_failure audit for the dropped candidates: %+v", audits.records)
+	}
+	assertOneStatus(t, runs, store.RunCompleted, "")
+}
+
+func TestRunLoopPreservesInitiallyValidCandidatesAcrossRepair(t *testing.T) {
+	repo := &fakeRepo{}
+	// A mixed proposal: one candidate on a real column (valid), one on an unknown
+	// column (invalid). Only the invalid one is re-proposed; the initially-valid one
+	// is preserved (never re-proposed) and executes alongside the repaired candidate.
+	claude := &fakeClaude{
+		proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{
+			{Filters: []domain.Constraint{{Field: "revenue", Op: domain.GreaterThan, Value: 1}}},
+			{Filters: []domain.Constraint{{Field: "unknown_col", Op: domain.GreaterThan, Value: 2}}},
+		}},
+		treeRepair: llm.Proposal{Candidates: []llm.CandidateIntervention{
+			{Filters: []domain.Constraint{{Field: "revenue", Op: domain.LessThan, Value: 9}}},
+		}},
+	}
+	sandbox := &fakeSandbox{
+		introspect: IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{{Name: "revenue", Type: "DOUBLE"}}}},
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}}, // root baseline
+			{Value: map[string]any{"avg(revenue)": 8.0}},  // initially-valid candidate (no improvement → stop)
+			{Value: map[string]any{"avg(revenue)": 7.0}},  // repaired candidate (no improvement → stop)
+		},
+	}
+	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if claude.treeRepairCalls != 1 {
+		t.Fatalf("expected one repair, got %d", claude.treeRepairCalls)
+	}
+	// Only the invalid candidate is re-proposed — the valid one is never sent to repair.
+	if len(claude.treeRepairPrior) != 1 || len(claude.treeRepairPrior[0].Candidates) != 1 ||
+		claude.treeRepairPrior[0].Candidates[0].Filters[0].Field != "unknown_col" {
+		t.Fatalf("repair must carry only the invalid candidate: %+v", claude.treeRepairPrior)
+	}
+	// Baseline + both surviving candidates (the initially-valid and the repaired) execute.
+	if sandbox.execCalls != 3 {
+		t.Fatalf("expected baseline + 2 candidate executes, got %d", sandbox.execCalls)
+	}
+	if len(repo.outcomes) != 2 {
+		t.Fatalf("expected two triplets (valid + repaired candidate), got %d", len(repo.outcomes))
+	}
+}
+
+func TestRunLoopRootRepairErrorIsNonTerminal(t *testing.T) {
+	runs := &fakeRuns{}
+	audits := &fakeAudits{}
+	// The root proposal references an unknown column; the repair call fails with a
+	// transport error. Best-effort salvage keeps the (here empty) accumulated valid
+	// set and records a branch failure, so the run still completes rather than failing.
+	claude := &fakeClaude{
+		proposal:      llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: []domain.Constraint{{Field: "unknown_col", Op: domain.GreaterThan, Value: 1}}}}},
+		treeRepairErr: errors.New("claude down"),
+	}
+	sandbox := &fakeSandbox{
+		introspect: IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{{Name: "revenue", Type: "DOUBLE"}}}},
+		execResps:  []ExecuteResponse{{Value: map[string]any{"avg(revenue)": 10.0}}}, // baseline only
+	}
+	srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, audits, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runs = runs
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if claude.treeRepairCalls != 1 {
+		t.Fatalf("expected one repair attempt before the transport error, got %d", claude.treeRepairCalls)
+	}
+	found := false
+	for _, r := range audits.records {
+		if r.Action == "hypothesis_branch_failure" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a hypothesis_branch_failure audit for the failed repair: %+v", audits.records)
+	}
+	assertOneStatus(t, runs, store.RunCompleted, "")
+}
+
+func TestRunLoopRepairErrorSalvagesAlreadyValidCandidates(t *testing.T) {
+	repo := &fakeRepo{}
+	// A mixed proposal (one valid candidate, one invalid) whose repair call then fails
+	// with a transport error. Best-effort salvage must keep the already-validated
+	// candidate — it still executes despite the fault. If the salvage returned nil
+	// instead of the accumulated valid set, only the baseline would execute.
+	claude := &fakeClaude{
+		proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{
+			{Filters: []domain.Constraint{{Field: "revenue", Op: domain.GreaterThan, Value: 1}}},
+			{Filters: []domain.Constraint{{Field: "unknown_col", Op: domain.GreaterThan, Value: 2}}},
+		}},
+		treeRepairErr: errors.New("claude down"),
+	}
+	sandbox := &fakeSandbox{
+		introspect: IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{{Name: "revenue", Type: "DOUBLE"}}}},
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}}, // root baseline
+			{Value: map[string]any{"avg(revenue)": 8.0}},  // preserved valid candidate (no improvement → stop)
+		},
+	}
+	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if claude.treeRepairCalls != 1 {
+		t.Fatalf("expected one repair attempt, got %d", claude.treeRepairCalls)
+	}
+	// Baseline + the preserved valid candidate: salvage returned the accumulated valid
+	// set, not nil.
+	if sandbox.execCalls != 2 {
+		t.Fatalf("expected baseline + preserved-candidate executes, got %d", sandbox.execCalls)
+	}
+	if len(repo.outcomes) != 1 {
+		t.Fatalf("expected one triplet from the preserved valid candidate, got %d", len(repo.outcomes))
+	}
+}
+
+func TestRunLoopRootProposalErrorIsTerminal(t *testing.T) {
+	runs := &fakeRuns{}
+	// A transport error from the initial proposal (not a repair) is terminal at the
+	// root — it settles the run failed, distinct from the non-terminal repair-error
+	// salvage above.
+	claude := &fakeClaude{proposalErr: errors.New("claude down")}
+	sandbox := &fakeSandbox{introspect: IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{{Name: "revenue", Type: "DOUBLE"}}}}}
+	srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runs = runs
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if claude.treeRepairCalls != 0 {
+		t.Fatalf("an initial-proposal error must not trigger repair, got %d", claude.treeRepairCalls)
+	}
+	// The proposal fault short-circuits before any sandbox baseline execute.
+	if sandbox.execCalls != 0 {
+		t.Fatalf("expected no execute calls on a terminal root proposal, got %d", sandbox.execCalls)
+	}
+	assertOneStatus(t, runs, store.RunFailed, "claude down")
+}
+
+func TestRunLoopChildRepairErrorIsNonTerminal(t *testing.T) {
+	runs := &fakeRuns{}
+	audits := &fakeAudits{}
+	// The root proposes a valid candidate that improves and expands; the child
+	// proposal references an unknown column and its repair fails with a transport
+	// error. That is non-terminal — a branch failure — so the run still completes.
+	childProposal := llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: []domain.Constraint{{Field: "unknown_col", Op: domain.GreaterThan, Value: 1}}}}}
+	claude := &fakeClaude{
+		proposal:      llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: []domain.Constraint{{Field: "revenue", Op: domain.GreaterThan, Value: 1}}}}},
+		childProposal: &childProposal,
+		treeRepairErr: errors.New("claude down"),
+	}
+	sandbox := &fakeSandbox{
+		introspect: IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{{Name: "revenue", Type: "DOUBLE"}}}},
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}}, // root baseline
+			{Value: map[string]any{"avg(revenue)": 12.0}}, // valid candidate improves → expand
+		},
+	}
+	srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, audits, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runs = runs
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if claude.treeRepairCalls != 1 {
+		t.Fatalf("expected one child repair attempt, got %d", claude.treeRepairCalls)
+	}
+	found := false
+	for _, r := range audits.records {
+		if r.Action == "hypothesis_branch_failure" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a hypothesis_branch_failure audit for the failed child repair: %+v", audits.records)
+	}
+	assertOneStatus(t, runs, store.RunCompleted, "")
+}
+
+func TestRunLoopRepairMessageDedupsUnknownColumnsAcrossCandidates(t *testing.T) {
+	// Two invalid candidates reference distinct unknown columns, one repeated in a
+	// different case. splitByColumns collects the unknowns across candidates and dedups
+	// case-insensitively in first-seen order; that deduped list is what reaches the
+	// repair call as its validation error.
+	claude := &fakeClaude{
+		proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{
+			{Filters: []domain.Constraint{
+				{Field: "Cabin", Op: domain.GreaterThan, Value: 1},
+				{Field: "Age", Op: domain.GreaterThan, Value: 2},
+			}},
+			{Filters: []domain.Constraint{{Field: "cabin", Op: domain.LessThan, Value: 3}}},
+		}},
+		treeRepair: llm.Proposal{}, // no valid candidates back → loop resolves, run completes
+	}
+	sandbox := &fakeSandbox{
+		introspect: IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{{Name: "revenue", Type: "DOUBLE"}}}},
+		execResps:  []ExecuteResponse{{Value: map[string]any{"avg(revenue)": 10.0}}}, // baseline only
+	}
+	srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if claude.treeRepairCalls != 1 {
+		t.Fatalf("expected one repair call, got %d", claude.treeRepairCalls)
+	}
+	// The unknown columns reach the repair call, deduped case-insensitively (the second
+	// candidate's "cabin" collapses into "Cabin") in first-seen order — a case-sensitive
+	// dedup regression would append a third "cabin" and break the "Cabin, Age;" fragment.
+	if msg := claude.treeRepairErrMsg[0]; !strings.Contains(msg, "schema: Cabin, Age;") {
+		t.Fatalf("repair validation error must carry the deduped unknown columns, got %q", msg)
 	}
 }
 

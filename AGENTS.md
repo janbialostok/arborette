@@ -42,6 +42,12 @@
   (e.g. a status-sweep's affected-row count) — assert per-row effects instead. When
   asserting an `ORDER BY` over `now()`-defaulted timestamps, `time.Sleep` a couple
   ms between inserts so the ordering is deterministic.
+- Scripted-response test doubles (`fakeSandbox`, `fakeClaude`) return a nil error /
+  empty success once their scripted slice is exhausted. A test for a bounded retry
+  loop must therefore script one failure per attempt **plus** the initial one
+  (K repairs → K+1 scripted errors): script too few and a later iteration reads past
+  the script, gets the defaulted success, and the loop exits early — persisting the
+  goal and passing the assertion for the wrong reason.
 - To smoke-test a backend service change over HTTP without rebuilding its (stale)
   compose container, build and run the binary against the live stack: `go build`
   the `cmd/<svc>` binary, then run it with the same localhost overrides `make test`

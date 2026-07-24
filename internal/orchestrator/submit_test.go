@@ -79,12 +79,16 @@ func TestSubmitGoalDryRunRepairThenSuccess(t *testing.T) {
 	}
 }
 
-func TestSubmitGoalDryRunFailsTwiceIsUnprocessable(t *testing.T) {
+func TestSubmitGoalRepairsExhaustedIsUnprocessable(t *testing.T) {
 	goals := &fakeGoals{}
 	claude := &fakeClaude{matrix: fittedMatrix(), repair: fittedMatrix()}
+	// The initial dry-run plus one after each of the three repairs must all 400 for
+	// the loop to exhaust still-failing — four scripted 400s (K repairs → K+1 dry-runs).
 	sandbox := &fakeSandbox{
 		introspect: revenueSchema(),
 		execErrs: []error{
+			&SandboxError{Status: http.StatusBadRequest, Message: "type-incompatible objective expression"},
+			&SandboxError{Status: http.StatusBadRequest, Message: "type-incompatible objective expression"},
 			&SandboxError{Status: http.StatusBadRequest, Message: "type-incompatible objective expression"},
 			&SandboxError{Status: http.StatusBadRequest, Message: "type-incompatible objective expression"},
 		},
@@ -98,8 +102,8 @@ func TestSubmitGoalDryRunFailsTwiceIsUnprocessable(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "type-incompatible objective expression") {
 		t.Fatalf("422 body should name what could not be resolved: %q", rec.Body.String())
 	}
-	if claude.repairCalls != 1 {
-		t.Fatalf("expected exactly one repair attempt, got %d", claude.repairCalls)
+	if claude.repairCalls != maxObjectiveRepairs {
+		t.Fatalf("expected %d repair attempts before giving up, got %d", maxObjectiveRepairs, claude.repairCalls)
 	}
 	if goals.inserted != nil {
 		t.Fatal("an unfittable objective must not be persisted")
