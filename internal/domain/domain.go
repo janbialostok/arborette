@@ -241,6 +241,42 @@ func renderLiteral(l *LiteralValue) string {
 	}
 }
 
+// MaxObjectiveExpressionDepth caps how deeply an objective value expression may
+// nest. Real objectives are shallow — the deepest expected shape is avg over a
+// case-bucket over a comparison over a column_ref, which ExpressionDepth counts as
+// 3 — so 6 is generous headroom while still rejecting a pathological tree the
+// output schema does not bound (it carries the expression as a plain string).
+const MaxObjectiveExpressionDepth = 6
+
+// ExpressionDepth returns the maximum nesting depth of the value-expression AST,
+// counting a leaf (column_ref, literal) as 1 and each composite as one more than
+// its deepest child. It is CGO-free so the orchestrator can depth-guard a decoded
+// objective before dispatching it to the sandbox — the deterministic check that
+// grounds the loosened JSON-string value.
+func ExpressionDepth(e Expression) int {
+	switch e.Kind {
+	case CastKind:
+		return 1 + childDepth(e.Operand)
+	case ComparisonKind, ArithmeticKind:
+		return 1 + max(childDepth(e.Left), childDepth(e.Right))
+	case CaseKind:
+		deepest := childDepth(e.Else)
+		for _, br := range e.Cases {
+			deepest = max(deepest, max(childDepth(br.When), childDepth(br.Then)))
+		}
+		return 1 + deepest
+	default:
+		return 1
+	}
+}
+
+func childDepth(e *Expression) int {
+	if e == nil {
+		return 0
+	}
+	return ExpressionDepth(*e)
+}
+
 // ConstraintOp expresses a hard-constraint boundary comparison.
 type ConstraintOp string
 

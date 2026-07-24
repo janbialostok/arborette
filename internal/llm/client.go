@@ -66,11 +66,7 @@ func (c *Client) GenerateEvaluationMatrix(ctx context.Context, goalText string, 
 	if err != nil {
 		return domain.EvaluationMatrix{}, err
 	}
-	var matrix domain.EvaluationMatrix
-	if err := json.Unmarshal([]byte(body), &matrix); err != nil {
-		return domain.EvaluationMatrix{}, fmt.Errorf("parse evaluation matrix: %w", err)
-	}
-	return matrix, nil
+	return decodeMatrix(body)
 }
 
 // RepairEvaluationMatrix re-fits the objective after the fitted matrix failed the
@@ -79,9 +75,9 @@ func (c *Client) GenerateEvaluationMatrix(ctx context.Context, goalText string, 
 // correct the specific incompatibility. One generation per call; the caller bounds
 // how many times it retries.
 func (c *Client) RepairEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema, prior domain.EvaluationMatrix, validationErr string) (domain.EvaluationMatrix, error) {
-	priorJSON, err := json.Marshal(prior)
+	priorJSON, err := encodeMatrix(prior)
 	if err != nil {
-		return domain.EvaluationMatrix{}, fmt.Errorf("marshal prior matrix: %w", err)
+		return domain.EvaluationMatrix{}, fmt.Errorf("encode prior matrix: %w", err)
 	}
 	user := "Analyst goal:\n" + goalText + "\n\nAvailable columns:\n" + columnSummary(schema) +
 		"\nThis fitted objective failed to compile against the data source:\n" + string(priorJSON) +
@@ -92,11 +88,7 @@ func (c *Client) RepairEvaluationMatrix(ctx context.Context, goalText string, sc
 	if err != nil {
 		return domain.EvaluationMatrix{}, err
 	}
-	var matrix domain.EvaluationMatrix
-	if err := json.Unmarshal([]byte(body), &matrix); err != nil {
-		return domain.EvaluationMatrix{}, fmt.Errorf("parse evaluation matrix: %w", err)
-	}
-	return matrix, nil
+	return decodeMatrix(body)
 }
 
 // ProposeInterventionTree proposes one node of the hypothesis tree: a set of
@@ -158,6 +150,59 @@ type proposalWire struct {
 	} `json:"candidates"`
 }
 
+// evaluationMatrixWire mirrors the matrix structured-output body: each target's
+// value expression is a plain string holding a JSON-encoded domain.Expression, not
+// the AST object itself, because the output schema does not carry the recursive
+// AST. decodeMatrix re-parses each string into the flat fat node.
+type evaluationMatrixWire struct {
+	Targets     []matrixTargetWire  `json:"targets"`
+	Constraints []domain.Constraint `json:"constraints"`
+}
+
+// matrixTargetWire is one target in the matrix wire shape.
+type matrixTargetWire struct {
+	Direction   domain.TargetDirection `json:"direction"`
+	Aggregation string                 `json:"aggregation"`
+	Value       string                 `json:"value"`
+}
+
+// decodeMatrix decodes a matrix structured-output body into domain.EvaluationMatrix,
+// re-parsing each target's JSON-string value into a domain.Expression. A malformed
+// outer body or inner value string is a generation error (the caller maps it to a
+// 502, matching the prior top-level parse-failure handling); the depth guard on the
+// parsed AST is enforced downstream in the sandbox dry-run + repair loop.
+func decodeMatrix(body string) (domain.EvaluationMatrix, error) {
+	var wire evaluationMatrixWire
+	if err := json.Unmarshal([]byte(body), &wire); err != nil {
+		return domain.EvaluationMatrix{}, fmt.Errorf("parse evaluation matrix: %w", err)
+	}
+	targets := make([]domain.Target, 0, len(wire.Targets))
+	for i, t := range wire.Targets {
+		var expr domain.Expression
+		if err := json.Unmarshal([]byte(t.Value), &expr); err != nil {
+			return domain.EvaluationMatrix{}, fmt.Errorf("parse target %d value expression: %w", i, err)
+		}
+		targets = append(targets, domain.Target{Direction: t.Direction, Aggregation: t.Aggregation, Value: &expr})
+	}
+	return domain.EvaluationMatrix{Targets: targets, Constraints: wire.Constraints}, nil
+}
+
+// encodeMatrix re-encodes a matrix into the JSON-string-value wire body, the inverse
+// of decodeMatrix, so the repair prompt shows the model the prior matrix in the exact
+// form its output schema now demands (value as a JSON string, not a bare object). Each
+// target's resolved value expression is marshaled back into the string field.
+func encodeMatrix(matrix domain.EvaluationMatrix) ([]byte, error) {
+	wire := evaluationMatrixWire{Constraints: matrix.Constraints}
+	for i, t := range matrix.Targets {
+		valueJSON, err := json.Marshal(t.ValueExpression())
+		if err != nil {
+			return nil, fmt.Errorf("marshal target %d value expression: %w", i, err)
+		}
+		wire.Targets = append(wire.Targets, matrixTargetWire{Direction: t.Direction, Aggregation: t.Aggregation, Value: string(valueJSON)})
+	}
+	return json.Marshal(wire)
+}
+
 // complete issues one structured-output call: adaptive thinking (load-bearing on
 // Opus 4.8 — an omitted thinking field runs with none), the requested effort,
 // and the json_schema format. It maps a refusal or max_tokens stop reason to a
@@ -208,14 +253,22 @@ const evaluationMatrixSystem = "You fit an analyst's plain-English optimization 
 	"optimization direction. A plain numeric target is a bare column_ref value expression; a boolean or " +
 	"categorical target is a cast or comparison indicator (e.g. a rate of transported passengers is avg over the " +
 	"comparison Transported = True). Reference ONLY columns present in the provided \"Available columns\" list, " +
-	"and use each column's exact name as written there — a name absent from the list will not compile."
+	"and use each column's exact name as written there — a name absent from the list will not compile." +
+	expressionShapeGuide
 
 const evaluationMatrixRepairSystem = "You fit an analyst's optimization goal to a specific tabular data source. A " +
 	"previously fitted objective failed to compile against the data. Given the prior fitted matrix and the exact " +
 	"validation error, return a corrected Evaluation Matrix whose objective compiles and measures — resolve the " +
 	"objective to the actual columns and types, and express it as an aggregation over a value expression with an " +
 	"optimization direction. Reference ONLY columns present in the provided \"Available columns\" list, and use " +
-	"each column's exact name as written there — a name absent from the list will not compile."
+	"each column's exact name as written there — a name absent from the list will not compile." +
+	expressionShapeGuide
+
+// expressionShapeGuide grounds the objective value expression, which the output
+// schema carries as a plain string rather than a strict AST. It describes the
+// domain.Expression JSON shape the model must emit inside that string, so the
+// generated value round-trips through domain.Expression's json tags.
+const expressionShapeGuide = ` Each target's "value" field MUST be a JSON string containing a JSON object that encodes the value expression — not a bare object. That object is a discriminated union on a "kind" field, one of: column_ref {"kind":"column_ref","column":<name>}; literal {"kind":"literal","literal":{"number"|"string"|"bool":<value>}}; cast {"kind":"cast","operand":<expr>,"cast_type":<type>}; comparison {"kind":"comparison","op":<op>,"left":<expr>,"right":<expr>}; arithmetic {"kind":"arithmetic","op":<op>,"left":<expr>,"right":<expr>}; case {"kind":"case","cases":[{"when":<expr>,"then":<expr>}],"else":<expr>}. Nested expressions are the same object shape. A plain numeric objective is a bare column_ref, e.g. "value":"{\"kind\":\"column_ref\",\"column\":\"revenue\"}". A boolean rate is avg over a comparison, e.g. "value":"{\"kind\":\"comparison\",\"op\":\"=\",\"left\":{\"kind\":\"column_ref\",\"column\":\"Transported\"},\"right\":{\"kind\":\"literal\",\"literal\":{\"bool\":true}}}". A bucketed rate is avg over a case, e.g. avg(CASE WHEN age > 18 THEN 1 ELSE 0 END) is a case whose one branch compares age > 18 then literal 1, else literal 0. Reference only columns from the "Available columns" list inside the expression.`
 
 const interventionTreeSystem = "You propose candidate interventions for an empirical hypothesis tree over a " +
 	"tabular data source. Each candidate is a set of hard-constraint filters that segments the data; the run " +

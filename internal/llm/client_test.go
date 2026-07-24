@@ -54,12 +54,13 @@ func thinkingBlockJSON(text string) map[string]any {
 }
 
 func TestGenerateEvaluationMatrix(t *testing.T) {
-	// A boolean/categorical objective is fitted as an aggregation over a
-	// comparison indicator, which must round-trip into the AST.
-	body := `{"targets":[{"field":"revenue","direction":"maximize","aggregation":"avg",` +
-		`"value":{"kind":"comparison","op":"=",` +
-		`"left":{"kind":"column_ref","column":"revenue"},` +
-		`"right":{"kind":"literal","literal":{"number":100}}}}],` +
+	// A boolean/categorical objective is fitted as an aggregation over a comparison
+	// indicator; the output schema carries the value as a JSON string, which must
+	// re-parse into the AST.
+	body := `{"targets":[{"direction":"maximize","aggregation":"avg",` +
+		`"value":"{\"kind\":\"comparison\",\"op\":\"=\",` +
+		`\"left\":{\"kind\":\"column_ref\",\"column\":\"revenue\"},` +
+		`\"right\":{\"kind\":\"literal\",\"literal\":{\"number\":100}}}"}],` +
 		`"constraints":[{"field":"cost","op":"lte","value":100}]}`
 	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
 	c := &Client{messages: fake, model: "test-model"}
@@ -89,8 +90,8 @@ func TestGenerateEvaluationMatrix(t *testing.T) {
 }
 
 func TestGenerateEvaluationMatrixSkipsLeadingThinkingBlock(t *testing.T) {
-	body := `{"targets":[{"field":"latency","direction":"minimize","aggregation":"avg",` +
-		`"value":{"kind":"column_ref","column":"latency"}}],"constraints":[]}`
+	body := `{"targets":[{"direction":"minimize","aggregation":"avg",` +
+		`"value":"{\"kind\":\"column_ref\",\"column\":\"latency\"}"}],"constraints":[]}`
 	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn,
 		thinkingBlockJSON("considering the goal"),
 		textBlockJSON(body),
@@ -107,13 +108,21 @@ func TestGenerateEvaluationMatrixSkipsLeadingThinkingBlock(t *testing.T) {
 }
 
 func TestRepairEvaluationMatrix(t *testing.T) {
-	body := `{"targets":[{"field":"revenue","direction":"maximize","aggregation":"sum",` +
-		`"value":{"kind":"column_ref","column":"revenue"}}],"constraints":[]}`
+	body := `{"targets":[{"direction":"maximize","aggregation":"sum",` +
+		`"value":"{\"kind\":\"column_ref\",\"column\":\"revenue\"}"}],"constraints":[]}`
 	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
 	c := &Client{messages: fake, model: "test-model"}
 
-	prior := domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}}
-	schema := SandboxSchema{Columns: []SandboxColumn{{Name: "revenue", Type: "DOUBLE"}}}
+	// A composite prior objective (a boolean-rate comparison indicator) is the
+	// representative repair input: decodeMatrix always hands RepairEvaluationMatrix a
+	// full value AST, so encodeMatrix must re-encode a nested expression, not just
+	// a degenerate column_ref, back into the JSON-string value field.
+	tru := true
+	priorExpr := domain.Expression{Kind: domain.ComparisonKind, Op: "=",
+		Left:  &domain.Expression{Kind: domain.ColumnRefKind, Column: "Transported"},
+		Right: &domain.Expression{Kind: domain.LiteralKind, Literal: &domain.LiteralValue{Bool: &tru}}}
+	prior := domain.EvaluationMatrix{Targets: []domain.Target{{Direction: domain.Maximize, Aggregation: "avg", Value: &priorExpr}}}
+	schema := SandboxSchema{Columns: []SandboxColumn{{Name: "Transported", Type: "BOOLEAN"}}}
 	matrix, err := c.RepairEvaluationMatrix(context.Background(), "grow revenue", schema, prior, "numeric aggregation over non-numeric column")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -121,13 +130,41 @@ func TestRepairEvaluationMatrix(t *testing.T) {
 	if matrix.Targets[0].Aggregation != "sum" {
 		t.Fatalf("expected the repaired matrix, got %+v", matrix.Targets)
 	}
-	// The repair prompt must embed the prior fitted matrix and the sandbox error.
+	// The repair prompt embeds the prior fitted matrix re-encoded through the wire:
+	// its aggregation is present and its composite value expression is shown as a
+	// JSON string (matching the output schema the model must now satisfy).
 	user := fake.got.Messages[0].Content[0].OfText.Text
 	if !strings.Contains(user, `"aggregation":"avg"`) {
 		t.Fatalf("repair prompt did not embed the prior matrix: %q", user)
 	}
+	if !strings.Contains(user, `\"kind\":\"comparison\"`) || !strings.Contains(user, `\"column\":\"Transported\"`) {
+		t.Fatalf("repair prompt did not embed the prior composite value as a JSON string: %q", user)
+	}
 	if !strings.Contains(user, "numeric aggregation over non-numeric column") {
 		t.Fatalf("repair prompt did not embed the validation error: %q", user)
+	}
+}
+
+func TestGenerateEvaluationMatrixMalformedValueErrors(t *testing.T) {
+	// A value string that is not valid JSON fails decodeMatrix's inner unmarshal;
+	// the caller maps this to a 502, matching the prior top-level parse-failure path.
+	body := `{"targets":[{"direction":"maximize","aggregation":"avg","value":"not json"}],"constraints":[]}`
+	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
+	c := &Client{messages: fake, model: "test-model"}
+	if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}); err == nil {
+		t.Fatalf("expected an error for a malformed value expression string")
+	}
+}
+
+func TestGenerateEvaluationMatrixObjectValueErrors(t *testing.T) {
+	// The pre-migration output shape emitted value as a bare object; against the
+	// string-typed wire it fails the outer unmarshal and surfaces as a generation
+	// error (mapped to 502), never a silently empty expression.
+	body := `{"targets":[{"direction":"maximize","aggregation":"avg","value":{"kind":"column_ref","column":"revenue"}}],"constraints":[]}`
+	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
+	c := &Client{messages: fake, model: "test-model"}
+	if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}); err == nil {
+		t.Fatalf("expected an error for an object-shaped value expression")
 	}
 }
 

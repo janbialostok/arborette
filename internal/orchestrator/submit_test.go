@@ -29,6 +29,18 @@ func revenueSchema() IntrospectResponse {
 	return IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{{Name: "revenue", Type: "DOUBLE"}}}}
 }
 
+// tooDeepMatrix fits an objective whose value expression nests one past the cap —
+// the shape the plain-string output schema does not bound, caught by the
+// registration depth guard before any sandbox Execute.
+func tooDeepMatrix() domain.EvaluationMatrix {
+	expr := domain.Expression{Kind: domain.ColumnRefKind, Column: "revenue"}
+	for i := 0; i <= domain.MaxObjectiveExpressionDepth; i++ {
+		inner := expr
+		expr = domain.Expression{Kind: domain.CastKind, CastType: "DOUBLE", Operand: &inner}
+	}
+	return domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg", Value: &expr}}}
+}
+
 func TestSubmitGoalIntrospectionFailureMapping(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -128,6 +140,62 @@ func TestSubmitGoalRepairErrorIsBadGateway(t *testing.T) {
 	}
 	if goals.inserted != nil {
 		t.Fatal("a failed repair call must not persist the goal")
+	}
+}
+
+func TestSubmitGoalTooDeepObjectiveRepairsThenSuccess(t *testing.T) {
+	goals := &fakeGoals{}
+	// The first fitted matrix nests past the depth cap, so the dry-run fails at the
+	// depth guard (before any Execute) and is routed to repair; the repaired
+	// within-cap matrix then measures and persists.
+	claude := &fakeClaude{matrix: tooDeepMatrix(), repair: fittedMatrix()}
+	sandbox := &fakeSandbox{
+		introspect: revenueSchema(),
+		execResps:  []ExecuteResponse{{Value: map[string]any{"avg(revenue)": 10.0}}},
+	}
+	srv := newTestServer(goals, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+
+	rec := postGoal(t, srv)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %q)", rec.Code, rec.Body.String())
+	}
+	if claude.repairCalls != 1 {
+		t.Fatalf("expected exactly one repair, got %d", claude.repairCalls)
+	}
+	// The depth guard short-circuits before the first Execute; only the post-repair
+	// dry-run runs.
+	if sandbox.execCalls != 1 {
+		t.Fatalf("expected exactly one execute (post-repair dry-run), got %d", sandbox.execCalls)
+	}
+	if goals.inserted == nil {
+		t.Fatal("goal should be persisted after a repaired objective validates")
+	}
+}
+
+func TestSubmitGoalAlwaysTooDeepIsUnprocessable(t *testing.T) {
+	goals := &fakeGoals{}
+	// Both the initial and every repaired matrix nest past the cap, so the depth
+	// guard exhausts the repair loop and the goal is 422 — never a sandbox fault,
+	// and never dispatched to Execute.
+	claude := &fakeClaude{matrix: tooDeepMatrix(), repair: tooDeepMatrix()}
+	sandbox := &fakeSandbox{introspect: revenueSchema()}
+	srv := newTestServer(goals, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+
+	rec := postGoal(t, srv)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body %q)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "nests too deeply") {
+		t.Fatalf("422 body should name the depth failure: %q", rec.Body.String())
+	}
+	if claude.repairCalls != maxObjectiveRepairs {
+		t.Fatalf("expected %d repair attempts before giving up, got %d", maxObjectiveRepairs, claude.repairCalls)
+	}
+	if sandbox.execCalls != 0 {
+		t.Fatalf("a too-deep objective must never reach the sandbox, got %d executes", sandbox.execCalls)
+	}
+	if goals.inserted != nil {
+		t.Fatal("an unfittable objective must not be persisted")
 	}
 }
 

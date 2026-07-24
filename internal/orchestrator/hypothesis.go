@@ -21,6 +21,7 @@ var (
 	errNonNumericValue    = errors.New("sandbox returned a non-numeric objective value")
 	errNoObjective        = errors.New("evaluation matrix has no target to pin as the objective")
 	errMissingAggregation = errors.New("evaluation matrix target carries no aggregation; re-register the goal to fit a measurable objective")
+	errExpressionTooDeep  = errors.New("objective value expression nests too deeply")
 )
 
 // loopTimeout bounds a whole hypothesis run. The loop runs on a background
@@ -413,6 +414,12 @@ func (s *Server) dryRunObjective(ctx context.Context, ref string, matrix domain.
 	if err != nil {
 		return err
 	}
+	// The output schema does not bound expression nesting (the value is a plain
+	// JSON string), so guard depth here — the message flows verbatim into
+	// RepairEvaluationMatrix via the existing repair loop.
+	if domain.ExpressionDepth(obj.expr) > domain.MaxObjectiveExpressionDepth {
+		return fmt.Errorf("%w (max %d)", errExpressionTooDeep, domain.MaxObjectiveExpressionDepth)
+	}
 	_, err = s.sandbox.Execute(ctx, executeRequestFor(store.Goal{DataSourceRef: ref}, obj, nil))
 	return err
 }
@@ -422,7 +429,7 @@ func (s *Server) dryRunObjective(ctx context.Context, ref string, matrix domain.
 // sandbox 400 compile/type error. A sandbox 4xx≠400, 5xx, or transport error is a
 // fault, not an unfixable objective.
 func isObjectiveValidationFailure(err error) bool {
-	if errors.Is(err, errNoObjective) || errors.Is(err, errMissingAggregation) {
+	if errors.Is(err, errNoObjective) || errors.Is(err, errMissingAggregation) || errors.Is(err, errExpressionTooDeep) {
 		return true
 	}
 	var se *SandboxError

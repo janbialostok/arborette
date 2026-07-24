@@ -102,6 +102,64 @@ func TestTargetWithExpressionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestExpressionDepth(t *testing.T) {
+	// avg(CASE WHEN age > 18 THEN 1 ELSE 0 END): case(3) over comparison(2) over
+	// column_ref(1) — the deepest real objective shape, well under the cap.
+	caseBucket := Expression{Kind: CaseKind,
+		Cases: []CaseBranch{{
+			When: &Expression{Kind: ComparisonKind, Op: ">",
+				Left:  &Expression{Kind: ColumnRefKind, Column: "age"},
+				Right: &Expression{Kind: LiteralKind, Literal: &LiteralValue{Number: ptr(18.0)}}},
+			Then: &Expression{Kind: LiteralKind, Literal: &LiteralValue{Number: ptr(1.0)}}}},
+		Else: &Expression{Kind: LiteralKind, Literal: &LiteralValue{Number: ptr(0.0)}}}
+
+	// A CASE whose deepest nesting lives in the else arm, so the else seed — not a
+	// WHEN/THEN branch — must drive the result; a dropped else seed would undercount.
+	caseElseDeepest := Expression{Kind: CaseKind,
+		Cases: []CaseBranch{{
+			When: &Expression{Kind: ColumnRefKind, Column: "flag"},
+			Then: &Expression{Kind: LiteralKind, Literal: &LiteralValue{Number: ptr(1.0)}}}},
+		Else: &Expression{Kind: ComparisonKind, Op: ">",
+			Left:  &Expression{Kind: ColumnRefKind, Column: "age"},
+			Right: &Expression{Kind: LiteralKind, Literal: &LiteralValue{Number: ptr(18.0)}}}}
+
+	// A pathological tree the plain-string output schema does not bound: casts
+	// nested one past the cap.
+	overCap := Expression{Kind: ColumnRefKind, Column: "revenue"}
+	for i := 0; i <= MaxObjectiveExpressionDepth; i++ {
+		inner := overCap
+		overCap = Expression{Kind: CastKind, CastType: "DOUBLE", Operand: &inner}
+	}
+
+	cases := []struct {
+		name string
+		expr Expression
+		want int
+	}{
+		{"leaf column_ref", Expression{Kind: ColumnRefKind, Column: "revenue"}, 1},
+		{"boolean-rate comparison indicator", Expression{Kind: ComparisonKind, Op: "=",
+			Left:  &Expression{Kind: ColumnRefKind, Column: "Transported"},
+			Right: &Expression{Kind: LiteralKind, Literal: &LiteralValue{Bool: ptr(true)}}}, 2},
+		{"case bucket", caseBucket, 3},
+		{"case with deepest else arm", caseElseDeepest, 3},
+		{"nil children are depth zero", Expression{Kind: ComparisonKind, Op: "="}, 1},
+		{"over-cap cast chain", overCap, MaxObjectiveExpressionDepth + 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ExpressionDepth(c.expr); got != c.want {
+				t.Fatalf("ExpressionDepth = %d, want %d", got, c.want)
+			}
+		})
+	}
+	if ExpressionDepth(overCap) <= MaxObjectiveExpressionDepth {
+		t.Fatalf("over-cap tree must exceed the cap: depth %d, cap %d", ExpressionDepth(overCap), MaxObjectiveExpressionDepth)
+	}
+	if ExpressionDepth(caseBucket) > MaxObjectiveExpressionDepth {
+		t.Fatalf("the case-bucket shape must be under the cap: depth %d, cap %d", ExpressionDepth(caseBucket), MaxObjectiveExpressionDepth)
+	}
+}
+
 func TestUnknownFilterColumns(t *testing.T) {
 	columns := []string{"Revenue", "Region", "HomePlanet"}
 

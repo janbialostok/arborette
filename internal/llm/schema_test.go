@@ -3,7 +3,6 @@ package llm
 import (
 	"encoding/json"
 	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/arborette/arborette/internal/domain"
@@ -41,52 +40,6 @@ func enumValues(t *testing.T, prop any) []any {
 	return vals
 }
 
-func anyOfVariants(t *testing.T, schema any) []map[string]any {
-	t.Helper()
-	m, ok := schema.(map[string]any)
-	if !ok {
-		t.Fatalf("schema is not an object: %v", schema)
-	}
-	raw, ok := m["anyOf"].([]any)
-	if !ok {
-		t.Fatalf("schema has no anyOf: %v", schema)
-	}
-	out := make([]map[string]any, 0, len(raw))
-	for _, v := range raw {
-		out = append(out, v.(map[string]any))
-	}
-	return out
-}
-
-func variantByKind(t *testing.T, variants []map[string]any, kind string) map[string]any {
-	t.Helper()
-	for _, v := range variants {
-		if k, ok := properties(t, v)["kind"].(map[string]any); ok && k["const"] == kind {
-			return v
-		}
-	}
-	t.Fatalf("no anyOf variant with kind %q", kind)
-	return nil
-}
-
-// resolveRef follows a {$ref: "#/$defs/name"} node to its definition; a non-ref
-// schema is returned unchanged.
-func resolveRef(t *testing.T, defs map[string]any, node any) map[string]any {
-	t.Helper()
-	m, ok := node.(map[string]any)
-	if !ok {
-		t.Fatalf("node is not a schema: %v", node)
-	}
-	if ref, ok := m["$ref"].(string); ok {
-		def, ok := defs[strings.TrimPrefix(ref, "#/$defs/")].(map[string]any)
-		if !ok {
-			t.Fatalf("dangling $ref: %s", ref)
-		}
-		return def
-	}
-	return m
-}
-
 func TestEvaluationMatrixSchema(t *testing.T) {
 	schema := SandboxSchema{Columns: []SandboxColumn{{Name: "revenue"}, {Name: "cost"}}}
 	s := evaluationMatrixSchema(schema)
@@ -119,51 +72,25 @@ func TestEvaluationMatrixSchema(t *testing.T) {
 		t.Fatalf("aggregation enum = %v, want the domain aggregation set", agg)
 	}
 
-	// The value expression is a $ref into $defs; the resolved depth-N schema is an
-	// anyOf of per-kind variants. At the top depth all six kinds are offered; the
-	// column_ref variant is a closed object requiring kind+column, with column a
-	// plain string (grounded via the prompt, validated after generation — no enum,
-	// so the compiled grammar does not scale with dataset width).
-	defs := s["$defs"].(map[string]any)
-	value := resolveRef(t, defs, tprops["value"])
-	variants := anyOfVariants(t, value)
-	if len(variants) != 6 {
-		t.Fatalf("value anyOf = %d variants, want 6 kinds", len(variants))
+	// The value expression is a plain string holding a JSON-encoded domain.Expression
+	// (grounded via the prompt, parsed + depth-guarded + validated after generation),
+	// not a strict AST — so the compiled grammar is independent of expression depth
+	// and no $defs are emitted.
+	value := tprops["value"].(map[string]any)
+	if value["type"] != "string" {
+		t.Fatalf("value must be a plain string schema: %v", value)
 	}
-	colRef := variantByKind(t, variants, string(domain.ColumnRefKind))
-	if colRef["additionalProperties"] != false {
-		t.Fatal("expression variant must set additionalProperties:false")
+	if _, hasEnum := value["enum"]; hasEnum {
+		t.Fatalf("value must not be enum-constrained: %v", value)
 	}
-	creq := requiredKeys(t, colRef)
-	if !creq["kind"] || !creq["column"] {
-		t.Fatalf("column_ref variant must require kind and column: %v", creq)
+	if _, hasAnyOf := value["anyOf"]; hasAnyOf {
+		t.Fatalf("value must not carry a strict AST anyOf: %v", value)
 	}
-	column := properties(t, colRef)["column"].(map[string]any)
-	if column["type"] != "string" {
-		t.Fatalf("column must be a plain string schema: %v", column)
+	if _, hasRef := value["$ref"]; hasRef {
+		t.Fatalf("value must not $ref an expression definition: %v", value)
 	}
-	if _, hasEnum := column["enum"]; hasEnum {
-		t.Fatalf("column must not be enum-constrained (width-independence): %v", column)
-	}
-	// The literal variant models "exactly one of number/string/bool" as its own
-	// three-way anyOf.
-	lit := variantByKind(t, variants, string(domain.LiteralKind))
-	if len(anyOfVariants(t, properties(t, lit)["literal"])) != 3 {
-		t.Fatalf("literal must be a 3-way anyOf: %v", properties(t, lit)["literal"])
-	}
-
-	// Composite variants recurse (via $ref) down to maxExprDepth; the leaf offers
-	// only the two leaf kinds.
-	node := tprops["value"]
-	for depth := maxExprDepth; depth > 0; depth-- {
-		vs := anyOfVariants(t, resolveRef(t, defs, node))
-		if len(vs) != 6 {
-			t.Fatalf("depth %d anyOf = %d variants, want 6", depth, len(vs))
-		}
-		node = properties(t, variantByKind(t, vs, string(domain.ComparisonKind)))["left"]
-	}
-	if leaf := anyOfVariants(t, resolveRef(t, defs, node)); len(leaf) != 2 {
-		t.Fatalf("leaf anyOf = %d variants, want 2 leaf kinds", len(leaf))
+	if _, hasDefs := s["$defs"]; hasDefs {
+		t.Fatalf("schema must not emit $defs once the AST is a plain string: %v", s["$defs"])
 	}
 }
 
