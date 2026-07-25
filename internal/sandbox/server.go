@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/arborette/arborette/internal/datasource"
 	"github.com/arborette/arborette/internal/domain"
@@ -26,11 +27,12 @@ func NewServer(objects *objectstore.Client, maxObjectBytes int64, maxTempDirSize
 	return &Server{objects: objects, maxObjectBytes: maxObjectBytes, maxTempDirSize: maxTempDirSize}
 }
 
-// Routes returns the mux for the two endpoints.
+// Routes returns the mux for the endpoints.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /introspect", s.handleIntrospect)
 	mux.HandleFunc("POST /execute", s.handleExecute)
+	mux.HandleFunc("POST /document/text", s.handleDocumentText)
 	return mux
 }
 
@@ -62,10 +64,25 @@ type IntrospectRequest struct {
 	Targets       []domain.Target `json:"targets"`
 }
 
-// IntrospectResponse returns the schema and the per-target column bindings.
+// IntrospectResponse returns the schema and the per-target column bindings. For a
+// document source Schema.Kind is "document", TargetBindings is empty (a document
+// has no columns to bind), and Sample carries a bounded plain-text excerpt of the
+// document's first page that grounds the orchestrator's field-introspection call.
 type IntrospectResponse struct {
 	Schema         schemaDTO       `json:"schema"`
 	TargetBindings []TargetBinding `json:"target_bindings"`
+	Sample         string          `json:"sample,omitempty"`
+}
+
+// DocumentTextRequest asks for a document's ordered per-page plain text.
+type DocumentTextRequest struct {
+	DataSourceRef string `json:"data_source_ref"`
+}
+
+// DocumentTextResponse returns the document's per-page plain text, page index to
+// text, the run-invariant substrate the orchestrator caches for provenance.
+type DocumentTextResponse struct {
+	Pages []string `json:"pages"`
 }
 
 // ExecuteRequest measures one aggregate over a data source under hard-constraint
@@ -104,6 +121,24 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A document source has no columns to describe or bind: report its kind plus a
+	// first-page text sample and let the orchestrator derive extractable fields via
+	// Claude. Kind detection is by extension, mirroring the tabular reader's own
+	// extension dispatch, so the two readers own non-overlapping formats.
+	if isDocumentRef(req.DataSourceRef) {
+		src := NewDocumentSource(s.objects, req.DataSourceRef, s.maxObjectBytes)
+		pages, err := src.Pages(r.Context())
+		if err != nil {
+			writeStageErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, IntrospectResponse{
+			Schema: schemaDTO{Kind: string(datasource.KindDocument)},
+			Sample: documentSample(pages),
+		})
+		return
+	}
+
 	src := NewFileSource(s.objects, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
 	schema, err := src.Introspect(r.Context())
 	if err != nil {
@@ -117,6 +152,36 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, IntrospectResponse{Schema: toSchemaDTO(schema), TargetBindings: bindings})
+}
+
+// handleDocumentText serves a document's ordered per-page plain text. It mirrors
+// handleIntrospect's stage-and-read shape and is deterministic (no LLM): the
+// orchestrator fetches this once per run as the substrate for provenance search.
+func (s *Server) handleDocumentText(w http.ResponseWriter, r *http.Request) {
+	var req DocumentTextRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.DataSourceRef == "" {
+		writeErr(w, http.StatusBadRequest, "data_source_ref is required")
+		return
+	}
+
+	src := NewDocumentSource(s.objects, req.DataSourceRef, s.maxObjectBytes)
+	pages, err := src.Pages(r.Context())
+	if err != nil {
+		writeStageErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, DocumentTextResponse{Pages: pages})
+}
+
+// isDocumentRef reports whether a ref is a document this service reads (a PDF
+// today), so introspection routes it to the document reader rather than the
+// tabular one. The two extension sets are non-overlapping.
+func isDocumentRef(ref string) bool {
+	return strings.HasSuffix(strings.ToLower(ref), ".pdf")
 }
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
@@ -200,6 +265,7 @@ func writeStageErr(w http.ResponseWriter, err error) {
 		errors.Is(err, errUnknownCast),
 		errors.Is(err, errNonFiniteValue),
 		errors.Is(err, errUnsupportedFormat),
+		errors.Is(err, errUnsupportedDocument),
 		errors.Is(err, errObjectTooLarge):
 		writeErr(w, http.StatusBadRequest, err.Error())
 	default:

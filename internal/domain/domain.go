@@ -69,7 +69,9 @@ type Intervention struct {
 }
 
 // ProvenanceLocator pins an extract-type outcome's value to the exact source
-// excerpt it came from. Nil when no exact match is found in the source text.
+// excerpt it came from: a 0-based page index and the byte offsets (not rune
+// offsets) of the value within that page's extracted text. Nil when no exact
+// match is found in the source text.
 type ProvenanceLocator struct {
 	Page      int
 	CharStart int
@@ -111,6 +113,16 @@ type ProducedEdge struct {
 type EvaluationMatrix struct {
 	Targets     []Target     `json:"targets"`
 	Constraints []Constraint `json:"constraints"`
+}
+
+// TargetField is one field a document goal extracts. A document goal has no
+// aggregation or direction to optimize -- its objective is a set of fields to
+// extract accurately -- so target fields are the document analog of an
+// EvaluationMatrix's targets, and a document goal persists these instead of a
+// matrix. Stored as jsonb in the goal registry.
+type TargetField struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
 // TargetDirection is whether a target should be maximized or minimized.

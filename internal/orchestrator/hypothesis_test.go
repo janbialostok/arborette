@@ -561,6 +561,9 @@ func (p panicSandbox) Introspect(context.Context, IntrospectRequest) (Introspect
 func (p panicSandbox) Execute(context.Context, ExecuteRequest) (ExecuteResponse, error) {
 	return ExecuteResponse{}, nil
 }
+func (p panicSandbox) DocumentText(context.Context, DocumentTextRequest) (DocumentTextResponse, error) {
+	return DocumentTextResponse{}, nil
+}
 
 func assertOneStatus(t *testing.T, runs *fakeRuns, status store.RunStatus, reason string) {
 	t.Helper()

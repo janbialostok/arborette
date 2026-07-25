@@ -49,10 +49,24 @@ type IntrospectRequest struct {
 	Targets       []domain.Target `json:"targets"`
 }
 
-// IntrospectResponse returns the schema and per-target column bindings.
+// IntrospectResponse returns the schema and per-target column bindings. For a
+// document source Schema.Kind is "document", TargetBindings is empty, and Sample
+// carries a first-page text excerpt grounding the field-introspection call.
 type IntrospectResponse struct {
 	Schema         schemaDTO       `json:"schema"`
 	TargetBindings []TargetBinding `json:"target_bindings"`
+	Sample         string          `json:"sample,omitempty"`
+}
+
+// DocumentTextRequest asks the sandbox for a document's ordered per-page text.
+type DocumentTextRequest struct {
+	DataSourceRef string `json:"data_source_ref"`
+}
+
+// DocumentTextResponse returns a document's per-page plain text (page index to
+// text), the run-invariant substrate the loop caches for provenance search.
+type DocumentTextResponse struct {
+	Pages []string `json:"pages"`
 }
 
 // ExecuteRequest measures one aggregate over a data source under hard-constraint
@@ -117,6 +131,17 @@ func (c *SandboxClient) Execute(ctx context.Context, req ExecuteRequest) (Execut
 	var resp ExecuteResponse
 	if err := c.post(ctx, "/execute", req, &resp); err != nil {
 		return ExecuteResponse{}, err
+	}
+	return resp, nil
+}
+
+// DocumentText POSTs a per-page text request to /document/text. The whole read is
+// deterministic PDF parsing, so it stays inside the 2-minute sandbox bound; only
+// the LLM extraction runs orchestrator-side to escape that timeout.
+func (c *SandboxClient) DocumentText(ctx context.Context, req DocumentTextRequest) (DocumentTextResponse, error) {
+	var resp DocumentTextResponse
+	if err := c.post(ctx, "/document/text", req, &resp); err != nil {
+		return DocumentTextResponse{}, err
 	}
 	return resp, nil
 }

@@ -86,6 +86,33 @@ func interventionTreeSchema(_ SandboxSchema) map[string]any {
 	}, "candidates")
 }
 
+// documentFieldsSchema is the structured-output schema for IntrospectDocumentFields:
+// an array of candidate extractable fields, each a name plus a one-line
+// description. Both are plain strings grounded via the prompt, so the schema is
+// static (no enums, no recursion) and statically cacheable.
+func documentFieldsSchema() map[string]any {
+	return object(props{
+		"fields": arrayOf(object(props{
+			"name":        stringProp(),
+			"description": stringProp(),
+		}, "name", "description")),
+	}, "fields")
+}
+
+// extractionSchema is the structured-output schema for Extract: the extracted
+// value as a plain string plus a confidence in [0,1]. It deliberately carries no
+// source locator -- Citations and structured outputs are mutually exclusive on
+// the Claude API, so provenance is computed separately by a deterministic text
+// search. Keeping value a plain string (not a per-field typed union) keeps the
+// grammar small and lets the deterministic provenance pass match it verbatim
+// against the source text.
+func extractionSchema() map[string]any {
+	return object(props{
+		"value":      stringProp(),
+		"confidence": map[string]any{"type": "number"},
+	}, "value", "confidence")
+}
+
 // constraintItem is the schema for one matrix hard-constraint. The field is a plain
 // string (grounded via the prompt, validated after generation); only the op keeps
 // its fixed-cardinality enum. It stays numeric-only because it is shared with

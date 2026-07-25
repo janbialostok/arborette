@@ -1,6 +1,8 @@
 module github.com/arborette/arborette
 
-go 1.24
+go 1.24.1
+
+toolchain go1.24.4
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.58.0
@@ -12,6 +14,7 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.18.3
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.6
+	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
 	github.com/marcboeker/go-duckdb/v2 v2.4.3
 	github.com/modelcontextprotocol/go-sdk v1.3.1
 	github.com/neo4j/neo4j-go-driver/v5 v5.28.4

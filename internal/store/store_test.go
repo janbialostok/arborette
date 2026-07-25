@@ -223,6 +223,67 @@ func TestGoalRegistryGrants(t *testing.T) {
 	}
 }
 
+func TestGoalRegistryDocumentGoal(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+
+	p := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	registry := store.NewGoalRegistry(p)
+
+	// A document goal writes a NULL evaluation_matrix + populated target_fields.
+	docID := testutil.NewID(t)
+	docGoal := store.Goal{
+		OptimizationFunctionID: docID,
+		GoalText:               "extract the key contract dates",
+		TargetFields: []domain.TargetField{
+			{Name: "effective_date", Description: "the effective date"},
+			{Name: "termination_date", Description: "the termination date"},
+		},
+		DataSourceRef: "s3://arborette/contract.pdf",
+	}
+	if err := registry.Insert(ctx, docGoal); err != nil {
+		t.Fatalf("insert document goal: %v", err)
+	}
+	got, err := registry.Get(ctx, docID)
+	if err != nil {
+		t.Fatalf("get document goal: %v", err)
+	}
+	if !got.IsDocument() || len(got.TargetFields) != 2 || got.TargetFields[0].Name != "effective_date" {
+		t.Fatalf("document goal round-trip mismatch: %+v", got)
+	}
+	if len(got.EvaluationMatrix.Targets) != 0 {
+		t.Fatalf("document goal should decode a zero-value matrix, got %+v", got.EvaluationMatrix)
+	}
+
+	// A tabular goal alongside it: List must decode a mix of NULL-matrix (document)
+	// and NULL-target_fields (tabular) rows without a decode error -- the null-guard
+	// that otherwise breaks handleListGoals once one document goal exists.
+	tabID := testutil.NewID(t)
+	if err := registry.Insert(ctx, store.Goal{
+		OptimizationFunctionID: tabID,
+		GoalText:               "grow revenue",
+		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
+		DataSourceRef:          "s3://arborette/data.csv",
+	}); err != nil {
+		t.Fatalf("insert tabular goal: %v", err)
+	}
+
+	goals, err := registry.List(ctx)
+	if err != nil {
+		t.Fatalf("list mixed goals: %v", err)
+	}
+	byID := map[string]store.Goal{}
+	for _, g := range goals {
+		byID[g.OptimizationFunctionID] = g
+	}
+	if g := byID[docID]; !g.IsDocument() || len(g.TargetFields) != 2 {
+		t.Fatalf("document goal not listed with its target fields: %+v", g)
+	}
+	if g := byID[tabID]; g.IsDocument() || len(g.EvaluationMatrix.Targets) != 1 {
+		t.Fatalf("tabular goal not listed with its matrix: %+v", g)
+	}
+}
+
 // seedGoal inserts a minimal registered goal a run row can reference, returning
 // its id.
 func seedGoal(t *testing.T, ctx context.Context, p *store.Pool) string {

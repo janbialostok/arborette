@@ -40,18 +40,23 @@ const (
 // *store.GoalRegistry, *store.AuditLog, *objectstore.Client, and
 // *heuristics.Service, which satisfy them.
 
-// claudeClient is the two structured-output Claude calls the loop needs, named
-// for the collaborator (the `claude` field) rather than either single method.
+// claudeClient is the structured-output Claude calls the loop needs, named for
+// the collaborator (the `claude` field) rather than any single method. The two
+// document methods sit here beside the tabular ones: the document intake path
+// derives extractable fields, and the extraction loop measures each field.
 type claudeClient interface {
 	GenerateEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema) (domain.EvaluationMatrix, error)
 	RepairEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema, prior domain.EvaluationMatrix, validationErr string) (domain.EvaluationMatrix, error)
 	ProposeInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema llm.SandboxSchema, node llm.TreeContext) (llm.Proposal, error)
 	RepairInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema llm.SandboxSchema, node llm.TreeContext, prior llm.Proposal, validationErr string) (llm.Proposal, error)
+	IntrospectDocumentFields(ctx context.Context, goalText, sample string) ([]domain.TargetField, error)
+	Extract(ctx context.Context, pdf []byte, field domain.TargetField, method string) (string, float64, error)
 }
 
 type sandboxExecutor interface {
 	Introspect(ctx context.Context, req IntrospectRequest) (IntrospectResponse, error)
 	Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error)
+	DocumentText(ctx context.Context, req DocumentTextRequest) (DocumentTextResponse, error)
 }
 
 type goalStore interface {
@@ -76,6 +81,7 @@ type auditStore interface {
 type objectStore interface {
 	NewKey(parts ...string) string
 	Put(ctx context.Context, key string, r io.Reader, contentType string) error
+	Get(ctx context.Context, key string) (io.ReadCloser, error)
 }
 
 type heuristicsService interface {

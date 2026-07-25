@@ -87,8 +87,10 @@ func (f *fakeAudits) Append(_ context.Context, r store.AuditRecord) error {
 }
 
 type fakeObjects struct {
-	puts   int
-	putErr error
+	puts    int
+	putErr  error
+	getData []byte
+	getErr  error
 }
 
 func (fakeObjects) NewKey(parts ...string) string { return strings.Join(parts, "/") }
@@ -99,6 +101,12 @@ func (f *fakeObjects) Put(_ context.Context, _ string, r io.Reader, _ string) er
 	}
 	f.puts++
 	return nil
+}
+func (f *fakeObjects) Get(_ context.Context, _ string) (io.ReadCloser, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	return io.NopCloser(bytes.NewReader(f.getData)), nil
 }
 
 type fakeHeur struct {
@@ -118,21 +126,29 @@ func (f *fakeHeur) Trace(_ context.Context, _ string) ([]graph.CausalTriplet, er
 }
 
 type fakeClaude struct {
-	matrix           domain.EvaluationMatrix
-	matrixErr        error
-	repair           domain.EvaluationMatrix
-	repairErr        error
-	repairCalls      int
-	proposal         llm.Proposal
-	proposalErr      error
-	childProposal    *llm.Proposal
-	gotSchema        llm.SandboxSchema
-	gotNodes         []llm.TreeContext
-	treeRepair       llm.Proposal
-	treeRepairErr    error
-	treeRepairCalls  int
-	treeRepairPrior  []llm.Proposal
-	treeRepairErrMsg []string
+	matrix            domain.EvaluationMatrix
+	matrixErr         error
+	repair            domain.EvaluationMatrix
+	repairErr         error
+	repairCalls       int
+	proposal          llm.Proposal
+	proposalErr       error
+	childProposal     *llm.Proposal
+	gotSchema         llm.SandboxSchema
+	gotNodes          []llm.TreeContext
+	treeRepair        llm.Proposal
+	treeRepairErr     error
+	treeRepairCalls   int
+	treeRepairPrior   []llm.Proposal
+	treeRepairErrMsg  []string
+	fields            []domain.TargetField
+	fieldsErr         error
+	gotSample         string
+	extractValue      string
+	extractConfidence float64
+	extractErr        error
+	extractCalls      int
+	gotMethods        []string
 }
 
 func (f *fakeClaude) GenerateEvaluationMatrix(_ context.Context, _ string, schema llm.SandboxSchema) (domain.EvaluationMatrix, error) {
@@ -158,6 +174,18 @@ func (f *fakeClaude) RepairInterventionTree(_ context.Context, _ string, _ domai
 	f.treeRepairPrior = append(f.treeRepairPrior, prior)
 	f.treeRepairErrMsg = append(f.treeRepairErrMsg, validationErr)
 	return f.treeRepair, f.treeRepairErr
+}
+func (f *fakeClaude) IntrospectDocumentFields(_ context.Context, _, sample string) ([]domain.TargetField, error) {
+	f.gotSample = sample
+	return f.fields, f.fieldsErr
+}
+func (f *fakeClaude) Extract(_ context.Context, _ []byte, _ domain.TargetField, method string) (string, float64, error) {
+	f.extractCalls++
+	f.gotMethods = append(f.gotMethods, method)
+	if f.extractErr != nil {
+		return "", 0, f.extractErr
+	}
+	return f.extractValue, f.extractConfidence, nil
 }
 
 // fakeRepo is a no-op graph.Repository that records the nodes writeTriplet
@@ -218,10 +246,15 @@ type fakeSandbox struct {
 	execResps     []ExecuteResponse
 	execErrs      []error
 	execCalls     int
+	docPages      []string
+	docTextErr    error
 }
 
 func (f *fakeSandbox) Introspect(_ context.Context, _ IntrospectRequest) (IntrospectResponse, error) {
 	return f.introspect, f.introspectErr
+}
+func (f *fakeSandbox) DocumentText(_ context.Context, _ DocumentTextRequest) (DocumentTextResponse, error) {
+	return DocumentTextResponse{Pages: f.docPages}, f.docTextErr
 }
 func (f *fakeSandbox) Execute(_ context.Context, _ ExecuteRequest) (ExecuteResponse, error) {
 	i := f.execCalls

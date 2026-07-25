@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -117,6 +118,14 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		s.hub.Complete(id)
 	}()
 
+	// A document goal has no objective to pin or baseline to measure -- its tree is
+	// one extraction sub-tree per target field. Branch before pinObjective so a
+	// document goal never trips errNoObjective on the tabular path below.
+	if goal.IsDocument() {
+		termErr = s.runDocumentLoop(ctx, goal)
+		return
+	}
+
 	obj, err := pinObjective(goal.EvaluationMatrix)
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: pin objective: %v", id, err)
@@ -216,6 +225,125 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 	}
 }
 
+// maxInlinePDFBytes bounds a PDF sent inline as a base64 document block. The
+// Claude API rejects an inline document request over 32 MB (a 413), so a document
+// larger than this cannot be extracted via the MVP inline path — the run fails
+// once with a clear reason rather than a 413 on every extraction node. The Files
+// API is the scale path for larger documents.
+const maxInlinePDFBytes = 32 << 20
+
+// extractionMethods are the competing extraction approaches that form a field
+// sub-tree's breadth axis: each is a prompt-strategy discriminator that varies
+// how Extract is instructed. Their count is the document loop's breadth, kept at
+// defaultBreadth to match the tabular fan-out.
+var extractionMethods = []string{
+	"Read the document top to bottom and extract the field where it is explicitly stated.",
+	"Locate section headings and labels related to the field, then read the value beside them.",
+	"Infer the value from surrounding context when it is not explicitly labelled, staying close to the source text.",
+}
+
+// runDocumentLoop drives a document goal's tree: it fetches the run-invariant
+// per-page text and the raw PDF bytes once (never per node -- a breadth×depth
+// sub-tree per field would otherwise re-download and re-parse the whole document
+// at every measurement), then expands one extraction sub-tree per target field.
+// It returns a terminal error only for a run-fatal setup failure (the text or
+// bytes fetch); per-field branch failures are non-terminal, like the tabular
+// per-candidate branches.
+func (s *Server) runDocumentLoop(ctx context.Context, goal store.Goal) error {
+	id := goal.OptimizationFunctionID
+
+	textResp, err := s.sandbox.DocumentText(ctx, DocumentTextRequest{DataSourceRef: goal.DataSourceRef})
+	if err != nil {
+		log.Printf("orchestrator: hypothesis loop %q: document text: %v", id, err)
+		s.branchFailure(ctx, id, nil, err)
+		return err
+	}
+	pdf, err := s.readObject(ctx, goal.DataSourceRef)
+	if err != nil {
+		log.Printf("orchestrator: hypothesis loop %q: read document: %v", id, err)
+		s.branchFailure(ctx, id, nil, err)
+		return err
+	}
+	if len(pdf) > maxInlinePDFBytes {
+		err := fmt.Errorf("document is %d bytes, exceeds the %d-byte inline extraction limit", len(pdf), maxInlinePDFBytes)
+		log.Printf("orchestrator: hypothesis loop %q: %v", id, err)
+		s.branchFailure(ctx, id, nil, err)
+		return err
+	}
+
+	for _, field := range goal.TargetFields {
+		// Each competing method is a sibling at the field root; the field root's
+		// baseline confidence is 0, so the first extraction must clear 0 to expand.
+		for _, method := range extractionMethods {
+			s.processExtractionCandidate(ctx, goal, field, pdf, textResp.Pages, method, 0.0, 1)
+		}
+	}
+	return nil
+}
+
+// processExtractionCandidate is the extraction analog of processCandidate: it
+// measures one field with one method, writes the extract-typed triplet, and --
+// if the extraction's confidence improves on the parent's and the depth cap is
+// not reached -- refines with the competing methods one level deeper. The
+// improvement signal is model confidence (maximize), so a refinement must raise
+// confidence over its parent to avoid pruning. It shares no code with
+// processCandidate, which is welded to the tabular objective (aggregation,
+// direction, matrix constraints); extraction has none of those, and runs no
+// constraint check.
+func (s *Server) processExtractionCandidate(ctx context.Context, goal store.Goal, field domain.TargetField, pdf []byte, pages []string, method string, parentConfidence float64, depth int) {
+	id := goal.OptimizationFunctionID
+
+	value, confidence, err := s.claude.Extract(ctx, pdf, field, method)
+	if err != nil {
+		s.branchFailure(ctx, id, nil, err)
+		return
+	}
+
+	locator := locateProvenance(pages, value)
+	if err := s.writeExtractionTriplet(ctx, goal, field, method, parentConfidence, value, confidence, locator); err != nil {
+		log.Printf("orchestrator: hypothesis loop %q: write extraction triplet: %v", id, err)
+		s.branchFailure(ctx, id, nil, err)
+		return
+	}
+
+	if !improves(parentConfidence, confidence, domain.Maximize) {
+		return
+	}
+	if depth >= defaultDepth {
+		return
+	}
+	for _, m := range extractionMethods {
+		s.processExtractionCandidate(ctx, goal, field, pdf, pages, m, confidence, depth+1)
+	}
+}
+
+// readObject returns the object's raw bytes opaquely -- no PDF parsing in the
+// orchestrator; parsing stays behind the sandbox's /document/text endpoint.
+func (s *Server) readObject(ctx context.Context, ref string) ([]byte, error) {
+	r, err := s.objects.Get(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return io.ReadAll(r)
+}
+
+// locateProvenance finds the first exact occurrence of the extracted value across
+// the cached per-page text and records its locator (0-based page index and byte
+// offsets into that page). It yields nil for an empty value or when no exact
+// match is found -- no fuzzy matching in the MVP.
+func locateProvenance(pages []string, needle string) *domain.ProvenanceLocator {
+	if needle == "" {
+		return nil
+	}
+	for i, page := range pages {
+		if idx := strings.Index(page, needle); idx >= 0 {
+			return &domain.ProvenanceLocator{Page: i, CharStart: idx, CharEnd: idx + len(needle)}
+		}
+	}
+	return nil
+}
+
 // writeTriplet persists one State→Intervention→Outcome triplet and audits the
 // intervention and outcome. The persisted finding is observational (a correlation,
 // not a causal effect); the PRODUCED edge is tagged accordingly (see
@@ -286,6 +414,90 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 		"direction":       string(obj.direction),
 		"filters":         renderConstraints(effective),
 		"new_filters":     renderConstraints(cand.Filters),
+	}})
+	return nil
+}
+
+// writeExtractionTriplet is the extract-path analog of writeTriplet: it persists
+// one State→Intervention→Outcome triplet for an extraction measurement. Unlike
+// the query path it writes Intervention.Type extract, an unverified outcome (which
+// feeds the HITL queue and gates Sleep-Cycle clustering), the deterministic
+// provenance locator, and a PRODUCED confidence that is the model's self-reported
+// value rather than the fixed 1.0. The effect size is the confidence delta over
+// the parent, mirroring the query path's value delta over its baseline. The
+// epistemic source stays observational.
+func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, field domain.TargetField, method string, parentConfidence float64, value string, confidence float64, locator *domain.ProvenanceLocator) error {
+	stateID := uuid.NewString()
+	state := domain.State{ID: stateID, Properties: map[string]any{
+		"data_source_ref": goal.DataSourceRef,
+		"field":           field.Name,
+		"confidence":      parentConfidence,
+	}}
+	if err := s.repo.CreateState(ctx, state); err != nil {
+		return err
+	}
+
+	interventionID := uuid.NewString()
+	intervention := domain.Intervention{ID: interventionID, Type: domain.InterventionExtract, Properties: map[string]any{
+		"field":  field.Name,
+		"method": method,
+	}}
+	if err := s.repo.CreateIntervention(ctx, intervention); err != nil {
+		return err
+	}
+
+	outcomeID := uuid.NewString()
+	// The stored Outcome.Value is keyed by the field name, mirroring the query
+	// path's label-keyed value; the llm layer returns just the raw string.
+	outcome := domain.Outcome{
+		ID:                 outcomeID,
+		VerificationStatus: domain.VerificationUnverified,
+		Value:              map[string]any{field.Name: value},
+		Provenance:         locator,
+	}
+	if err := s.repo.CreateOutcome(ctx, outcome); err != nil {
+		return err
+	}
+
+	if err := s.repo.CreatePreConditionFor(ctx, stateID, interventionID); err != nil {
+		return err
+	}
+	if err := s.repo.CreateProduced(ctx, interventionID, outcomeID, domain.ProducedEdge{
+		EffectSize:      confidence - parentConfidence,
+		Confidence:      confidence,
+		EpistemicSource: domain.EpistemicObservational,
+	}); err != nil {
+		return err
+	}
+
+	if err := s.recordAudit(ctx, "hypothesis_intervention", "intervention", map[string]any{
+		"optimization_function_id": goal.OptimizationFunctionID,
+		"intervention_id":          interventionID,
+		"field":                    field.Name,
+	}); err != nil {
+		log.Printf("orchestrator: append audit: %v", err)
+	}
+	if err := s.recordAudit(ctx, "hypothesis_outcome", "outcome", map[string]any{
+		"optimization_function_id": goal.OptimizationFunctionID,
+		"outcome_id":               outcomeID,
+		"confidence":               confidence,
+	}); err != nil {
+		log.Printf("orchestrator: append audit: %v", err)
+	}
+
+	// The extract path reuses the "triplet" SSE type but deliberately carries a
+	// different payload than writeTriplet's query triplet (field/method/string
+	// value/provenance vs baseline/effect_size/filters). A document run's stream is
+	// homogeneous, so the web client reads it by the goal kind.
+	s.hub.Publish(goal.OptimizationFunctionID, Event{Type: "triplet", Payload: map[string]any{
+		"state_id":        stateID,
+		"intervention_id": interventionID,
+		"outcome_id":      outcomeID,
+		"field":           field.Name,
+		"method":          method,
+		"confidence":      confidence,
+		"value":           value,
+		"provenance":      locator,
 	}})
 	return nil
 }

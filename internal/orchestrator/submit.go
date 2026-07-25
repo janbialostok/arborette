@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/arborette/arborette/internal/datasource"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -70,6 +71,14 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		s.writeIntakeErr(w, err)
 		return
 	}
+
+	// A document source has no aggregation/direction to fit: its objective is a set
+	// of fields to extract accurately. Branch here so the tabular objective-fitting
+	// path below is never entered for a document goal.
+	if introspect.Schema.Kind == string(datasource.KindDocument) {
+		s.submitDocumentGoal(ctx, w, goal, ref, introspect.Sample)
+		return
+	}
 	schema := toSandboxSchema(introspect.Schema)
 
 	matrix, err := s.claude.GenerateEvaluationMatrix(ctx, goal, schema)
@@ -107,6 +116,47 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		OptimizationFunctionID: optID,
 		GoalText:               goal,
 		EvaluationMatrix:       matrix,
+		DataSourceRef:          ref,
+	}); err != nil {
+		log.Printf("orchestrator: insert goal: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	if err := s.recordAudit(ctx, "goal_submit", "goal", map[string]any{
+		"optimization_function_id": optID,
+		"data_source_ref":          ref,
+	}); err != nil {
+		log.Printf("orchestrator: append audit: %v", err)
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+}
+
+// submitDocumentGoal completes registration for a document source: it derives the
+// extractable fields via Claude (grounded in the goal and the sandbox's first-page
+// sample), rejecting the goal with 422 if none fit, then persists the target
+// fields in place of an Evaluation Matrix. The API response shape is stable with
+// the tabular path (optimization_function_id), so the caller cannot tell the two
+// intake flows apart. A Claude fault is a 502, matching the tabular generation
+// failure mapping.
+func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, goal, ref, sample string) {
+	fields, err := s.claude.IntrospectDocumentFields(ctx, goal, sample)
+	if err != nil {
+		log.Printf("orchestrator: introspect document fields: %v", err)
+		writeErr(w, http.StatusBadGateway, "document field introspection failed")
+		return
+	}
+	if len(fields) == 0 {
+		writeErr(w, http.StatusUnprocessableEntity, "could not identify any extractable fields for the goal in this document")
+		return
+	}
+
+	optID := uuid.NewString()
+	if err := s.goals.Insert(ctx, store.Goal{
+		OptimizationFunctionID: optID,
+		GoalText:               goal,
+		TargetFields:           fields,
 		DataSourceRef:          ref,
 	}); err != nil {
 		log.Printf("orchestrator: insert goal: %v", err)

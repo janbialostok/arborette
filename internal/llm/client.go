@@ -11,6 +11,7 @@ package llm
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -122,6 +123,104 @@ func (c *Client) RepairInterventionTree(ctx context.Context, goalText string, ma
 	}
 	return decodeProposal(body)
 }
+
+// IntrospectDocumentFields derives the fields an analyst wants extracted from a
+// document, grounded in the goal text and a sample of the document. The sandbox
+// cannot do this (it holds no Claude client), so the document intake path calls
+// it after the sandbox reports Kind: document plus a first-page sample. An empty
+// result means no field matched the goal; the caller rejects that at intake.
+func (c *Client) IntrospectDocumentFields(ctx context.Context, goalText, sample string) ([]domain.TargetField, error) {
+	user := "Analyst goal:\n" + goalText + "\n\nDocument sample (first page):\n" + sample
+	body, err := c.complete(ctx, anthropic.OutputConfigEffortHigh, documentFieldsSchema(),
+		documentFieldsSystem, user)
+	if err != nil {
+		return nil, err
+	}
+	return decodeFields(body)
+}
+
+// Extract measures one document field: it sends the whole PDF as an inline
+// base64 document block plus a field- and method-specific instruction, and
+// returns the extracted value string plus the model's self-reported confidence in
+// [0,1]. It deliberately does NOT request Citations — Citations and structured
+// outputs are mutually exclusive on the Claude API — so the strict output schema
+// keeps the value typed and provenance is computed separately by a deterministic
+// text search over the source pages. Base64 for the MVP; the Files API is the
+// scale path for large or repeated PDFs. method varies the extraction approach per
+// competing sibling (the sub-tree breadth axis).
+func (c *Client) Extract(ctx context.Context, pdf []byte, field domain.TargetField, method string) (string, float64, error) {
+	doc := anthropic.NewDocumentBlock(anthropic.Base64PDFSourceParam{
+		Data: base64.StdEncoding.EncodeToString(pdf),
+	})
+	body, err := c.completeWithContent(ctx, anthropic.OutputConfigEffortHigh, extractionSchema(),
+		extractionSystem, []anthropic.ContentBlockParamUnion{doc, anthropic.NewTextBlock(extractionInstruction(field, method))})
+	if err != nil {
+		return "", 0, err
+	}
+	return decodeExtraction(body)
+}
+
+// documentFieldsWire mirrors the document-field structured-output body.
+type documentFieldsWire struct {
+	Fields []struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	} `json:"fields"`
+}
+
+// decodeFields parses a document-field body into domain.TargetFields. A malformed
+// body is a generation error, mapped by the caller like any other parse failure.
+func decodeFields(body string) ([]domain.TargetField, error) {
+	var wire documentFieldsWire
+	if err := json.Unmarshal([]byte(body), &wire); err != nil {
+		return nil, fmt.Errorf("parse document fields: %w", err)
+	}
+	fields := make([]domain.TargetField, 0, len(wire.Fields))
+	for _, f := range wire.Fields {
+		fields = append(fields, domain.TargetField{Name: f.Name, Description: f.Description})
+	}
+	return fields, nil
+}
+
+// extractionWire mirrors the extraction structured-output body: the value as a
+// plain string plus a confidence.
+type extractionWire struct {
+	Value      string  `json:"value"`
+	Confidence float64 `json:"confidence"`
+}
+
+// decodeExtraction parses an extraction body into the extracted value string and
+// confidence. A malformed body is a generation error.
+func decodeExtraction(body string) (string, float64, error) {
+	var wire extractionWire
+	if err := json.Unmarshal([]byte(body), &wire); err != nil {
+		return "", 0, fmt.Errorf("parse extraction: %w", err)
+	}
+	return wire.Value, wire.Confidence, nil
+}
+
+// extractionInstruction assembles the per-node user message: the field to extract
+// and, when set, the competing method that varies this sibling's approach.
+func extractionInstruction(field domain.TargetField, method string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Extract this field from the attached document:\n- %s: %s\n", field.Name, field.Description)
+	if method != "" {
+		fmt.Fprintf(&b, "\nApproach: %s\n", method)
+	}
+	b.WriteString("\nReturn the extracted value verbatim from the document where possible, plus your confidence (0 to 1).")
+	return b.String()
+}
+
+const documentFieldsSystem = "You identify the fields an analyst wants extracted from a document, given their " +
+	"plain-English goal and a sample of the document's text. Return a small set of concrete, individually " +
+	"extractable fields, each with a short name and a one-line description of what to extract. Ground the fields " +
+	"in the goal and the sample — do not invent fields the goal does not ask for, and do not return a field the " +
+	"goal clearly does not want."
+
+const extractionSystem = "You extract a single requested field from a document. Return the field's value exactly as " +
+	"it appears in the document (verbatim where possible, so it can be located in the source text), and a " +
+	"confidence between 0 and 1 reflecting how certain you are the value is correct and complete. If the field is " +
+	"absent from the document, return an empty value with a low confidence rather than guessing."
 
 // proposalWire mirrors the intervention-tree structured-output body: candidates
 // carrying filters only. Each filter's value is polymorphic (a bare scalar or a flat
@@ -304,12 +403,19 @@ func encodeMatrix(matrix domain.EvaluationMatrix) ([]byte, error) {
 	return json.Marshal(wire)
 }
 
-// complete issues one structured-output call: adaptive thinking (load-bearing on
-// Opus 4.8 — an omitted thinking field runs with none), the requested effort,
-// and the json_schema format. It maps a refusal or max_tokens stop reason to a
-// sentinel and selects the text block rather than assuming Content[0], which a
-// leading thinking block would displace.
+// complete issues one text-only structured-output call, delegating to
+// completeWithContent with a single user text block.
 func (c *Client) complete(ctx context.Context, effort anthropic.OutputConfigEffort, schema map[string]any, system, user string) (string, error) {
+	return c.completeWithContent(ctx, effort, schema, system, []anthropic.ContentBlockParamUnion{anthropic.NewTextBlock(user)})
+}
+
+// completeWithContent issues one structured-output call over an arbitrary user
+// content block list: adaptive thinking (load-bearing on Opus 4.8 — an omitted
+// thinking field runs with none), the requested effort, and the json_schema
+// format. It maps a refusal or max_tokens stop reason to a sentinel and selects
+// the text block rather than assuming Content[0], which a leading thinking block
+// would displace.
+func (c *Client) completeWithContent(ctx context.Context, effort anthropic.OutputConfigEffort, schema map[string]any, system string, content []anthropic.ContentBlockParamUnion) (string, error) {
 	adaptive := anthropic.ThinkingConfigAdaptiveParam{}
 	resp, err := c.messages.New(ctx, anthropic.MessageNewParams{
 		Model:     c.model,
@@ -321,7 +427,7 @@ func (c *Client) complete(ctx context.Context, effort anthropic.OutputConfigEffo
 		},
 		System: []anthropic.TextBlockParam{{Text: system}},
 		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(user)),
+			anthropic.NewUserMessage(content...),
 		},
 	})
 	if err != nil {

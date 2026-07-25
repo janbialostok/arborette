@@ -182,13 +182,20 @@ func (s *FileSource) stage(ctx context.Context) (db *sql.DB, tableFn string, cle
 	return db, tableFn, cleanup, nil
 }
 
-// download streams the object into dest, bounded so an object larger than
-// maxObjectBytes is rejected rather than silently truncated: LimitReader is given
-// one extra byte so an over-limit read is detected, not swallowed at a row
-// boundary (which would yield a silently wrong aggregate). The copy runs under
-// ctx so a slow Get is cancellable.
+// download streams the object into dest via the shared bounded-staging helper.
 func (s *FileSource) download(ctx context.Context, dest string) error {
-	r, err := s.objects.Get(ctx, s.dataSourceRef)
+	return stageBoundedObject(ctx, s.objects, s.dataSourceRef, dest, s.maxObjectBytes)
+}
+
+// stageBoundedObject streams an object-store object into dest, bounded so an
+// object larger than maxBytes is rejected rather than silently truncated:
+// LimitReader is given one extra byte so an over-limit read is detected, not
+// swallowed at a boundary (which would yield a silently wrong aggregate for a
+// table, or wrong extracted text for a document). The copy runs under ctx so a
+// slow Get is cancellable. Shared by both the tabular and document readers so the
+// subtle +1 over-limit trick lives in one place.
+func stageBoundedObject(ctx context.Context, objects *objectstore.Client, ref, dest string, maxBytes int64) error {
+	r, err := objects.Get(ctx, ref)
 	if err != nil {
 		return err
 	}
@@ -200,12 +207,12 @@ func (s *FileSource) download(ctx context.Context, dest string) error {
 	}
 	defer f.Close()
 
-	n, err := io.Copy(f, ctxReader{ctx: ctx, r: io.LimitReader(r, s.maxObjectBytes+1)})
+	n, err := io.Copy(f, ctxReader{ctx: ctx, r: io.LimitReader(r, maxBytes+1)})
 	if err != nil {
 		return fmt.Errorf("stage object: %w", err)
 	}
-	if n > s.maxObjectBytes {
-		return fmt.Errorf("%w: object exceeds %d bytes", errObjectTooLarge, s.maxObjectBytes)
+	if n > maxBytes {
+		return fmt.Errorf("%w: object exceeds %d bytes", errObjectTooLarge, maxBytes)
 	}
 	return nil
 }
