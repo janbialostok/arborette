@@ -217,7 +217,9 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 }
 
 // writeTriplet persists one State→Intervention→Outcome triplet and audits the
-// intervention and outcome. The start state is the objective measured at the
+// intervention and outcome. The persisted finding is observational (a correlation,
+// not a causal effect); the PRODUCED edge is tagged accordingly (see
+// domain.EpistemicSource). The start state is the objective measured at the
 // parent's effective filters (the baseline the candidate is judged against);
 // query outcomes are always verified with PRODUCED confidence fixed at 1.0.
 func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objective, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, effective []domain.Constraint, value float64) error {
@@ -253,7 +255,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 	if err := s.repo.CreatePreConditionFor(ctx, stateID, interventionID); err != nil {
 		return err
 	}
-	if err := s.repo.CreateProduced(ctx, interventionID, outcomeID, domain.ProducedEdge{EffectSize: value - baseline, Confidence: 1.0}); err != nil {
+	if err := s.repo.CreateProduced(ctx, interventionID, outcomeID, domain.ProducedEdge{EffectSize: value - baseline, Confidence: 1.0, EpistemicSource: domain.EpistemicObservational}); err != nil {
 		return err
 	}
 

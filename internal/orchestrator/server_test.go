@@ -165,6 +165,7 @@ func (f *fakeClaude) RepairInterventionTree(_ context.Context, _ string, _ domai
 type fakeRepo struct {
 	states   []domain.State
 	outcomes []domain.Outcome
+	produced []domain.ProducedEdge
 }
 
 func (f *fakeRepo) CreateState(_ context.Context, s domain.State) error {
@@ -189,7 +190,8 @@ func (f *fakeRepo) GetMetaHeuristic(_ context.Context, _ string) (domain.MetaHeu
 	return domain.MetaHeuristic{}, nil
 }
 func (f *fakeRepo) CreatePreConditionFor(_ context.Context, _, _ string) error { return nil }
-func (f *fakeRepo) CreateProduced(_ context.Context, _, _ string, _ domain.ProducedEdge) error {
+func (f *fakeRepo) CreateProduced(_ context.Context, _, _ string, edge domain.ProducedEdge) error {
+	f.produced = append(f.produced, edge)
 	return nil
 }
 func (f *fakeRepo) CreateMetaHeuristic(_ context.Context, _ domain.MetaHeuristic, _ []string) error {

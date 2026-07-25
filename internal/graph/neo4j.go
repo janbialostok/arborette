@@ -184,17 +184,22 @@ func (r *Neo4jRepository) CreatePreConditionFor(ctx context.Context, stateID, in
 }
 
 func (r *Neo4jRepository) CreateProduced(ctx context.Context, interventionID, outcomeID string, edge domain.ProducedEdge) error {
+	src := edge.EpistemicSource
+	if src == "" {
+		src = domain.EpistemicObservational
+	}
 	return r.writeOp(ctx, "create produced edge", func(tx neo4j.ManagedTransaction) (any, error) {
 		return tx.Run(ctx,
 			"MATCH (i:"+labelIntervention+" {id: $interventionID}) "+
 				"MATCH (o:"+labelOutcome+" {id: $outcomeID}) "+
 				"MERGE (i)-[e:"+domain.Produced+"]->(o) "+
-				"SET e.effect_size = $effectSize, e.confidence = $confidence",
+				"SET e.effect_size = $effectSize, e.confidence = $confidence, e.epistemic_source = $epistemicSource",
 			map[string]any{
-				"interventionID": interventionID,
-				"outcomeID":      outcomeID,
-				"effectSize":     edge.EffectSize,
-				"confidence":     edge.Confidence,
+				"interventionID":  interventionID,
+				"outcomeID":       outcomeID,
+				"effectSize":      edge.EffectSize,
+				"confidence":      edge.Confidence,
+				"epistemicSource": string(src),
 			},
 		)
 	})

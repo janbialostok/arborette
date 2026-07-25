@@ -31,6 +31,21 @@ const (
 	VerificationRejected   VerificationStatus = "rejected"
 )
 
+// EpistemicSource records how a PRODUCED edge's effect was established. V1 writes
+// only observational — a measured correlation P(Outcome | Segment), not do-calculus
+// causation. interventional is reserved for a future V2 interventional layer
+// (physically-executed interventions, do-calculus edges) and is never written in
+// the MVP; a physically-executed intervention likewise reuses the existing
+// InterventionType field rather than adding a node-level field. Any consumer that
+// reads this property treats an absent/empty value as observational and must not
+// assume interventional exists.
+type EpistemicSource string
+
+const (
+	EpistemicObservational  EpistemicSource = "observational"
+	EpistemicInterventional EpistemicSource = "interventional"
+)
+
 // Relationship names for the graph edges. Kept as constants so both the graph
 // implementation and its consumers reference one spelling.
 const (
@@ -82,10 +97,12 @@ type MetaHeuristic struct {
 }
 
 // ProducedEdge carries the measured effect size and a self-reported confidence
-// weight (0.0–1.0) on an Intervention→Outcome edge.
+// weight (0.0–1.0) on an Intervention→Outcome edge, plus the epistemic provenance
+// of that effect (see EpistemicSource).
 type ProducedEdge struct {
-	EffectSize float64
-	Confidence float64
+	EffectSize      float64
+	Confidence      float64
+	EpistemicSource EpistemicSource
 }
 
 // EvaluationMatrix is the structured form of an analyst's plain-English goal:

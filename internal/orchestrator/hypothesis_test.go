@@ -135,6 +135,10 @@ func TestRunLoopSuccessKeysByObjectiveLabel(t *testing.T) {
 	if len(repo.states) != 1 || repo.states[0].Properties["objective_label"] != "avg(revenue)" {
 		t.Fatalf("state must carry objective_label: %+v", repo.states)
 	}
+	// The Phase-1 finding is observational; the PRODUCED edge records that provenance.
+	if len(repo.produced) != 1 || repo.produced[0].EpistemicSource != domain.EpistemicObservational {
+		t.Fatalf("PRODUCED edge must carry observational epistemic source: %+v", repo.produced)
+	}
 }
 
 func TestRunLoopTripletPayloadCarriesSegmentAndDirection(t *testing.T) {
