@@ -11,6 +11,7 @@ import (
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/llm"
 	"github.com/arborette/arborette/internal/objective"
+	"github.com/arborette/arborette/internal/sandboxclient"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -192,6 +193,63 @@ func TestRunLoopTripletPayloadCarriesSegmentAndDirection(t *testing.T) {
 	newFilters, ok := triplet["new_filters"].([]string)
 	if !ok || len(newFilters) != 1 || newFilters[0] != "CryoSleep = True" {
 		t.Fatalf("triplet new_filters = %v, want [CryoSleep = True]", triplet["new_filters"])
+	}
+}
+
+// TestRunLoopCandidateMeasurementRecordsSupport pins the Phase-1 support seam:
+// the candidate measurement asks for the row count (the baseline stays flagless
+// — nothing consumes its support) and the persisted Outcome carries it, so the
+// Sleep Cycle's S* floor has evidence to filter on.
+func TestRunLoopCandidateMeasurementRecordsSupport(t *testing.T) {
+	repo := &fakeRepo{}
+	claude := &fakeClaude{proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: nil}}}}
+	sandbox := &fakeSandbox{
+		introspect: revenueSchema(),
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}},                                        // root baseline
+			{Value: map[string]any{"avg(revenue)": 8.0, sandboxclient.RowCountKey: float64(45)}}, // candidate (no improvement → stop)
+		},
+	}
+	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if len(sandbox.execReqs) != 2 {
+		t.Fatalf("expected baseline + candidate executes, got %d", len(sandbox.execReqs))
+	}
+	if sandbox.execReqs[0].IncludeRowCount {
+		t.Fatal("the root baseline must not request a row count")
+	}
+	if !sandbox.execReqs[1].IncludeRowCount {
+		t.Fatal("the candidate measurement must request a row count")
+	}
+	if len(repo.outcomes) != 1 || repo.outcomes[0].Support != 45 {
+		t.Fatalf("the persisted outcome must carry the measured support 45: %+v", repo.outcomes)
+	}
+}
+
+// TestRunLoopMissingRowCountIsNonFatal: the loop's job does not depend on
+// support, so a response without the requested count still persists the outcome
+// — with Support 0, self-excluding from S* — rather than failing the candidate.
+// This deliberately differs from the Sleep-Cycle search, where a missing count
+// faults the measurement because support drives pruning.
+func TestRunLoopMissingRowCountIsNonFatal(t *testing.T) {
+	repo := &fakeRepo{}
+	claude := &fakeClaude{proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: nil}}}}
+	sandbox := &fakeSandbox{
+		introspect: revenueSchema(),
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}}, // root baseline
+			{Value: map[string]any{"avg(revenue)": 8.0}},  // candidate, no row count
+		},
+	}
+	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if len(repo.outcomes) != 1 {
+		t.Fatalf("a missing row count must not fail the candidate, got %d outcomes", len(repo.outcomes))
+	}
+	if repo.outcomes[0].Support != 0 {
+		t.Fatalf("support = %d, want 0 when the sandbox returned no count", repo.outcomes[0].Support)
 	}
 }
 

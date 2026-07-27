@@ -42,7 +42,9 @@ func atomOn(field string) domain.Constraint {
 	return domain.Constraint{Field: field, Op: domain.GreaterThan, Value: 1}
 }
 
-// finding builds one eligible Phase-1 triplet introducing the given atoms.
+// finding builds one eligible Phase-1 triplet introducing the given atoms. Its
+// support of 100 clears every floor the tests configure, matching the fake
+// sandbox's defaultSupport, so S* stays defined unless a case says otherwise.
 func finding(id string, value float64, label string, fields ...string) graph.CausalTriplet {
 	filters := make([]domain.Constraint, 0, len(fields))
 	for _, f := range fields {
@@ -51,8 +53,15 @@ func finding(id string, value float64, label string, fields ...string) graph.Cau
 	return graph.CausalTriplet{
 		State:        domain.State{ID: "s-" + id},
 		Intervention: domain.Intervention{ID: "i-" + id, Properties: map[string]any{"new_filters": asProperty(filters)}},
-		Outcome:      domain.Outcome{ID: "o-" + id, VerificationStatus: domain.VerificationVerified, Value: map[string]any{label: value}},
+		Outcome:      domain.Outcome{ID: "o-" + id, VerificationStatus: domain.VerificationVerified, Value: map[string]any{label: value}, Support: 100},
 	}
+}
+
+// findingWithSupport overrides the default support to exercise the S* floor.
+func findingWithSupport(id string, value float64, support int64, fields ...string) graph.CausalTriplet {
+	f := finding(id, value, testObjectiveLabel, fields...)
+	f.Outcome.Support = support
+	return f
 }
 
 // asProperty round-trips filters through the shape the graph layer actually

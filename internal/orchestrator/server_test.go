@@ -256,6 +256,7 @@ type fakeSandbox struct {
 	execResps     []ExecuteResponse
 	execErrs      []error
 	execCalls     int
+	execReqs      []ExecuteRequest
 	docPages      []string
 	docTextErr    error
 }
@@ -266,7 +267,8 @@ func (f *fakeSandbox) Introspect(_ context.Context, _ IntrospectRequest) (Intros
 func (f *fakeSandbox) DocumentText(_ context.Context, _ DocumentTextRequest) (DocumentTextResponse, error) {
 	return DocumentTextResponse{Pages: f.docPages}, f.docTextErr
 }
-func (f *fakeSandbox) Execute(_ context.Context, _ ExecuteRequest) (ExecuteResponse, error) {
+func (f *fakeSandbox) Execute(_ context.Context, req ExecuteRequest) (ExecuteResponse, error) {
+	f.execReqs = append(f.execReqs, req)
 	i := f.execCalls
 	f.execCalls++
 	var resp ExecuteResponse

@@ -114,15 +114,22 @@ func (r *Neo4jRepository) CreateOutcome(ctx context.Context, o domain.Outcome) e
 	if err != nil {
 		return err
 	}
+	// An unrecorded support (0) is stored as null — SET removes the property —
+	// so it stays absent, mirroring the nil-provenance omission.
+	var support any
+	if o.Support > 0 {
+		support = o.Support
+	}
 	return r.writeOp(ctx, "create outcome "+o.ID, func(tx neo4j.ManagedTransaction) (any, error) {
 		return tx.Run(ctx,
 			"MERGE (n:"+labelOutcome+" {id: $id}) "+
-				"SET n.goal_id = $goalID, n.verification_status = $status, n.value = $value, n.provenance = $provenance",
+				"SET n.goal_id = $goalID, n.verification_status = $status, n.value = $value, n."+domain.PropSupport+" = $support, n.provenance = $provenance",
 			map[string]any{
 				"id":         o.ID,
 				"goalID":     o.GoalID,
 				"status":     string(o.VerificationStatus),
 				"value":      value,
+				"support":    support,
 				"provenance": provenance,
 			},
 		)
@@ -509,11 +516,13 @@ func outcomeFromNode(id string, node neo4j.Node) (domain.Outcome, error) {
 		return domain.Outcome{}, err
 	}
 	status, _ := node.Props["verification_status"].(string)
+	support, _ := node.Props[domain.PropSupport].(int64)
 	return domain.Outcome{
 		ID:                 id,
 		GoalID:             stringProp(node.Props["goal_id"]),
 		VerificationStatus: domain.VerificationStatus(status),
 		Value:              value,
+		Support:            support,
 		Provenance:         provenance,
 	}, nil
 }

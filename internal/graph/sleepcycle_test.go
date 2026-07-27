@@ -237,6 +237,40 @@ func TestGetNodeNotFound(t *testing.T) {
 	}
 }
 
+// TestOutcomeSupportRoundTrips pins the S* floor's persistence contract: a
+// recorded support round-trips through ListEligibleFindings (the read path that
+// feeds bestSingleSegment), and a legacy outcome written without one hydrates
+// as 0 — self-excluding from any positive floor.
+func TestOutcomeSupportRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, ctx)
+	goalID := testutil.NewID(t)
+
+	_, _, supportedID := seedGoalTriplet(t, ctx, repo, goalID, domain.VerificationVerified, false)
+	_, _, legacyID := seedGoalTriplet(t, ctx, repo, goalID, domain.VerificationVerified, false)
+	// CreateOutcome MERGEs on id, so this re-write records support on the first
+	// outcome in place.
+	mustCreate(t, repo.CreateOutcome(ctx, domain.Outcome{
+		ID: supportedID, GoalID: goalID, VerificationStatus: domain.VerificationVerified,
+		Value: map[string]any{"avg(qty)": 5.0}, Support: 45,
+	}))
+
+	found, err := repo.ListEligibleFindings(ctx, goalID)
+	if err != nil {
+		t.Fatalf("list eligible findings: %v", err)
+	}
+	support := map[string]int64{}
+	for _, f := range found {
+		support[f.Outcome.ID] = f.Outcome.Support
+	}
+	if support[supportedID] != 45 {
+		t.Fatalf("support = %d, want 45 to round-trip", support[supportedID])
+	}
+	if support[legacyID] != 0 {
+		t.Fatalf("a legacy outcome without a recorded support must hydrate as 0, got %d", support[legacyID])
+	}
+}
+
 // TestSleepDerivedRoundTrips pins the discriminator the search excludes on.
 func TestSleepDerivedRoundTrips(t *testing.T) {
 	ctx := context.Background()

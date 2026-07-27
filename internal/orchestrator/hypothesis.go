@@ -15,6 +15,7 @@ import (
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/llm"
 	"github.com/arborette/arborette/internal/objective"
+	"github.com/arborette/arborette/internal/sandboxclient"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -171,7 +172,9 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 	id := goal.OptimizationFunctionID
 	effective := concatFilters(parentFilters, cand.Filters)
 
-	resp, err := s.sandbox.Execute(ctx, objective.ExecuteRequestFor(goal.DataSourceRef, obj, effective))
+	req := objective.ExecuteRequestFor(goal.DataSourceRef, obj, effective)
+	req.IncludeRowCount = true
+	resp, err := s.sandbox.Execute(ctx, req)
 	if err != nil {
 		s.branchFailure(ctx, id, effective, err)
 		return
@@ -181,8 +184,16 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 		s.branchFailure(ctx, id, effective, errNonNumericValue)
 		return
 	}
+	// A missing count is a version-skew signal worth logging, but non-fatal: the
+	// loop's job does not depend on support, so the outcome persists with 0
+	// (self-excluding from the Sleep Cycle's S* floor) rather than failing the
+	// candidate — unlike the search, where support drives pruning.
+	support, counted := sandboxclient.RowCount(resp)
+	if !counted {
+		log.Printf("orchestrator: hypothesis loop %q: sandbox returned no row count for a counted measurement", id)
+	}
 
-	if err := s.writeTriplet(ctx, goal, obj, parentFilters, baseline, cand, effective, value); err != nil {
+	if err := s.writeTriplet(ctx, goal, obj, parentFilters, baseline, cand, effective, value, support); err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: write triplet: %v", id, err)
 		s.branchFailure(ctx, id, effective, err)
 		return
@@ -340,7 +351,7 @@ func locateProvenance(pages []string, needle string) *domain.ProvenanceLocator {
 // domain.EpistemicSource). The start state is the objective measured at the
 // parent's effective filters (the baseline the candidate is judged against);
 // query outcomes are always verified with PRODUCED confidence fixed at 1.0.
-func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objective.Objective, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, effective []domain.Constraint, value float64) error {
+func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objective.Objective, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, effective []domain.Constraint, value float64, support int64) error {
 	stateID := uuid.NewString()
 	state := domain.State{ID: stateID, GoalID: goal.OptimizationFunctionID, Properties: map[string]any{
 		domain.PropDataSourceRef:        goal.DataSourceRef,
@@ -365,7 +376,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 	}
 
 	outcomeID := uuid.NewString()
-	outcome := domain.Outcome{ID: outcomeID, GoalID: goal.OptimizationFunctionID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{obj.Label: value}}
+	outcome := domain.Outcome{ID: outcomeID, GoalID: goal.OptimizationFunctionID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{obj.Label: value}, Support: support}
 	if err := s.repo.CreateOutcome(ctx, outcome); err != nil {
 		return err
 	}
@@ -389,6 +400,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 		"optimization_function_id": goal.OptimizationFunctionID,
 		"outcome_id":               outcomeID,
 		"value":                    value,
+		"support":                  support,
 	}); err != nil {
 		log.Printf("orchestrator: append audit: %v", err)
 	}

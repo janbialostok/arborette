@@ -10,8 +10,9 @@ import (
 
 // winner is one macro-segment whose derived triplet is fully persisted, carrying
 // the ids the abstraction stage links back to. The measured support is not
-// carried here: it is already persisted on the Intervention and reported in the
-// intervention audit, and the abstraction stage does not consider it.
+// carried here: it is already persisted on the Intervention and Outcome and
+// reported in the intervention audit, and the abstraction stage does not
+// consider it.
 type winner struct {
 	node           *Node
 	value          float64
@@ -99,7 +100,7 @@ func (w *Worker) writeSegment(ctx context.Context, target searchTarget, obj obje
 			domain.PropNewFilters:           seg.node.filters,
 			domain.PropEffectiveFilters:     seg.node.filters,
 			"canonical_filter":              canonical,
-			"support":                       seg.measurement.Support,
+			domain.PropSupport:              seg.measurement.Support,
 		},
 	}
 	if err := w.repo.CreateIntervention(ctx, intervention); err != nil {
@@ -111,6 +112,7 @@ func (w *Worker) writeSegment(ctx context.Context, target searchTarget, obj obje
 		GoalID:             target.goalID,
 		VerificationStatus: domain.VerificationVerified,
 		Value:              map[string]any{obj.Label: seg.measurement.Value},
+		Support:            seg.measurement.Support,
 	}
 	if err := w.repo.CreateOutcome(ctx, outcome); err != nil {
 		return winner{}, err

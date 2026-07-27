@@ -234,7 +234,7 @@ func (w *Worker) Run(ctx context.Context, goalID string) (err error) {
 	if err != nil {
 		return fmt.Errorf("list eligible findings: %w", err)
 	}
-	bestSingle := bestSingleSegment(findings, obj)
+	bestSingle := bestSingleSegment(findings, obj, int64(w.cfg.MinSupport))
 
 	atoms, err := buildAtoms(findings)
 	if err != nil {
@@ -285,11 +285,18 @@ func (w *Worker) measureBaseline(ctx context.Context, target searchTarget, obj o
 
 // bestSingleSegment is S*: the best absolute objective value any eligible finding
 // achieved. It is a strictly harder bar than "best single predicate" and needs no
-// depth special-casing — a deep Phase-1 finding counts too. The result is nil
-// when no eligible finding yields a value, where S* is simply undefined.
-func bestSingleSegment(findings []graph.CausalTriplet, obj objective.Objective) *float64 {
+// depth special-casing — a deep Phase-1 finding counts too. Findings are held to
+// the same support floor as the candidates S* gates, so a bar set by evidence the
+// gate itself would reject (including legacy outcomes with no recorded support,
+// which read as 0) is impossible. The result is nil when no eligible finding
+// yields a value at or above the floor, where S* is simply undefined and
+// materiallyBetter takes its degenerate-run path.
+func bestSingleSegment(findings []graph.CausalTriplet, obj objective.Objective, minSupport int64) *float64 {
 	var best *float64
 	for _, f := range findings {
+		if f.Outcome.Support < minSupport {
+			continue
+		}
 		v, ok := objective.NumericValue(f.Outcome.Value, obj.Label)
 		if !ok {
 			continue

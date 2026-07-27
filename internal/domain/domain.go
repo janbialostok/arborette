@@ -74,6 +74,7 @@ const (
 	PropObjectiveLabel       = "objective_label"
 	PropObjectiveAggregation = "objective_aggregation"
 	PropDataSourceRef        = "data_source_ref"
+	PropSupport              = "support"
 )
 
 // State is a snapshot/telemetry point in time. GoalID scopes it to the
@@ -114,6 +115,10 @@ type Outcome struct {
 	GoalID             string
 	VerificationStatus VerificationStatus
 	Value              map[string]any
+	// Support is the matched-row count of the measurement that produced this
+	// outcome. 0 means unrecorded (legacy or extraction outcomes); consumers
+	// must treat absent/zero as below any positive support floor.
+	Support int64
 	// Provenance is set only for extract-type outcomes; nil for query-type or
 	// when no exact source match was located.
 	Provenance *ProvenanceLocator

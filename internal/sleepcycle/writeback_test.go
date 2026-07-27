@@ -64,6 +64,9 @@ func TestWriteBackPersistsOneCompleteTriplet(t *testing.T) {
 	if iv.Properties["support"] != int64(100) {
 		t.Fatalf("support = %v, want the measured row count 100", iv.Properties["support"])
 	}
+	if h.repo.outcomes[0].Support != 100 {
+		t.Fatalf("outcome support = %d, want the measured row count 100", h.repo.outcomes[0].Support)
+	}
 	if h.repo.outcomes[0].VerificationStatus != domain.VerificationVerified {
 		t.Fatalf("a measured query outcome must be verified, got %q", h.repo.outcomes[0].VerificationStatus)
 	}
