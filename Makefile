@@ -1,4 +1,4 @@
-.PHONY: build test up down migrate-up migrate-down web-dev web-build
+.PHONY: build test up down sleep-cycle migrate-up migrate-down web-dev web-build
 
 # Host env for runs that talk to the compose stack from the host (not from
 # inside the network): the published ports on localhost.
@@ -21,6 +21,12 @@ up:
 
 down:
 	docker compose down
+
+# One-shot job (compose profile "jobs"), so `make up` does not start it. --build
+# keeps a stale image from silently running previous code:
+#   make sleep-cycle GOAL=<optimization_function_id>
+sleep-cycle:
+	docker compose run --rm --build sleepcycle -goal $(GOAL)
 
 migrate-up:
 	set -a; . ./.env; set +a; $(HOST_ENV) go run ./cmd/migrate up

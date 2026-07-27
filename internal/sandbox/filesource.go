@@ -87,43 +87,75 @@ func (s *FileSource) Introspect(ctx context.Context) (*datasource.Schema, error)
 // legacy path). A nil result means the aggregate filtered to an empty set (SQL
 // NULL) for avg/sum/min/max; count over an empty set returns 0, not nil.
 func (s *FileSource) Execute(ctx context.Context, agg string, target domain.Target, expr *domain.Expression, filters []domain.Constraint) (*float64, error) {
-	db, tableFn, cleanup, err := s.stage(ctx)
+	m, err := s.ExecuteCounted(ctx, agg, target, expr, filters, false)
 	if err != nil {
 		return nil, err
+	}
+	return m.Value, nil
+}
+
+// Measurement is one execute result: the aggregate Value (nil when the filters
+// matched nothing and the aggregate scanned as SQL NULL) plus, when the caller
+// asked for it, the matched RowCount. Counted reports whether RowCount was
+// measured, distinguishing a real zero from an unrequested one.
+type Measurement struct {
+	Value    *float64
+	RowCount int64
+	Counted  bool
+}
+
+// ExecuteCounted is Execute with an opt-in matched-row count measured in the
+// same scan, so a caller that needs support alongside the objective pays one
+// scan rather than a second round-trip. The count is populated even when the
+// objective scans as SQL NULL: an empty-filtered aggregate with support 0 is
+// exactly the case a support floor must see. count(*) never returns NULL, so it
+// scans into a plain int64.
+func (s *FileSource) ExecuteCounted(ctx context.Context, agg string, target domain.Target, expr *domain.Expression, filters []domain.Constraint, withCount bool) (Measurement, error) {
+	db, tableFn, cleanup, err := s.stage(ctx)
+	if err != nil {
+		return Measurement{}, err
 	}
 	defer cleanup()
 
 	cols, err := columns(ctx, db, tableFn)
 	if err != nil {
-		return nil, err
+		return Measurement{}, err
 	}
 
 	var query string
 	var args []any
 	if expr != nil {
-		query, args, err = compileObjective(tableFn, cols, agg, *expr, filters)
+		query, args, err = compileObjectiveCounted(tableFn, cols, agg, *expr, filters, withCount)
 	} else {
-		query, args, err = compileQuery(tableFn, cols, agg, target, filters)
+		query, args, err = compileQueryCounted(tableFn, cols, agg, target, filters, withCount)
 	}
 	if err != nil {
-		return nil, err
+		return Measurement{}, err
 	}
 
 	var value sql.NullFloat64
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&value); err != nil {
-		return nil, fmt.Errorf("execute aggregate: %w", err)
+	measurement := Measurement{Counted: withCount}
+	row := db.QueryRowContext(ctx, query, args...)
+	if withCount {
+		err = row.Scan(&value, &measurement.RowCount)
+	} else {
+		err = row.Scan(&value)
+	}
+	if err != nil {
+		return Measurement{}, fmt.Errorf("execute aggregate: %w", err)
 	}
 	if !value.Valid {
-		return nil, nil
+		return measurement, nil
 	}
 	// A non-finite DOUBLE scans as a valid float64 but json.Marshal cannot encode
 	// it, so reject it here rather than emit a truncated 200 body: an expression
 	// division by zero (+Inf/NaN) or a source column literally containing inf both
 	// reach this guard regardless of which compiler produced the query.
 	if math.IsInf(value.Float64, 0) || math.IsNaN(value.Float64) {
-		return nil, errNonFiniteValue
+		return Measurement{}, errNonFiniteValue
 	}
-	return &value.Float64, nil
+	measurement.Value = &value.Float64
+	return measurement, nil
 }
 
 // stage downloads the object into an isolated temp dir and opens a configured

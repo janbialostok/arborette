@@ -22,6 +22,7 @@ type Config struct {
 	Sandbox      SandboxConfig
 	Orchestrator OrchestratorConfig
 	MCP          MCPConfig
+	SleepCycle   SleepCycleConfig
 	Anthropic    AnthropicConfig
 }
 
@@ -105,6 +106,24 @@ type OrchestratorConfig struct {
 type MCPConfig struct {
 	Port            string
 	OrchestratorURL string
+}
+
+// SleepCycleConfig drives the Sleep-Cycle Worker: the two services it calls plus
+// the lattice search's tuning knobs. MaxMeasurements is a safety bound on
+// distinct sandbox measurements per run (the beam is finite by construction, so
+// this only caps a pathologically wide harvest); BeamWidth is how many nodes
+// survive each level; MaxOrder is the largest conjunction the search will form;
+// MinSupport is an absolute matched-row floor below which a candidate and every
+// superset of it are pruned; MinLift is the relative improvement over the best
+// single segment a macro-segment must clear to be written back.
+type SleepCycleConfig struct {
+	SandboxURL      string
+	OrchestratorURL string
+	MaxMeasurements int
+	BeamWidth       int
+	MaxOrder        int
+	MinSupport      int
+	MinLift         float64
 }
 
 // AnthropicConfig points the Claude client at a model and key. Model is
@@ -210,6 +229,15 @@ func Load() (Config, error) {
 			Port:            env("MCP_PORT", "8082"),
 			OrchestratorURL: env("ORCHESTRATOR_URL", "http://orchestrator:8080"),
 		},
+		SleepCycle: SleepCycleConfig{
+			SandboxURL:      env("SANDBOX_URL", "http://sandbox:8081"),
+			OrchestratorURL: env("ORCHESTRATOR_URL", "http://orchestrator:8080"),
+			MaxMeasurements: intEnv("SLEEPCYCLE_SEARCH_MAX_MEASUREMENTS", 200),
+			BeamWidth:       intEnv("SLEEPCYCLE_SEARCH_BEAM_WIDTH", 10),
+			MaxOrder:        intEnv("SLEEPCYCLE_SEARCH_MAX_ORDER", 3),
+			MinSupport:      intEnv("SLEEPCYCLE_SEARCH_MIN_SUPPORT", 30),
+			MinLift:         floatEnv("SLEEPCYCLE_SEARCH_MIN_LIFT", 0.05),
+		},
 		Anthropic: AnthropicConfig{
 			APIKey: os.Getenv("ANTHROPIC_API_KEY"),
 			Model:  env("ANTHROPIC_MODEL", "claude-opus-4-8"),
@@ -238,6 +266,15 @@ func int64Env(key string, fallback int64) int64 {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
+		}
+	}
+	return fallback
+}
+
+func floatEnv(key string, fallback float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return fallback

@@ -16,6 +16,10 @@ type JobLauncher interface {
 // shell out to docker: the compose orchestrator block mounts no Docker socket,
 // so a real docker invocation would fail at runtime. The production seam (AWS
 // Batch SubmitJob) replaces this behind the interface.
+//
+// Argument contract the production launcher must honor: the worker binary takes
+// the goal as `-goal <optimization_function_id>` from the args map key of that
+// name, or SLEEPCYCLE_GOAL_ID as an environment fallback.
 type StubLauncher struct{}
 
 // Launch logs the invocation the production launcher would dispatch.

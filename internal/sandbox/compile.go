@@ -146,6 +146,13 @@ var numericTypes = map[string]bool{
 // bind time). The aggregate is CAST(... AS DOUBLE) so every allowed aggregation
 // scans back as one uniform DOUBLE/NULL.
 func compileQuery(tableFn string, cols []datasource.Column, agg string, target domain.Target, filters []domain.Constraint) (string, []any, error) {
+	return compileQueryCounted(tableFn, cols, agg, target, filters, false)
+}
+
+// compileQueryCounted is compileQuery with an opt-in matched-row count measured
+// in the same scan. With withCount false it emits byte-identical SQL to
+// compileQuery, so the legacy single-column path is unaffected.
+func compileQueryCounted(tableFn string, cols []datasource.Column, agg string, target domain.Target, filters []domain.Constraint, withCount bool) (string, []any, error) {
 	sqlAgg, ok := allowedAgg[strings.ToLower(agg)]
 	if !ok {
 		return "", nil, fmt.Errorf("%w: %q", errUnknownAggregation, agg)
@@ -167,14 +174,20 @@ func compileQuery(tableFn string, cols []datasource.Column, agg string, target d
 		return "", nil, err
 	}
 
-	return aggregateSelect(sqlAgg, quoteIdent(targetCol.Name), tableFn, predicates), args, nil
+	return aggregateSelect(sqlAgg, quoteIdent(targetCol.Name), tableFn, predicates, withCount), args, nil
 }
 
 // aggregateSelect assembles the read-only aggregate SELECT both execute paths
 // emit: the aggregated operand cast to DOUBLE for a uniform scalar scan, over the
 // server-built table function, under the compiled hard-constraint predicates.
-func aggregateSelect(sqlAgg, operand, tableFn string, predicates []string) string {
-	query := "SELECT CAST(" + sqlAgg + "(" + operand + ") AS DOUBLE) FROM " + tableFn
+// withCount appends count(*) as a second column over those same predicates, so a
+// caller measuring support pays one scan rather than a second round-trip.
+func aggregateSelect(sqlAgg, operand, tableFn string, predicates []string, withCount bool) string {
+	query := "SELECT CAST(" + sqlAgg + "(" + operand + ") AS DOUBLE)"
+	if withCount {
+		query += ", CAST(count(*) AS BIGINT)"
+	}
+	query += " FROM " + tableFn
 	if len(predicates) > 0 {
 		query += " WHERE " + strings.Join(predicates, " AND ")
 	}
@@ -267,6 +280,13 @@ func compileFilter(col datasource.Column, f domain.Constraint) (string, []any, e
 // args because the expression is emitted before the WHERE clause and DuckDB binds
 // ? positionally.
 func compileObjective(tableFn string, cols []datasource.Column, agg string, expr domain.Expression, filters []domain.Constraint) (string, []any, error) {
+	return compileObjectiveCounted(tableFn, cols, agg, expr, filters, false)
+}
+
+// compileObjectiveCounted is compileObjective with an opt-in matched-row count
+// measured in the same scan. With withCount false it emits byte-identical SQL to
+// compileObjective, so the legacy single-column path is unaffected.
+func compileObjectiveCounted(tableFn string, cols []datasource.Column, agg string, expr domain.Expression, filters []domain.Constraint, withCount bool) (string, []any, error) {
 	sqlAgg, ok := allowedAgg[strings.ToLower(agg)]
 	if !ok {
 		return "", nil, fmt.Errorf("%w: %q", errUnknownAggregation, agg)
@@ -287,7 +307,7 @@ func compileObjective(tableFn string, cols []datasource.Column, agg string, expr
 	}
 	args = append(args, filterArgs...)
 
-	return aggregateSelect(sqlAgg, measured, tableFn, predicates), args, nil
+	return aggregateSelect(sqlAgg, measured, tableFn, predicates, withCount), args, nil
 }
 
 // aggregateOperand adapts a compiled objective expression to its aggregation at

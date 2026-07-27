@@ -7,7 +7,7 @@ depends_on: [arborette-01-shared-infrastructure-data-layer, arborette-02-orchest
 
 ## Context
 
-Since extraction results have no labeled ground truth, the system routes low-confidence results to a human verification queue — but the loop must never block on individual verifications, and the trust gate for Sleep-Cycle clustering must be an explicit human-confirmed status, not a self-reported confidence number the model could report as 1.0 without ever being reviewed. This shell builds the Orchestrator-side machinery: the verification queue, its REST endpoints, the `verification_status` write-through on resolution, and the live confidence-bin distribution that streams alongside hypothesis-loop progress. The web UI that consumes these endpoints is a separate shell (10), since frontend work across all three new features shares conventions worth surveying once.
+Since extraction results have no labeled ground truth, the system routes low-confidence results to a human verification queue — but the loop must never block on individual verifications, and the trust gate for the Sleep-Cycle search must be an explicit human-confirmed status, not a self-reported confidence number the model could report as 1.0 without ever being reviewed. This shell builds the Orchestrator-side machinery: the verification queue, its REST endpoints, the `verification_status` write-through on resolution, and the live confidence-bin distribution that streams alongside hypothesis-loop progress. The web UI that consumes these endpoints is a separate shell (10), since frontend work across all three new features shares conventions worth surveying once.
 
 ## Produces
 
@@ -50,7 +50,7 @@ Since extraction results have no labeled ground truth, the system routes low-con
 
 ## Open Questions
 
-- Exact default confidence threshold — a starting default of 0.8 is reasonable but should be tuned at implementation time against real extraction-accuracy data. The `verification_status` gate (not this threshold) is what protects Sleep-Cycle clustering from a miscalibrated confidence signal, so this tuning question is about queue ergonomics, not correctness.
+- Exact default confidence threshold — a starting default of 0.8 is reasonable but should be tuned at implementation time against real extraction-accuracy data. The `verification_status` gate (not this threshold) is what protects the Sleep-Cycle search from a miscalibrated confidence signal, so this tuning question is about queue ergonomics, not correctness.
 - Known gap (see spec Open Questions): no invalidation/versioning path exists yet for a `Meta-Heuristic` already abstracted from a triplet later corrected or rejected here — post-MVP work.
 
 ## Expansion Deferred

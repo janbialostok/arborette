@@ -191,16 +191,20 @@ func (f *fakeClaude) Extract(_ context.Context, _ []byte, _ domain.TargetField, 
 // fakeRepo is a no-op graph.Repository that records the nodes writeTriplet
 // persists, so a loop test can assert the objective-label keying end to end.
 type fakeRepo struct {
-	states   []domain.State
-	outcomes []domain.Outcome
-	produced []domain.ProducedEdge
+	states        []domain.State
+	interventions []domain.Intervention
+	outcomes      []domain.Outcome
+	produced      []domain.ProducedEdge
 }
 
 func (f *fakeRepo) CreateState(_ context.Context, s domain.State) error {
 	f.states = append(f.states, s)
 	return nil
 }
-func (f *fakeRepo) CreateIntervention(_ context.Context, _ domain.Intervention) error { return nil }
+func (f *fakeRepo) CreateIntervention(_ context.Context, i domain.Intervention) error {
+	f.interventions = append(f.interventions, i)
+	return nil
+}
 func (f *fakeRepo) CreateOutcome(_ context.Context, o domain.Outcome) error {
 	f.outcomes = append(f.outcomes, o)
 	return nil
@@ -234,6 +238,12 @@ func (f *fakeRepo) UpdateOutcomeVerification(_ context.Context, _ string, _ doma
 }
 func (f *fakeRepo) TraceCausalChain(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
 	return nil, nil
+}
+func (f *fakeRepo) ListEligibleFindings(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
+	return nil, nil
+}
+func (f *fakeRepo) MarkStaleMetaHeuristics(_ context.Context, _ string) (int, error) {
+	return 0, nil
 }
 
 // fakeSandbox scripts per-call Execute results so the intake dry-run and the loop

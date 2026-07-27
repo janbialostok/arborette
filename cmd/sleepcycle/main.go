@@ -1,21 +1,35 @@
-// Command sleepcycle is the Sleep-Cycle Worker. It wires its connections and
-// blocks until shutdown, authenticating to Postgres as the service runtime role
-// (embedding upsert/read).
+// Command sleepcycle is the Sleep-Cycle Worker. It is a one-shot batch job, not
+// a service: it runs one Sleep Cycle for the goal named on the command line and
+// exits, so the job scheduler can mark it complete. It authenticates to Postgres as the service runtime role
+// (embedding upsert/read, goal-registry read) and reaches the audit table only
+// through the Orchestrator's internal API, which holds the sole credentials.
 package main
 
 import (
 	"context"
+	"flag"
 	"log"
+	"os"
 
+	"github.com/arborette/arborette/internal/auditclient"
 	"github.com/arborette/arborette/internal/config"
 	"github.com/arborette/arborette/internal/embedding"
 	"github.com/arborette/arborette/internal/graph"
-	"github.com/arborette/arborette/internal/service"
+	"github.com/arborette/arborette/internal/llm"
+	"github.com/arborette/arborette/internal/sandboxclient"
+	"github.com/arborette/arborette/internal/sleepcycle"
 	"github.com/arborette/arborette/internal/store"
 )
 
 func main() {
 	ctx := context.Background()
+	goalID := flag.String("goal", os.Getenv("SLEEPCYCLE_GOAL_ID"),
+		"optimization_function_id to run the Sleep Cycle for (defaults to SLEEPCYCLE_GOAL_ID)")
+	flag.Parse()
+	if *goalID == "" {
+		log.Fatalf("sleepcycle: a goal is required: pass -goal <optimization_function_id> or set SLEEPCYCLE_GOAL_ID")
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("sleepcycle: load config: %v", err)
@@ -40,7 +54,30 @@ func main() {
 	}
 
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
-	log.Printf("sleepcycle: wired neo4j, postgres, embeddings (dim=%d)", provider.Dimensions())
+	worker, err := sleepcycle.NewWorker(
+		repo,
+		sandboxclient.NewClient(cfg.SleepCycle.SandboxURL, nil),
+		llm.NewClient(cfg.Anthropic.APIKey, cfg.Anthropic.Model),
+		provider,
+		store.NewEmbeddingStore(pool),
+		store.NewGoalRegistry(pool),
+		auditclient.NewClient(cfg.SleepCycle.OrchestratorURL, nil),
+		sleepcycle.Config{
+			MaxMeasurements: cfg.SleepCycle.MaxMeasurements,
+			BeamWidth:       cfg.SleepCycle.BeamWidth,
+			MaxOrder:        cfg.SleepCycle.MaxOrder,
+			MinSupport:      cfg.SleepCycle.MinSupport,
+			MinLift:         cfg.SleepCycle.MinLift,
+		},
+	)
+	if err != nil {
+		log.Fatalf("sleepcycle: config: %v", err)
+	}
 
-	service.WaitForShutdown("sleepcycle")
+	log.Printf("sleepcycle: wired neo4j, postgres, sandbox, embeddings (dim=%d); running goal %q",
+		provider.Dimensions(), *goalID)
+	if err := worker.Run(ctx, *goalID); err != nil {
+		log.Fatalf("sleepcycle: run: %v", err)
+	}
+	log.Printf("sleepcycle: goal %q complete", *goalID)
 }

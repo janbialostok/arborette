@@ -113,6 +113,20 @@ func extractionSchema() map[string]any {
 	}, "value", "confidence")
 }
 
+// metaHeuristicSchema is AbstractMetaHeuristic's output schema. Every field is a
+// plain string — no enums, no recursion, no dependence on the dataset schema — so
+// the compiled grammar stays inside the constrained-decoding ceiling and the
+// schema is statically cacheable.
+func metaHeuristicSchema() map[string]any {
+	return object(props{
+		"definition": stringProp(),
+		"ontology_terms": arrayOf(object(props{
+			"concrete":    stringProp(),
+			"ontological": stringProp(),
+		}, "concrete", "ontological")),
+	}, "definition", "ontology_terms")
+}
+
 // constraintItem is the schema for one matrix hard-constraint. The field is a plain
 // string (grounded via the prompt, validated after generation); only the op keeps
 // its fixed-cardinality enum. It stays numeric-only because it is shared with

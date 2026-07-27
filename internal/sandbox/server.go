@@ -90,8 +90,9 @@ type DocumentTextResponse struct {
 // query, and since this service handles only query, any other value is rejected.
 // ValueExpression, when set, is the objective value expression measured in place
 // of the bare Target; ObjectiveLabel is the key the measured value is returned
-// under (a compiled expression has no single column name). Both are omitempty so
-// the legacy field-keyed request is unchanged.
+// under (a compiled expression has no single column name); IncludeRowCount adds
+// the matched row count to the response, measured in the same scan. All three are
+// omitempty so the legacy field-keyed request is unchanged.
 type ExecuteRequest struct {
 	DataSourceRef   string                  `json:"data_source_ref"`
 	Type            domain.InterventionType `json:"type"`
@@ -99,13 +100,20 @@ type ExecuteRequest struct {
 	Target          domain.Target           `json:"target"`
 	ValueExpression *domain.Expression      `json:"value_expression,omitempty"`
 	ObjectiveLabel  string                  `json:"objective_label,omitempty"`
+	IncludeRowCount bool                    `json:"include_row_count,omitempty"`
 	Filters         []domain.Constraint     `json:"filters"`
 }
+
+// rowCountKey is the reserved Value key carrying the matched row count when
+// IncludeRowCount is set. It cannot collide with a measured value's own key: that
+// key is either a target field name or a RenderObjectiveLabel agg(expr) string.
+const rowCountKey = "row_count"
 
 // ExecuteResponse carries the single measured aggregate shaped like an Outcome's
 // Value: {"<key>": <number>}, keyed by the request's objective label when set and
 // falling back to the target field for the legacy path, with a null number when a
-// sum/avg/min/max filtered to an empty set (count over an empty set is 0).
+// sum/avg/min/max filtered to an empty set (count over an empty set is 0). When
+// the request set IncludeRowCount the map additionally carries rowCountKey.
 type ExecuteResponse struct {
 	Value map[string]any `json:"value"`
 }
@@ -201,15 +209,15 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	src := NewFileSource(s.objects, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
-	value, err := src.Execute(r.Context(), req.Aggregation, req.Target, req.ValueExpression, req.Filters)
+	m, err := src.ExecuteCounted(r.Context(), req.Aggregation, req.Target, req.ValueExpression, req.Filters, req.IncludeRowCount)
 	if err != nil {
 		writeStageErr(w, err)
 		return
 	}
 
 	var measured any
-	if value != nil {
-		measured = *value
+	if m.Value != nil {
+		measured = *m.Value
 	}
 	// A compiled expression has no single column name, so the value is keyed by the
 	// objective label; the legacy field-only request carries no label and falls
@@ -218,7 +226,11 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	if key == "" {
 		key = req.Target.Field
 	}
-	writeJSON(w, http.StatusOK, ExecuteResponse{Value: map[string]any{key: measured}})
+	value := map[string]any{key: measured}
+	if m.Counted {
+		value[rowCountKey] = m.RowCount
+	}
+	writeJSON(w, http.StatusOK, ExecuteResponse{Value: value})
 }
 
 // bindTargets binds each target to a column using the shared case-insensitive

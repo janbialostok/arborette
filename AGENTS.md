@@ -55,6 +55,16 @@
   compose container already holds 8080), sourcing `.env` for credentials — then
   `curl` the endpoint. Boot-time work (migrations already applied, reconciliation
   sweeps) runs too, so the local process exercises the real startup path.
+- The Sleep-Cycle Worker is a one-shot job behind the compose `jobs` profile, so
+  `make up` neither builds nor starts it, and a bare `docker compose run` reuses
+  whatever image already exists — `make sleep-cycle GOAL=<id>` passes `--build` for
+  exactly that reason. The REST/UI trigger (`POST /goals/{id}/sleep-cycle`) is
+  backed by `StubLauncher` locally: it logs, audits, returns 202, and runs nothing,
+  so `make sleep-cycle` is the only way to execute a run against the local stack.
+  To run it from the host instead, use the same overrides as the HTTP smoke-test
+  plus `ORCHESTRATOR_URL=http://localhost:8080` (it reaches the audit table only
+  through that API) and `-goal <optimization_function_id>`; it exits when the run
+  finishes rather than serving.
 - To preview or smoke-test a `web/` frontend change against the live stack, run
   `make web-dev` — it starts the Next.js dev server on :3000 with your local edits,
   pointed at the orchestrator on :8080 (`ORCHESTRATOR_URL`). The compose `web`

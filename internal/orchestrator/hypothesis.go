@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,14 +14,17 @@ import (
 
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/llm"
+	"github.com/arborette/arborette/internal/objective"
 	"github.com/arborette/arborette/internal/store"
 )
 
 var (
-	errNonNumericValue    = errors.New("sandbox returned a non-numeric objective value")
-	errNoObjective        = errors.New("evaluation matrix has no target to pin as the objective")
-	errMissingAggregation = errors.New("evaluation matrix target carries no aggregation; re-register the goal to fit a measurable objective")
-	errExpressionTooDeep  = errors.New("objective value expression nests too deeply")
+	errExpressionTooDeep = errors.New("objective value expression nests too deeply")
+
+	// These live in internal/objective, shared with the Sleep-Cycle Worker.
+	errNonNumericValue    = objective.ErrNonNumericValue
+	errNoObjective        = objective.ErrNoObjective
+	errMissingAggregation = objective.ErrMissingAggregation
 )
 
 // loopTimeout bounds a whole hypothesis run. The loop runs on a background
@@ -45,18 +47,6 @@ const statusWriteTimeout = 5 * time.Second
 // for the grounding check). After the bound, any still-invalid candidate is dropped
 // so the run always terminates.
 const maxProposalRepairs = 3
-
-// objective is the run's fixed measurement, held constant across the whole tree:
-// one aggregation over one value expression, with the direction that decides what
-// "improvement" means. label is the rendered key the measured value is carried
-// under end to end. Pinning it once is what makes the stop-on-no-improvement
-// comparison meaningful — every value compared is the same measurement.
-type objective struct {
-	aggregation string
-	expr        domain.Expression
-	label       string
-	direction   domain.TargetDirection
-}
 
 // handleTriggerLoop starts the Phase-1 hypothesis loop for a goal. It looks the
 // goal up (404 on miss), launches the loop in a goroutine on a timeout-bounded
@@ -119,14 +109,14 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 	}()
 
 	// A document goal has no objective to pin or baseline to measure -- its tree is
-	// one extraction sub-tree per target field. Branch before pinObjective so a
+	// one extraction sub-tree per target field. Branch before pinning the objective so a
 	// document goal never trips errNoObjective on the tabular path below.
 	if goal.IsDocument() {
 		termErr = s.runDocumentLoop(ctx, goal)
 		return
 	}
 
-	obj, err := pinObjective(goal.EvaluationMatrix)
+	obj, err := objective.Pin(goal.EvaluationMatrix)
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: pin objective: %v", id, err)
 		termErr = err
@@ -154,14 +144,14 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 
 	// Root baseline: the objective measured with no filters. Deeper baselines
 	// reuse the parent's outcome value (cumulative nesting makes that valid).
-	baseResp, err := s.sandbox.Execute(ctx, executeRequestFor(goal, obj, nil))
+	baseResp, err := s.sandbox.Execute(ctx, objective.ExecuteRequestFor(goal.DataSourceRef, obj, nil))
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: root baseline: %v", id, err)
 		termErr = err
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
-	baseline, ok := numericValue(baseResp.Value, obj.label)
+	baseline, ok := objective.NumericValue(baseResp.Value, obj.Label)
 	if !ok {
 		termErr = errNonNumericValue
 		s.branchFailure(ctx, id, nil, errNonNumericValue)
@@ -177,16 +167,16 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 // set, writes the causal triplet, and — if the candidate improves the objective
 // within constraints and the depth cap is not reached — proposes and expands its
 // refinement children.
-func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj objective, schema llm.SandboxSchema, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, depth int) {
+func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj objective.Objective, schema llm.SandboxSchema, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, depth int) {
 	id := goal.OptimizationFunctionID
 	effective := concatFilters(parentFilters, cand.Filters)
 
-	resp, err := s.sandbox.Execute(ctx, executeRequestFor(goal, obj, effective))
+	resp, err := s.sandbox.Execute(ctx, objective.ExecuteRequestFor(goal.DataSourceRef, obj, effective))
 	if err != nil {
 		s.branchFailure(ctx, id, effective, err)
 		return
 	}
-	value, ok := numericValue(resp.Value, obj.label)
+	value, ok := objective.NumericValue(resp.Value, obj.Label)
 	if !ok {
 		s.branchFailure(ctx, id, effective, errNonNumericValue)
 		return
@@ -198,7 +188,7 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 		return
 	}
 
-	if !improves(baseline, value, obj.direction) {
+	if !objective.Improves(baseline, value, obj.Direction) {
 		return
 	}
 	if !constraintsSatisfied(goal.EvaluationMatrix.Constraints, objectiveField(obj), value) {
@@ -211,8 +201,8 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 
 	children, err := s.proposeValidCandidates(ctx, goal, schema, llm.TreeContext{
 		Breadth:        defaultBreadth,
-		ObjectiveLabel: obj.label,
-		Direction:      obj.direction,
+		ObjectiveLabel: obj.Label,
+		Direction:      obj.Direction,
 		ParentFilters:  effective,
 		PriorValue:     &value,
 	})
@@ -306,7 +296,7 @@ func (s *Server) processExtractionCandidate(ctx context.Context, goal store.Goal
 		return
 	}
 
-	if !improves(parentConfidence, confidence, domain.Maximize) {
+	if !objective.Improves(parentConfidence, confidence, domain.Maximize) {
 		return
 	}
 	if depth >= defaultDepth {
@@ -350,32 +340,32 @@ func locateProvenance(pages []string, needle string) *domain.ProvenanceLocator {
 // domain.EpistemicSource). The start state is the objective measured at the
 // parent's effective filters (the baseline the candidate is judged against);
 // query outcomes are always verified with PRODUCED confidence fixed at 1.0.
-func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objective, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, effective []domain.Constraint, value float64) error {
+func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objective.Objective, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, effective []domain.Constraint, value float64) error {
 	stateID := uuid.NewString()
-	state := domain.State{ID: stateID, Properties: map[string]any{
-		"data_source_ref":       goal.DataSourceRef,
-		"objective_aggregation": obj.aggregation,
-		"objective_label":       obj.label,
-		"effective_filters":     parentFilters,
-		"value":                 baseline,
+	state := domain.State{ID: stateID, GoalID: goal.OptimizationFunctionID, Properties: map[string]any{
+		domain.PropDataSourceRef:        goal.DataSourceRef,
+		domain.PropObjectiveAggregation: obj.Aggregation,
+		domain.PropObjectiveLabel:       obj.Label,
+		domain.PropEffectiveFilters:     parentFilters,
+		"value":                         baseline,
 	}}
 	if err := s.repo.CreateState(ctx, state); err != nil {
 		return err
 	}
 
 	interventionID := uuid.NewString()
-	intervention := domain.Intervention{ID: interventionID, Type: domain.InterventionQuery, Properties: map[string]any{
-		"objective_aggregation": obj.aggregation,
-		"objective_label":       obj.label,
-		"new_filters":           cand.Filters,
-		"effective_filters":     effective,
+	intervention := domain.Intervention{ID: interventionID, GoalID: goal.OptimizationFunctionID, Type: domain.InterventionQuery, Properties: map[string]any{
+		domain.PropObjectiveAggregation: obj.Aggregation,
+		domain.PropObjectiveLabel:       obj.Label,
+		domain.PropNewFilters:           cand.Filters,
+		domain.PropEffectiveFilters:     effective,
 	}}
 	if err := s.repo.CreateIntervention(ctx, intervention); err != nil {
 		return err
 	}
 
 	outcomeID := uuid.NewString()
-	outcome := domain.Outcome{ID: outcomeID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{obj.label: value}}
+	outcome := domain.Outcome{ID: outcomeID, GoalID: goal.OptimizationFunctionID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{obj.Label: value}}
 	if err := s.repo.CreateOutcome(ctx, outcome); err != nil {
 		return err
 	}
@@ -391,7 +381,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 	if err := s.recordAudit(ctx, "hypothesis_intervention", "intervention", map[string]any{
 		"optimization_function_id": goal.OptimizationFunctionID,
 		"intervention_id":          interventionID,
-		"new_filters":              cand.Filters,
+		domain.PropNewFilters:      cand.Filters,
 	}); err != nil {
 		log.Printf("orchestrator: append audit: %v", err)
 	}
@@ -404,16 +394,16 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 	}
 
 	s.hub.Publish(goal.OptimizationFunctionID, Event{Type: "triplet", Payload: map[string]any{
-		"state_id":        stateID,
-		"intervention_id": interventionID,
-		"outcome_id":      outcomeID,
-		"baseline":        baseline,
-		"value":           value,
-		"effect_size":     value - baseline,
-		"objective_label": obj.label,
-		"direction":       string(obj.direction),
-		"filters":         renderConstraints(effective),
-		"new_filters":     renderConstraints(cand.Filters),
+		"state_id":                stateID,
+		"intervention_id":         interventionID,
+		"outcome_id":              outcomeID,
+		"baseline":                baseline,
+		"value":                   value,
+		"effect_size":             value - baseline,
+		domain.PropObjectiveLabel: obj.Label,
+		"direction":               string(obj.Direction),
+		"filters":                 renderConstraints(effective),
+		domain.PropNewFilters:     renderConstraints(cand.Filters),
 	}})
 	return nil
 }
@@ -428,17 +418,17 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 // epistemic source stays observational.
 func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, field domain.TargetField, method string, parentConfidence float64, value string, confidence float64, locator *domain.ProvenanceLocator) error {
 	stateID := uuid.NewString()
-	state := domain.State{ID: stateID, Properties: map[string]any{
-		"data_source_ref": goal.DataSourceRef,
-		"field":           field.Name,
-		"confidence":      parentConfidence,
+	state := domain.State{ID: stateID, GoalID: goal.OptimizationFunctionID, Properties: map[string]any{
+		domain.PropDataSourceRef: goal.DataSourceRef,
+		"field":                  field.Name,
+		"confidence":             parentConfidence,
 	}}
 	if err := s.repo.CreateState(ctx, state); err != nil {
 		return err
 	}
 
 	interventionID := uuid.NewString()
-	intervention := domain.Intervention{ID: interventionID, Type: domain.InterventionExtract, Properties: map[string]any{
+	intervention := domain.Intervention{ID: interventionID, GoalID: goal.OptimizationFunctionID, Type: domain.InterventionExtract, Properties: map[string]any{
 		"field":  field.Name,
 		"method": method,
 	}}
@@ -451,6 +441,7 @@ func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, fi
 	// path's label-keyed value; the llm layer returns just the raw string.
 	outcome := domain.Outcome{
 		ID:                 outcomeID,
+		GoalID:             goal.OptimizationFunctionID,
 		VerificationStatus: domain.VerificationUnverified,
 		Value:              map[string]any{field.Name: value},
 		Provenance:         locator,
@@ -602,58 +593,22 @@ func unknownColumnsMessage(unknown []string) string {
 		"; re-propose using only columns from the Available columns list"
 }
 
-// pinObjective fixes the run's objective from the Evaluation Matrix's first
-// target: the aggregation, value expression, direction, and rendered label the
-// whole tree measures against. A matrix with no target, or a legacy target with
-// no aggregation, is a terminal failure directing re-registration — there is no
-// count fallback, because a silently-substituted aggregation would mis-measure.
-func pinObjective(matrix domain.EvaluationMatrix) (objective, error) {
-	if len(matrix.Targets) == 0 {
-		return objective{}, errNoObjective
-	}
-	t := matrix.Targets[0]
-	if t.Aggregation == "" {
-		return objective{}, errMissingAggregation
-	}
-	expr := t.ValueExpression()
-	return objective{
-		aggregation: t.Aggregation,
-		expr:        expr,
-		label:       domain.RenderObjectiveLabel(t.Aggregation, expr),
-		direction:   t.Direction,
-	}, nil
-}
-
-// executeRequestFor builds the execute request measuring the pinned objective
-// under filters, shared so every call site pins the objective identically.
-func executeRequestFor(goal store.Goal, obj objective, filters []domain.Constraint) ExecuteRequest {
-	return ExecuteRequest{
-		DataSourceRef:   goal.DataSourceRef,
-		Type:            domain.InterventionQuery,
-		Aggregation:     obj.aggregation,
-		Target:          domain.Target{Direction: obj.direction},
-		ValueExpression: &obj.expr,
-		ObjectiveLabel:  obj.label,
-		Filters:         filters,
-	}
-}
-
 // dryRunObjective validates a fitted matrix by executing its pinned objective
 // against the sandbox with no filters — the same request the root baseline runs,
 // pinned identically. A nil return means the objective compiles and measures; a
 // non-nil error is either a pin failure or the sandbox's execute error.
 func (s *Server) dryRunObjective(ctx context.Context, ref string, matrix domain.EvaluationMatrix) error {
-	obj, err := pinObjective(matrix)
+	obj, err := objective.Pin(matrix)
 	if err != nil {
 		return err
 	}
 	// The output schema does not bound expression nesting (the value is a plain
 	// JSON string), so guard depth here — the message flows verbatim into
 	// RepairEvaluationMatrix via the existing repair loop.
-	if domain.ExpressionDepth(obj.expr) > domain.MaxObjectiveExpressionDepth {
+	if domain.ExpressionDepth(obj.Expr) > domain.MaxObjectiveExpressionDepth {
 		return fmt.Errorf("%w (max %d)", errExpressionTooDeep, domain.MaxObjectiveExpressionDepth)
 	}
-	_, err = s.sandbox.Execute(ctx, executeRequestFor(store.Goal{DataSourceRef: ref}, obj, nil))
+	_, err = s.sandbox.Execute(ctx, objective.ExecuteRequestFor(ref, obj, nil))
 	return err
 }
 
@@ -673,20 +628,11 @@ func isObjectiveValidationFailure(err error) bool {
 // against: the objective's column only when it is a bare ColumnRef. A compound
 // expression has no single column, so it yields "" and matches no constraint
 // (expression-based constraints are deferred).
-func objectiveField(obj objective) string {
-	if obj.expr.Kind == domain.ColumnRefKind {
-		return obj.expr.Column
+func objectiveField(obj objective.Objective) string {
+	if obj.Expr.Kind == domain.ColumnRefKind {
+		return obj.Expr.Column
 	}
 	return ""
-}
-
-// improves reports whether value moves the objective in the desired direction
-// versus the baseline.
-func improves(baseline, value float64, direction domain.TargetDirection) bool {
-	if direction == domain.Minimize {
-		return value < baseline
-	}
-	return value > baseline
 }
 
 // constraintsSatisfied checks the measured objective value against any hard
@@ -717,24 +663,6 @@ func constraintsSatisfied(constraints []domain.Constraint, field string, value f
 		}
 	}
 	return true
-}
-
-// numericValue extracts the objective value keyed by the objective label. A nil
-// value (an empty aggregate) or a non-number is not usable.
-func numericValue(value map[string]any, label string) (float64, bool) {
-	raw, ok := value[label]
-	if !ok || raw == nil {
-		return 0, false
-	}
-	switch n := raw.(type) {
-	case float64:
-		return n, true
-	case json.Number:
-		f, err := n.Float64()
-		return f, err == nil
-	default:
-		return 0, false
-	}
 }
 
 // concatFilters returns a fresh slice of the parent's effective filters plus the

@@ -1,6 +1,7 @@
 # Local-dev stack: four infra services, a completion-gated init chain
-# (db-bootstrap -> migrate), and the four Go service stubs. The init chain
-# provisions runtime roles and applies migrations before any service
+# (db-bootstrap -> migrate), three long-running Go services, the Next.js web UI,
+# and the sleepcycle one-shot job (profile "jobs", so `make up` skips it). The
+# init chain provisions runtime roles and applies migrations before any service
 # authenticates; embedding-consuming services additionally wait for the model
 # pull. See .env.example for the variables .env must supply.
 
@@ -163,7 +164,11 @@ services:
       minio:
         condition: service_healthy
 
+  # One-shot job, not a long-running service: the profile keeps `make up` from
+  # starting it. Run it per goal with
+  #   docker compose run --rm sleepcycle -goal <optimization_function_id>
   sleepcycle:
+    profiles: ["jobs"]
     build:
       context: .
       dockerfile: cmd/sleepcycle/Dockerfile
@@ -177,6 +182,10 @@ services:
         condition: service_completed_successfully
       neo4j:
         condition: service_healthy
+      sandbox:
+        condition: service_started
+      orchestrator:
+        condition: service_started
 
   mcpserver:
     build:

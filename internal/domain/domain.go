@@ -31,6 +31,14 @@ const (
 	VerificationRejected   VerificationStatus = "rejected"
 )
 
+// SearchEligibleStatuses is the canonical set of verification statuses whose
+// outcomes may feed the Sleep-Cycle search: query outcomes (always verified) and
+// HITL-resolved extract outcomes an analyst affirmed. This status, never the
+// PRODUCED-edge confidence weight, is the gate — confidence is a model
+// self-report and is never proof of verification. It is a slice because the
+// eligible-finding Cypher binds the set as a query parameter.
+var SearchEligibleStatuses = []VerificationStatus{VerificationVerified, VerificationConfirmed, VerificationCorrected}
+
 // EpistemicSource records how a PRODUCED edge's effect was established. V1 writes
 // only observational — a measured correlation P(Outcome | Segment), not do-calculus
 // causation. interventional is reserved for a future V2 interventional layer
@@ -54,18 +62,39 @@ const (
 	AbstractedFrom  = "ABSTRACTED_FROM"
 )
 
-// State is a snapshot/telemetry point in time.
+// Node property keys that cross a service boundary. PropNewFilters in particular
+// is written by the hypothesis loop and read back by the Sleep-Cycle search to
+// build its atom set; a divergence between the two spellings does not fail — the
+// read yields no filters, so the search finds nothing to conjoin and every run
+// reports a successful degenerate result. Naming them here makes that divergence
+// a compile error instead.
+const (
+	PropNewFilters           = "new_filters"
+	PropEffectiveFilters     = "effective_filters"
+	PropObjectiveLabel       = "objective_label"
+	PropObjectiveAggregation = "objective_aggregation"
+	PropDataSourceRef        = "data_source_ref"
+)
+
+// State is a snapshot/telemetry point in time. GoalID scopes it to the
+// optimization function it was measured for.
 type State struct {
 	ID         string
+	GoalID     string
 	Properties map[string]any
 }
 
 // Intervention is reified action metadata (configuration change, execution
-// metadata, confidence bounds).
+// metadata, confidence bounds). GoalID scopes it to its optimization function;
+// SleepDerived marks a macro-segment the Sleep-Cycle search produced, which is a
+// search output rather than an atomic input and is therefore excluded from a
+// later run's search space so conjunctions are never double-counted.
 type Intervention struct {
-	ID         string
-	Type       InterventionType
-	Properties map[string]any
+	ID           string
+	GoalID       string
+	Type         InterventionType
+	SleepDerived bool
+	Properties   map[string]any
 }
 
 // ProvenanceLocator pins an extract-type outcome's value to the exact source
@@ -82,6 +111,7 @@ type ProvenanceLocator struct {
 // analyst's Evaluation Matrix.
 type Outcome struct {
 	ID                 string
+	GoalID             string
 	VerificationStatus VerificationStatus
 	Value              map[string]any
 	// Provenance is set only for extract-type outcomes; nil for query-type or
@@ -91,11 +121,13 @@ type Outcome struct {
 
 // MetaHeuristic is a semantic abstraction produced during the Sleep Cycle. Its
 // embedding lives in pgvector keyed by ID; EmbeddingPending is true from node
-// creation until the pgvector write succeeds.
+// creation until the pgvector write succeeds. Stale marks a heuristic whose
+// supporting evidence was since rejected by an analyst.
 type MetaHeuristic struct {
 	ID               string
 	Definition       string
 	EmbeddingPending bool
+	Stale            bool
 }
 
 // ProducedEdge carries the measured effect size and a self-reported confidence

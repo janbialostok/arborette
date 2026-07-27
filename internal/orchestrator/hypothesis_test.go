@@ -10,6 +10,7 @@ import (
 
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/llm"
+	"github.com/arborette/arborette/internal/objective"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -19,18 +20,18 @@ func TestPinObjective(t *testing.T) {
 			{Field: "revenue", Direction: domain.Maximize, Aggregation: "sum"},
 			{Field: "cost", Direction: domain.Minimize, Aggregation: "avg"},
 		}}
-		obj, err := pinObjective(matrix)
+		obj, err := objective.Pin(matrix)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if obj.aggregation != "sum" || obj.direction != domain.Maximize {
+		if obj.Aggregation != "sum" || obj.Direction != domain.Maximize {
 			t.Fatalf("unexpected aggregation/direction: %+v", obj)
 		}
-		if obj.expr.Kind != domain.ColumnRefKind || obj.expr.Column != "revenue" {
-			t.Fatalf("field-only target should degenerate to a bare ColumnRef: %+v", obj.expr)
+		if obj.Expr.Kind != domain.ColumnRefKind || obj.Expr.Column != "revenue" {
+			t.Fatalf("field-only target should degenerate to a bare ColumnRef: %+v", obj.Expr)
 		}
-		if obj.label != "sum(revenue)" {
-			t.Fatalf("label = %q, want sum(revenue)", obj.label)
+		if obj.Label != "sum(revenue)" {
+			t.Fatalf("label = %q, want sum(revenue)", obj.Label)
 		}
 	})
 
@@ -42,24 +43,24 @@ func TestPinObjective(t *testing.T) {
 		matrix := domain.EvaluationMatrix{Targets: []domain.Target{
 			{Direction: domain.Maximize, Aggregation: "avg", Value: &expr},
 		}}
-		obj, err := pinObjective(matrix)
+		obj, err := objective.Pin(matrix)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if obj.expr.Kind != domain.ComparisonKind || obj.label != "avg(Transported = True)" {
-			t.Fatalf("compound objective not pinned/labeled: %+v (label %q)", obj.expr, obj.label)
+		if obj.Expr.Kind != domain.ComparisonKind || obj.Label != "avg(Transported = True)" {
+			t.Fatalf("compound objective not pinned/labeled: %+v (label %q)", obj.Expr, obj.Label)
 		}
 	})
 
 	t.Run("no targets is a terminal failure", func(t *testing.T) {
-		if _, err := pinObjective(domain.EvaluationMatrix{}); !errors.Is(err, errNoObjective) {
+		if _, err := objective.Pin(domain.EvaluationMatrix{}); !errors.Is(err, errNoObjective) {
 			t.Fatalf("error = %v, want errNoObjective", err)
 		}
 	})
 
 	t.Run("legacy field-only target with no aggregation is terminal", func(t *testing.T) {
 		matrix := domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize}}}
-		if _, err := pinObjective(matrix); !errors.Is(err, errMissingAggregation) {
+		if _, err := objective.Pin(matrix); !errors.Is(err, errMissingAggregation) {
 			t.Fatalf("error = %v, want errMissingAggregation", err)
 		}
 	})
@@ -68,14 +69,14 @@ func TestPinObjective(t *testing.T) {
 func boolPtr(b bool) *bool { return &b }
 
 func TestExecuteRequestFor(t *testing.T) {
-	obj := objective{
-		aggregation: "avg",
-		expr:        domain.Expression{Kind: domain.ColumnRefKind, Column: "revenue"},
-		label:       "avg(revenue)",
-		direction:   domain.Maximize,
+	obj := objective.Objective{
+		Aggregation: "avg",
+		Expr:        domain.Expression{Kind: domain.ColumnRefKind, Column: "revenue"},
+		Label:       "avg(revenue)",
+		Direction:   domain.Maximize,
 	}
 	filters := []domain.Constraint{{Field: "region", Op: domain.GreaterThanOrEqual, Value: 1}}
-	req := executeRequestFor(store.Goal{DataSourceRef: "ref"}, obj, filters)
+	req := objective.ExecuteRequestFor("ref", obj, filters)
 
 	if req.ValueExpression == nil || req.ValueExpression.Column != "revenue" {
 		t.Fatalf("value expression not carried: %+v", req.ValueExpression)
@@ -94,13 +95,13 @@ func TestExecuteRequestFor(t *testing.T) {
 }
 
 func TestObjectiveField(t *testing.T) {
-	bare := objective{expr: domain.Expression{Kind: domain.ColumnRefKind, Column: "revenue"}}
+	bare := objective.Objective{Expr: domain.Expression{Kind: domain.ColumnRefKind, Column: "revenue"}}
 	if objectiveField(bare) != "revenue" {
 		t.Fatalf("bare ColumnRef field = %q, want revenue", objectiveField(bare))
 	}
 	// A compound expression has no single column, so the on-objective-field
 	// constraint check is a no-op.
-	compound := objective{expr: domain.Expression{Kind: domain.ComparisonKind}}
+	compound := objective.Objective{Expr: domain.Expression{Kind: domain.ComparisonKind}}
 	if objectiveField(compound) != "" {
 		t.Fatalf("compound objective field = %q, want empty", objectiveField(compound))
 	}
@@ -658,19 +659,19 @@ func TestRunLoopStatusTransitions(t *testing.T) {
 }
 
 func TestImproves(t *testing.T) {
-	if !improves(10, 12, domain.Maximize) {
+	if !objective.Improves(10, 12, domain.Maximize) {
 		t.Fatal("maximize: larger value should improve")
 	}
-	if improves(10, 8, domain.Maximize) {
+	if objective.Improves(10, 8, domain.Maximize) {
 		t.Fatal("maximize: smaller value should not improve")
 	}
-	if !improves(10, 8, domain.Minimize) {
+	if !objective.Improves(10, 8, domain.Minimize) {
 		t.Fatal("minimize: smaller value should improve")
 	}
-	if improves(10, 12, domain.Minimize) {
+	if objective.Improves(10, 12, domain.Minimize) {
 		t.Fatal("minimize: larger value should not improve")
 	}
-	if improves(10, 10, domain.Maximize) || improves(10, 10, domain.Minimize) {
+	if objective.Improves(10, 10, domain.Maximize) || objective.Improves(10, 10, domain.Minimize) {
 		t.Fatal("equal value should not improve in either direction")
 	}
 }
@@ -714,19 +715,19 @@ func TestConstraintsSatisfied(t *testing.T) {
 }
 
 func TestNumericValue(t *testing.T) {
-	if v, ok := numericValue(map[string]any{"f": 12.5}, "f"); !ok || v != 12.5 {
+	if v, ok := objective.NumericValue(map[string]any{"f": 12.5}, "f"); !ok || v != 12.5 {
 		t.Fatalf("float64 = (%v,%v), want (12.5,true)", v, ok)
 	}
-	if v, ok := numericValue(map[string]any{"f": json.Number("7")}, "f"); !ok || v != 7 {
+	if v, ok := objective.NumericValue(map[string]any{"f": json.Number("7")}, "f"); !ok || v != 7 {
 		t.Fatalf("json.Number = (%v,%v), want (7,true)", v, ok)
 	}
-	if _, ok := numericValue(map[string]any{"f": nil}, "f"); ok {
+	if _, ok := objective.NumericValue(map[string]any{"f": nil}, "f"); ok {
 		t.Fatal("nil value (empty aggregate) should be unusable")
 	}
-	if _, ok := numericValue(map[string]any{}, "f"); ok {
+	if _, ok := objective.NumericValue(map[string]any{}, "f"); ok {
 		t.Fatal("missing key should be unusable")
 	}
-	if _, ok := numericValue(map[string]any{"f": "12"}, "f"); ok {
+	if _, ok := objective.NumericValue(map[string]any{"f": "12"}, "f"); ok {
 		t.Fatal("string value should be unusable")
 	}
 }
@@ -744,5 +745,75 @@ func TestConcatFiltersDoesNotAliasParent(t *testing.T) {
 	out[0].Value = 999
 	if parent[0].Value != 1 {
 		t.Fatalf("parent filter mutated through the concatenated slice: %+v", parent[0])
+	}
+}
+
+// TestWriteTripletScopesNodesToTheGoal pins the wire between Phase 1 and the
+// Sleep Cycle. The worker's eligible-finding query filters on the Intervention's
+// goal_id and its staleness sweep on the Outcome's, so a triplet written without
+// them is invisible to Phase 2 — and invisibly so: every run would simply find
+// nothing to conjoin and audit a successful degenerate run.
+func TestWriteTripletScopesNodesToTheGoal(t *testing.T) {
+	repo := &fakeRepo{}
+	claude := &fakeClaude{proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: nil}}}}
+	sandbox := &fakeSandbox{
+		introspect: revenueSchema(),
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}}, // baseline
+			{Value: map[string]any{"avg(revenue)": 8.0}},  // candidate, no improvement
+		},
+	}
+	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if len(repo.interventions) != 1 || len(repo.outcomes) != 1 || len(repo.states) != 1 {
+		t.Fatalf("expected one triplet, got states=%d interventions=%d outcomes=%d",
+			len(repo.states), len(repo.interventions), len(repo.outcomes))
+	}
+	if got := repo.interventions[0].GoalID; got != "g1" {
+		t.Fatalf("intervention goal id = %q, want g1 — the Sleep Cycle filters on this", got)
+	}
+	if got := repo.outcomes[0].GoalID; got != "g1" {
+		t.Fatalf("outcome goal id = %q, want g1 — the staleness sweep filters on this", got)
+	}
+	if got := repo.states[0].GoalID; got != "g1" {
+		t.Fatalf("state goal id = %q, want g1", got)
+	}
+	// A Phase-1 finding is search input, never a derived search output.
+	if repo.interventions[0].SleepDerived {
+		t.Fatal("a Phase-1 intervention must not be flagged sleep-derived")
+	}
+}
+
+// TestWriteExtractionTripletScopesNodesToTheGoal is the same contract on the
+// document path. The Sleep Cycle rejects document goals outright, so nothing
+// reads these today — but an unscoped node is invisible to every goal-filtered
+// query, including the staleness sweep, and the omission would only surface once
+// a later phase starts reading extraction outcomes by goal.
+func TestWriteExtractionTripletScopesNodesToTheGoal(t *testing.T) {
+	repo := &fakeRepo{}
+	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
+
+	field := domain.TargetField{Name: "invoice_total"}
+	if err := srv.writeExtractionTriplet(context.Background(), documentGoal([]domain.TargetField{field}),
+		field, "ocr", 0.5, "42", 0.9, nil); err != nil {
+		t.Fatalf("write extraction triplet: %v", err)
+	}
+
+	if len(repo.states) != 1 || len(repo.interventions) != 1 || len(repo.outcomes) != 1 {
+		t.Fatalf("expected one triplet, got states=%d interventions=%d outcomes=%d",
+			len(repo.states), len(repo.interventions), len(repo.outcomes))
+	}
+	for _, c := range []struct {
+		label string
+		got   string
+	}{
+		{"state", repo.states[0].GoalID},
+		{"intervention", repo.interventions[0].GoalID},
+		{"outcome", repo.outcomes[0].GoalID},
+	} {
+		if c.got != "doc-goal" {
+			t.Fatalf("%s goal id = %q, want doc-goal", c.label, c.got)
+		}
 	}
 }

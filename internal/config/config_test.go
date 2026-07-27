@@ -102,3 +102,37 @@ func TestPathStyleBoolFallback(t *testing.T) {
 		t.Fatalf("expected false override")
 	}
 }
+
+// TestMinLiftFallback drives the float knob through Load, so the env wiring is
+// exercised alongside the parser. An unparseable value must fall back rather than
+// zero the knob — a MinLift silently reset to 0 would let every measured
+// conjunction clear the materially-better gate.
+func TestMinLiftFallback(t *testing.T) {
+	setPostgresEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SleepCycle.MinLift != 0.05 {
+		t.Fatalf("unset = %v, want the 0.05 default", cfg.SleepCycle.MinLift)
+	}
+
+	t.Setenv("SLEEPCYCLE_SEARCH_MIN_LIFT", "0.25")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SleepCycle.MinLift != 0.25 {
+		t.Fatalf("parsed = %v, want 0.25", cfg.SleepCycle.MinLift)
+	}
+
+	t.Setenv("SLEEPCYCLE_SEARCH_MIN_LIFT", "not-a-number")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SleepCycle.MinLift != 0.05 {
+		t.Fatalf("unparseable = %v, want the 0.05 default", cfg.SleepCycle.MinLift)
+	}
+}

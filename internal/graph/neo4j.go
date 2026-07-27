@@ -3,11 +3,17 @@ package graph
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
+
+// ErrNotFound reports that a node with the requested id does not exist, as
+// opposed to the read itself failing. Callers match it with errors.Is to tell an
+// absent node from an unreachable database.
+var ErrNotFound = errors.New("node not found")
 
 // Node labels. The abstraction node is conceptually "Meta-Heuristic"; the graph
 // uses the hyphen-free MetaHeuristic label so no Cypher needs backtick quoting,
@@ -18,6 +24,11 @@ const (
 	labelOutcome       = "Outcome"
 	labelMetaHeuristic = "MetaHeuristic"
 )
+
+// goal_id and sleep_derived are deliberately written as top-level node
+// properties rather than entries in the marshalProps JSON blob: the
+// eligible-finding query MATCHes on them, and the Neptune-portable Cypher subset
+// this package is restricted to cannot filter inside a JSON string property.
 
 // Neo4jRepository is the Cypher-backed Repository implementation.
 type Neo4jRepository struct {
@@ -68,8 +79,8 @@ func (r *Neo4jRepository) CreateState(ctx context.Context, s domain.State) error
 	}
 	return r.writeOp(ctx, "create state "+s.ID, func(tx neo4j.ManagedTransaction) (any, error) {
 		return tx.Run(ctx,
-			"MERGE (n:"+labelState+" {id: $id}) SET n.properties = $properties",
-			map[string]any{"id": s.ID, "properties": props},
+			"MERGE (n:"+labelState+" {id: $id}) SET n.goal_id = $goalID, n.properties = $properties",
+			map[string]any{"id": s.ID, "goalID": s.GoalID, "properties": props},
 		)
 	})
 }
@@ -81,8 +92,15 @@ func (r *Neo4jRepository) CreateIntervention(ctx context.Context, i domain.Inter
 	}
 	return r.writeOp(ctx, "create intervention "+i.ID, func(tx neo4j.ManagedTransaction) (any, error) {
 		return tx.Run(ctx,
-			"MERGE (n:"+labelIntervention+" {id: $id}) SET n.type = $type, n.properties = $properties",
-			map[string]any{"id": i.ID, "type": string(i.Type), "properties": props},
+			"MERGE (n:"+labelIntervention+" {id: $id}) "+
+				"SET n.goal_id = $goalID, n.type = $type, n.sleep_derived = $sleepDerived, n.properties = $properties",
+			map[string]any{
+				"id":           i.ID,
+				"goalID":       i.GoalID,
+				"type":         string(i.Type),
+				"sleepDerived": i.SleepDerived,
+				"properties":   props,
+			},
 		)
 	})
 }
@@ -99,9 +117,10 @@ func (r *Neo4jRepository) CreateOutcome(ctx context.Context, o domain.Outcome) e
 	return r.writeOp(ctx, "create outcome "+o.ID, func(tx neo4j.ManagedTransaction) (any, error) {
 		return tx.Run(ctx,
 			"MERGE (n:"+labelOutcome+" {id: $id}) "+
-				"SET n.verification_status = $status, n.value = $value, n.provenance = $provenance",
+				"SET n.goal_id = $goalID, n.verification_status = $status, n.value = $value, n.provenance = $provenance",
 			map[string]any{
 				"id":         o.ID,
+				"goalID":     o.GoalID,
 				"status":     string(o.VerificationStatus),
 				"value":      value,
 				"provenance": provenance,
@@ -115,11 +134,7 @@ func (r *Neo4jRepository) GetState(ctx context.Context, id string) (domain.State
 	if err != nil {
 		return domain.State{}, err
 	}
-	props, err := unmarshalProps(node.Props["properties"])
-	if err != nil {
-		return domain.State{}, err
-	}
-	return domain.State{ID: id, Properties: props}, nil
+	return stateFromNode(id, node)
 }
 
 func (r *Neo4jRepository) GetIntervention(ctx context.Context, id string) (domain.Intervention, error) {
@@ -127,12 +142,7 @@ func (r *Neo4jRepository) GetIntervention(ctx context.Context, id string) (domai
 	if err != nil {
 		return domain.Intervention{}, err
 	}
-	props, err := unmarshalProps(node.Props["properties"])
-	if err != nil {
-		return domain.Intervention{}, err
-	}
-	typ, _ := node.Props["type"].(string)
-	return domain.Intervention{ID: id, Type: domain.InterventionType(typ), Properties: props}, nil
+	return interventionFromNode(id, node)
 }
 
 func (r *Neo4jRepository) GetOutcome(ctx context.Context, id string) (domain.Outcome, error) {
@@ -151,6 +161,14 @@ func (r *Neo4jRepository) GetMetaHeuristic(ctx context.Context, id string) (doma
 	return metaHeuristicFromNode(node), nil
 }
 
+// getNode fetches one node by label and application-assigned id, wrapping a miss
+// in ErrNotFound.
+//
+// The zero/duplicate branch is decided by collecting rows rather than by
+// inspecting the driver's error: Result.Single reports both "no records" and
+// "more than one record" as the same *UsageError type, whose only field is a
+// message string, and neither IsNeo4jError nor IsUsageError separates them.
+// Matching on that message would be undocumented, brittle API surface.
 func (r *Neo4jRepository) getNode(ctx context.Context, label, id string) (neo4j.Node, error) {
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,
@@ -160,14 +178,28 @@ func (r *Neo4jRepository) getNode(ctx context.Context, label, id string) (neo4j.
 		if err != nil {
 			return nil, err
 		}
-		rec, err := result.Single(ctx)
+		recs, err := result.Collect(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return recordNode(rec, "n")
+		switch len(recs) {
+		case 0:
+			// A miss is returned as a nil value, not an error: the driver treats any
+			// error out of a transaction function as "the client wants to roll back"
+			// and skips the commit, so signalling the normal first-run case that way
+			// would cost a RESET round-trip on every lookup that finds nothing.
+			return nil, nil
+		case 1:
+			return recordNode(recs[0], "n")
+		default:
+			return nil, fmt.Errorf("id resolves to %d nodes", len(recs))
+		}
 	})
 	if err != nil {
 		return neo4j.Node{}, fmt.Errorf("get %s %q: %w", label, id, err)
+	}
+	if res == nil {
+		return neo4j.Node{}, fmt.Errorf("get %s %q: %w", label, id, ErrNotFound)
 	}
 	return res.(neo4j.Node), nil
 }
@@ -232,11 +264,17 @@ func (r *Neo4jRepository) CreateMetaHeuristic(ctx context.Context, mh domain.Met
 			}
 		}
 
+		// MERGE, not CREATE: a re-run after a mid-write crash must re-write the same
+		// node rather than fail the uniqueness constraint. ON MATCH deliberately
+		// leaves embedding_pending alone -- resurrecting a cleared flag would make a
+		// finished abstraction look unprocessed and re-embed it forever.
 		result, err := tx.Run(ctx,
-			"CREATE (m:"+labelMetaHeuristic+" {id: $id, definition: $definition, embedding_pending: true}) "+
+			"MERGE (m:"+labelMetaHeuristic+" {id: $id}) "+
+				"ON CREATE SET m.definition = $definition, m.embedding_pending = true "+
+				"ON MATCH SET m.definition = $definition "+
 				"WITH m UNWIND $ids AS targetId "+
 				"MATCH (t {id: targetId}) "+
-				"CREATE (m)-[:"+domain.AbstractedFrom+"]->(t) "+
+				"MERGE (m)-[:"+domain.AbstractedFrom+"]->(t) "+
 				"RETURN count(*) AS edges",
 			map[string]any{"id": mh.ID, "definition": mh.Definition, "ids": abstractedFrom},
 		)
@@ -285,6 +323,74 @@ func (r *Neo4jRepository) ListEmbeddingPending(ctx context.Context) ([]domain.Me
 		return nil, fmt.Errorf("list embedding-pending meta-heuristics: %w", err)
 	}
 	return res.([]domain.MetaHeuristic), nil
+}
+
+func (r *Neo4jRepository) ListEligibleFindings(ctx context.Context, goalID string) ([]CausalTriplet, error) {
+	statuses := make([]string, 0, len(domain.SearchEligibleStatuses))
+	for _, s := range domain.SearchEligibleStatuses {
+		statuses = append(statuses, string(s))
+	}
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (s:"+labelState+")-[:"+domain.PreConditionFor+"]->(i:"+labelIntervention+")-[:"+domain.Produced+"]->(o:"+labelOutcome+") "+
+				"WHERE i.goal_id = $goalID "+
+				"AND (i.sleep_derived IS NULL OR i.sleep_derived = false) "+
+				"AND o.verification_status IN $statuses "+
+				"RETURN s, i, o",
+			map[string]any{"goalID": goalID, "statuses": statuses},
+		)
+		if err != nil {
+			return nil, err
+		}
+		recs, err := result.Collect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		triplets := make([]CausalTriplet, 0, len(recs))
+		for _, rec := range recs {
+			triplet, err := tripletFromRecord(rec)
+			if err != nil {
+				return nil, err
+			}
+			triplets = append(triplets, triplet)
+		}
+		return triplets, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list eligible findings for %q: %w", goalID, err)
+	}
+	return res.([]CausalTriplet), nil
+}
+
+func (r *Neo4jRepository) MarkStaleMetaHeuristics(ctx context.Context, goalID string) (int, error) {
+	res, err := r.write(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		// Recompute the flag rather than only ever setting it, so the sweep is
+		// idempotent and self-correcting: an analyst who corrects a rejected
+		// outcome makes that evidence eligible again, and a set-only sweep would
+		// leave the heuristic suppressed forever with no writer to clear it.
+		result, err := tx.Run(ctx,
+			"MATCH (m:"+labelMetaHeuristic+")-[:"+domain.AbstractedFrom+"]->(o:"+labelOutcome+") "+
+				"WHERE o.goal_id = $goalID "+
+				"WITH m, sum(CASE WHEN o.verification_status = $rejected THEN 1 ELSE 0 END) AS rejectedComponents "+
+				"SET m.stale = rejectedComponents > 0 "+
+				"RETURN count(CASE WHEN rejectedComponents > 0 THEN 1 END) AS marked",
+			map[string]any{"goalID": goalID, "rejected": string(domain.VerificationRejected)},
+		)
+		if err != nil {
+			return nil, err
+		}
+		rec, err := result.Single(ctx)
+		if err != nil {
+			return nil, err
+		}
+		marked, _ := rec.Get("marked")
+		count, _ := marked.(int64)
+		return int(count), nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("mark stale meta-heuristics for %q: %w", goalID, err)
+	}
+	return res.(int), nil
 }
 
 func (r *Neo4jRepository) UpdateOutcomeVerification(ctx context.Context, outcomeID string, status domain.VerificationStatus, confidence float64) error {
@@ -342,11 +448,11 @@ func tripletFromRecord(rec *neo4j.Record) (CausalTriplet, error) {
 	if err != nil {
 		return CausalTriplet{}, err
 	}
-	sProps, err := unmarshalProps(sNode.Props["properties"])
+	state, err := stateFromNode(stringProp(sNode.Props["id"]), sNode)
 	if err != nil {
 		return CausalTriplet{}, err
 	}
-	iProps, err := unmarshalProps(iNode.Props["properties"])
+	intervention, err := interventionFromNode(stringProp(iNode.Props["id"]), iNode)
 	if err != nil {
 		return CausalTriplet{}, err
 	}
@@ -354,21 +460,42 @@ func tripletFromRecord(rec *neo4j.Record) (CausalTriplet, error) {
 	if err != nil {
 		return CausalTriplet{}, err
 	}
-	iType, _ := iNode.Props["type"].(string)
-	return CausalTriplet{
-		State:        domain.State{ID: stringProp(sNode.Props["id"]), Properties: sProps},
-		Intervention: domain.Intervention{ID: stringProp(iNode.Props["id"]), Type: domain.InterventionType(iType), Properties: iProps},
-		Outcome:      outcome,
+	return CausalTriplet{State: state, Intervention: intervention, Outcome: outcome}, nil
+}
+
+func stateFromNode(id string, node neo4j.Node) (domain.State, error) {
+	props, err := unmarshalProps(node.Props["properties"])
+	if err != nil {
+		return domain.State{}, err
+	}
+	return domain.State{ID: id, GoalID: stringProp(node.Props["goal_id"]), Properties: props}, nil
+}
+
+func interventionFromNode(id string, node neo4j.Node) (domain.Intervention, error) {
+	props, err := unmarshalProps(node.Props["properties"])
+	if err != nil {
+		return domain.Intervention{}, err
+	}
+	typ, _ := node.Props["type"].(string)
+	sleepDerived, _ := node.Props["sleep_derived"].(bool)
+	return domain.Intervention{
+		ID:           id,
+		GoalID:       stringProp(node.Props["goal_id"]),
+		Type:         domain.InterventionType(typ),
+		SleepDerived: sleepDerived,
+		Properties:   props,
 	}, nil
 }
 
 func metaHeuristicFromNode(node neo4j.Node) domain.MetaHeuristic {
 	def, _ := node.Props["definition"].(string)
 	pending, _ := node.Props["embedding_pending"].(bool)
+	stale, _ := node.Props["stale"].(bool)
 	return domain.MetaHeuristic{
 		ID:               stringProp(node.Props["id"]),
 		Definition:       def,
 		EmbeddingPending: pending,
+		Stale:            stale,
 	}
 }
 
@@ -384,6 +511,7 @@ func outcomeFromNode(id string, node neo4j.Node) (domain.Outcome, error) {
 	status, _ := node.Props["verification_status"].(string)
 	return domain.Outcome{
 		ID:                 id,
+		GoalID:             stringProp(node.Props["goal_id"]),
 		VerificationStatus: domain.VerificationStatus(status),
 		Value:              value,
 		Provenance:         provenance,

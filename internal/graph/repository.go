@@ -58,4 +58,17 @@ type Repository interface {
 	// TraceCausalChain walks ABSTRACTED_FROM from a Meta-Heuristic back to the
 	// State/Intervention/Outcome triplet(s) that support it.
 	TraceCausalChain(ctx context.Context, metaHeuristicID string) ([]CausalTriplet, error)
+
+	// ListEligibleFindings returns the Sleep-Cycle search's input set for one
+	// goal: complete State→Intervention→Outcome paths that are not sleep-derived
+	// (a prior run's macro-segments are search outputs, not atomic inputs) and
+	// whose outcome status is search-eligible (domain.SearchEligibleStatuses).
+	ListEligibleFindings(ctx context.Context, goalID string) ([]CausalTriplet, error)
+
+	// MarkStaleMetaHeuristics flags every Meta-Heuristic for a goal whose
+	// ABSTRACTED_FROM components include a rejected Outcome, returning how many
+	// were marked. It triggers on rejected only -- deliberately not corrected,
+	// which domain.SearchEligibleStatuses admits, so a corrected-triggering sweep
+	// would flag the worker's own fresh output on the very next run.
+	MarkStaleMetaHeuristics(ctx context.Context, goalID string) (int, error)
 }
