@@ -2,6 +2,8 @@ package heuristics_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/arborette/arborette/internal/domain"
@@ -83,4 +85,269 @@ func mustCreate(t *testing.T, err error) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+}
+
+// The drift tests below run on fakes: the retire contract turns on faults the
+// live stores cannot be made to produce on cue -- a delete that fails for one
+// id, a graph that is unreachable rather than empty, and a cancel landing
+// mid-batch.
+
+type fakeProvider struct {
+	embedErr error
+}
+
+func (f fakeProvider) EmbedQuery(_ context.Context, _ string) ([]float32, error) {
+	if f.embedErr != nil {
+		return nil, f.embedErr
+	}
+	return []float32{0.1, 0.2}, nil
+}
+func (f fakeProvider) EmbedDocument(_ context.Context, _ string) ([]float32, error) {
+	if f.embedErr != nil {
+		return nil, f.embedErr
+	}
+	return []float32{0.1, 0.2}, nil
+}
+func (fakeProvider) Dimensions() int { return 2 }
+
+// fakeEmbeddings records attempted deletes separately from successful ones: a
+// delete that fails still proves the retire was reached, which is what pins the
+// corroboration threshold, and the two lists diverging is what pins that one
+// failure does not abandon the rest of the batch.
+//
+// Both methods honour the context they are handed. That is what makes the
+// retire's detachment from the request observable -- without it, dropping the
+// detachment entirely would leave every test still passing.
+type fakeEmbeddings struct {
+	hits         []string
+	attempted    []string
+	deleted      []string
+	searchErr    error
+	deleteErr    error
+	deleteErrFor map[string]error
+}
+
+func (f *fakeEmbeddings) SimilaritySearch(ctx context.Context, _ []float32, _ int) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
+	return f.hits, nil
+}
+
+func (f *fakeEmbeddings) Delete(ctx context.Context, nodeID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.attempted = append(f.attempted, nodeID)
+	if err := f.deleteErrFor[nodeID]; err != nil {
+		return err
+	}
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deleted = append(f.deleted, nodeID)
+	return nil
+}
+
+// fakeRepo resolves only the ids in present, and reports every other id the way
+// the Neo4j repository does -- ErrNotFound wrapped in context, so the caller is
+// forced to unwrap rather than compare against the bare sentinel.
+type fakeRepo struct {
+	present  map[string]domain.MetaHeuristic
+	failWith error
+	// onLookup runs before each answer, so a test can cancel the request context
+	// partway through the batch the way a disconnecting client would.
+	onLookup func()
+}
+
+func (f *fakeRepo) GetMetaHeuristic(_ context.Context, id string) (domain.MetaHeuristic, error) {
+	if f.onLookup != nil {
+		f.onLookup()
+	}
+	if f.failWith != nil {
+		return domain.MetaHeuristic{}, fmt.Errorf("get MetaHeuristic %q: %w", id, f.failWith)
+	}
+	if mh, ok := f.present[id]; ok {
+		return mh, nil
+	}
+	return domain.MetaHeuristic{}, fmt.Errorf("get MetaHeuristic %q: %w", id, graph.ErrNotFound)
+}
+
+func (f *fakeRepo) TraceCausalChain(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
+	return nil, nil
+}
+
+// TestQuerySkipsAndRetiresOrphanedEmbedding: a single embedding whose node the
+// graph no longer has must not fail the search that happens to rank it, and must
+// be retired so the stores reconverge.
+func TestQuerySkipsAndRetiresOrphanedEmbedding(t *testing.T) {
+	embeddings := &fakeEmbeddings{hits: []string{"live-a", "orphan", "live-b"}}
+	repo := &fakeRepo{present: map[string]domain.MetaHeuristic{
+		"live-a": {ID: "live-a"},
+		"live-b": {ID: "live-b"},
+	}}
+	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
+
+	matches, err := svc.Query(context.Background(), "any state", 3)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(matches) != 2 || matches[0].MetaHeuristic.ID != "live-a" || matches[1].MetaHeuristic.ID != "live-b" {
+		t.Fatalf("expected the two live heuristics in rank order, got %+v", matches)
+	}
+	if len(embeddings.deleted) != 1 || embeddings.deleted[0] != "orphan" {
+		t.Fatalf("expected only the orphan retired, got %v", embeddings.deleted)
+	}
+}
+
+// TestQueryKeepsOrphansWhenNothingResolves is the guard against the cascade. An
+// empty-but-healthy graph reports every id as not-found, and treating that as
+// per-row drift would delete the whole table -- unrecoverably, since resume keys
+// off embedding_pending, already false for anything embedded.
+func TestQueryKeepsOrphansWhenNothingResolves(t *testing.T) {
+	embeddings := &fakeEmbeddings{hits: []string{"orphan-a", "orphan-b"}}
+	svc := heuristics.NewService(fakeProvider{}, embeddings, &fakeRepo{})
+
+	matches, err := svc.Query(context.Background(), "any state", 2)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no matches, got %+v", matches)
+	}
+	if len(embeddings.deleted) != 0 {
+		t.Fatalf("expected no embedding retired without a live match, got %v", embeddings.deleted)
+	}
+}
+
+// TestQueryPropagatesGraphFailure separates drift from breakage: an unreachable
+// graph must fail the request, never be reported as an empty corpus and acted on
+// by deleting the embeddings that were about to resolve.
+func TestQueryPropagatesGraphFailure(t *testing.T) {
+	embeddings := &fakeEmbeddings{hits: []string{"live-a"}}
+	repo := &fakeRepo{failWith: errors.New("connection refused")}
+	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
+
+	if _, err := svc.Query(context.Background(), "any state", 1); err == nil {
+		t.Fatal("expected a transport failure to propagate")
+	}
+	if len(embeddings.deleted) != 0 {
+		t.Fatalf("expected no embedding retired on a transport failure, got %v", embeddings.deleted)
+	}
+}
+
+// TestQuerySurvivesRetireFailure keeps the cleanup subordinate to the answer: a
+// search that found live heuristics is still a good search when the repair fails.
+// Its batch holds exactly one live match, so the `attempted` assertion is also
+// what pins a single live sibling as sufficient corroboration to retire at all.
+func TestQuerySurvivesRetireFailure(t *testing.T) {
+	embeddings := &fakeEmbeddings{hits: []string{"live-a", "orphan"}, deleteErr: errors.New("permission denied")}
+	repo := &fakeRepo{present: map[string]domain.MetaHeuristic{"live-a": {ID: "live-a"}}}
+	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
+
+	matches, err := svc.Query(context.Background(), "any state", 2)
+	if err != nil {
+		t.Fatalf("expected the search to survive a failed retire, got %v", err)
+	}
+	if len(embeddings.attempted) != 1 || embeddings.attempted[0] != "orphan" {
+		t.Fatalf("expected the orphan retire to be attempted, got %v", embeddings.attempted)
+	}
+	if len(matches) != 1 || matches[0].MetaHeuristic.ID != "live-a" {
+		t.Fatalf("expected the live heuristic, got %+v", matches)
+	}
+}
+
+// TestQueryRetiresRestOfBatchAfterOneFailure pins that the retire loop treats
+// each orphan independently. A row that cannot be deleted -- locked, or racing
+// another reader -- must not strand the rest of the batch, or drift would only
+// ever clear behind whichever id happens to sort first.
+func TestQueryRetiresRestOfBatchAfterOneFailure(t *testing.T) {
+	embeddings := &fakeEmbeddings{
+		hits:         []string{"live-a", "orphan-a", "orphan-b"},
+		deleteErrFor: map[string]error{"orphan-a": errors.New("row locked")},
+	}
+	repo := &fakeRepo{present: map[string]domain.MetaHeuristic{"live-a": {ID: "live-a"}}}
+	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
+
+	matches, err := svc.Query(context.Background(), "any state", 3)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(matches) != 1 || matches[0].MetaHeuristic.ID != "live-a" {
+		t.Fatalf("expected the live heuristic, got %+v", matches)
+	}
+	if len(embeddings.attempted) != 2 || embeddings.attempted[0] != "orphan-a" || embeddings.attempted[1] != "orphan-b" {
+		t.Fatalf("expected both orphans attempted, got %v", embeddings.attempted)
+	}
+	if len(embeddings.deleted) != 1 || embeddings.deleted[0] != "orphan-b" {
+		t.Fatalf("expected only the non-failing orphan retired, got %v", embeddings.deleted)
+	}
+}
+
+// TestQueryRetiresAfterRequestCancelled is the detachment contract: the repair is
+// justified by a graph read that already happened, so a client hanging up
+// mid-batch must not leave the drift in place for the next search to rediscover.
+func TestQueryRetiresAfterRequestCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	embeddings := &fakeEmbeddings{hits: []string{"live-a", "orphan"}}
+	repo := &fakeRepo{
+		present:  map[string]domain.MetaHeuristic{"live-a": {ID: "live-a"}},
+		onLookup: cancel,
+	}
+	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
+
+	if _, err := svc.Query(ctx, "any state", 2); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(embeddings.deleted) != 1 || embeddings.deleted[0] != "orphan" {
+		t.Fatalf("expected the orphan retired despite cancellation, got %v", embeddings.deleted)
+	}
+}
+
+// TestQueryEmptyCorpus is the healthy-but-empty case: no hits is an empty answer,
+// not an error, and there is nothing to retire.
+func TestQueryEmptyCorpus(t *testing.T) {
+	embeddings := &fakeEmbeddings{}
+	svc := heuristics.NewService(fakeProvider{}, embeddings, &fakeRepo{})
+
+	matches, err := svc.Query(context.Background(), "any state", 10)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no matches, got %+v", matches)
+	}
+	if len(embeddings.attempted) != 0 {
+		t.Fatalf("expected no retire attempt on an empty corpus, got %v", embeddings.attempted)
+	}
+}
+
+// TestQueryPropagatesPreSearchFailures covers the two paths that fail before any
+// hit is resolved, so neither can be mistaken for an empty corpus.
+func TestQueryPropagatesPreSearchFailures(t *testing.T) {
+	t.Run("embed", func(t *testing.T) {
+		embeddings := &fakeEmbeddings{hits: []string{"live-a"}}
+		svc := heuristics.NewService(fakeProvider{embedErr: errors.New("ollama down")}, embeddings, &fakeRepo{})
+		if _, err := svc.Query(context.Background(), "any state", 1); err == nil {
+			t.Fatal("expected an embed failure to propagate")
+		}
+		if len(embeddings.attempted) != 0 {
+			t.Fatalf("expected no retire attempt, got %v", embeddings.attempted)
+		}
+	})
+	t.Run("similarity search", func(t *testing.T) {
+		embeddings := &fakeEmbeddings{searchErr: errors.New("pgvector down")}
+		svc := heuristics.NewService(fakeProvider{}, embeddings, &fakeRepo{})
+		if _, err := svc.Query(context.Background(), "any state", 1); err == nil {
+			t.Fatal("expected a similarity-search failure to propagate")
+		}
+		if len(embeddings.attempted) != 0 {
+			t.Fatalf("expected no retire attempt, got %v", embeddings.attempted)
+		}
+	})
 }

@@ -6,29 +6,53 @@ package heuristics
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
+	"time"
 
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/embedding"
 	"github.com/arborette/arborette/internal/graph"
-	"github.com/arborette/arborette/internal/store"
 )
+
+// retireTimeout is the ceiling on how much cleanup latency a caller can be made
+// to wait for: the deletes run before Query returns, so a slow pgvector is added
+// response time.
+const retireTimeout = 5 * time.Second
 
 // Match is one semantic Meta-Heuristic result, ordered by similarity.
 type Match struct {
 	MetaHeuristic domain.MetaHeuristic
 }
 
+// The interfaces below are the narrow contracts the Service depends on, defined
+// at the consumer so Query is unit-testable with fakes and no infra.
+// cmd/orchestrator and cmd/mcpserver pass the concrete *store.EmbeddingStore and
+// *graph.Neo4jRepository, which satisfy them.
+
+// embeddingStore is the vector surface this seam needs: the similarity search
+// itself, plus the delete that retires a row the graph no longer backs.
+type embeddingStore interface {
+	SimilaritySearch(ctx context.Context, query []float32, k int) ([]string, error)
+	Delete(ctx context.Context, nodeID string) error
+}
+
+type heuristicRepo interface {
+	GetMetaHeuristic(ctx context.Context, id string) (domain.MetaHeuristic, error)
+	TraceCausalChain(ctx context.Context, metaHeuristicID string) ([]graph.CausalTriplet, error)
+}
+
 // Service answers get_optimized_heuristics and trace_causal_chain over the
 // graph and vector stores.
 type Service struct {
 	provider   embedding.Provider
-	embeddings *store.EmbeddingStore
-	repo       graph.Repository
+	embeddings embeddingStore
+	repo       heuristicRepo
 }
 
 // NewService wires the query service from its three collaborators.
-func NewService(provider embedding.Provider, embeddings *store.EmbeddingStore, repo graph.Repository) *Service {
+func NewService(provider embedding.Provider, embeddings embeddingStore, repo heuristicRepo) *Service {
 	return &Service{provider: provider, embeddings: embeddings, repo: repo}
 }
 
@@ -37,6 +61,12 @@ func NewService(provider embedding.Provider, embeddings *store.EmbeddingStore, r
 // Meta-Heuristic nodes from the graph -- the read side of
 // get_optimized_heuristics. Stored definitions are embedded via EmbedDocument
 // when the Sleep Cycle writes them, keeping the query/document sides consistent.
+//
+// A hit whose node is gone is skipped rather than failed: one such row would
+// otherwise blank out every search whose neighbourhood touches it. Only the
+// not-found sentinel is treated that way -- a transport fault still propagates,
+// because answering "no such heuristic" when the graph is merely unreachable
+// would silently narrow the corpus.
 func (s *Service) Query(ctx context.Context, stateString string, k int) ([]Match, error) {
 	vec, err := s.provider.EmbedQuery(ctx, stateString)
 	if err != nil {
@@ -47,14 +77,76 @@ func (s *Service) Query(ctx context.Context, stateString string, k int) ([]Match
 		return nil, fmt.Errorf("similarity search: %w", err)
 	}
 	matches := make([]Match, 0, len(ids))
+	var orphaned []string
 	for _, id := range ids {
 		mh, err := s.repo.GetMetaHeuristic(ctx, id)
-		if err != nil {
+		switch {
+		case errors.Is(err, graph.ErrNotFound):
+			orphaned = append(orphaned, id)
+			continue
+		case err != nil:
 			return nil, fmt.Errorf("fetch meta-heuristic %q: %w", id, err)
 		}
 		matches = append(matches, Match{MetaHeuristic: mh})
 	}
+	s.retireOrphans(ctx, orphaned, len(matches))
 	return matches, nil
+}
+
+// retireOrphans deletes the pgvector rows behind similarity hits the graph has
+// no node for, so the two stores reconverge on read. They are written
+// separately and the graph can be reset on its own, which is how a row outlives
+// its node.
+//
+// It repairs nothing unless some other hit in the same batch resolved. Per hit,
+// "this node is gone" and "the whole graph is gone" are the same observation,
+// and deleting on the second reading would empty a table nothing regenerates --
+// resume keys off embedding_pending, already false for anything embedded. One
+// live sibling is the cheap proof that the miss is really about this id.
+//
+// That proof is per-batch, not per-goal, and abstraction runs one goal at a
+// time: a live hit from an already-abstracted goal will corroborate retiring a
+// goal whose nodes have not been rebuilt yet. Narrowing it needs a goal on the
+// embedding row, which the table does not carry.
+//
+// Deletion is best-effort past that point. A search that found live heuristics
+// is a good answer, and failing it because the cleanup failed would turn a
+// self-healing read into the outage it exists to prevent.
+func (s *Service) retireOrphans(ctx context.Context, orphaned []string, live int) {
+	if len(orphaned) == 0 {
+		return
+	}
+	if live == 0 {
+		log.Printf("heuristics: retire %d orphaned embedding(s): skipped, no live match corroborates a populated graph", len(orphaned))
+		return
+	}
+	// Cancellation is dropped deliberately: a client that hangs up mid-batch must
+	// not leave a half-done repair for the next search to re-derive. WithoutCancel
+	// rather than Background so request-scoped values survive.
+	retireCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), retireTimeout)
+	defer cancel()
+
+	var retiredIDs []string
+	var firstErr error
+	for _, id := range orphaned {
+		if err := s.embeddings.Delete(retireCtx, id); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%q: %w", id, err)
+			}
+			continue
+		}
+		retiredIDs = append(retiredIDs, id)
+	}
+	// Naming every failure would hand an unauthenticated caller a log amplifier,
+	// since one revoked grant fails every delete in the batch.
+	if firstErr != nil {
+		log.Printf("heuristics: retire %d orphaned embedding(s): %d retired %v, first failure %v",
+			len(orphaned), len(retiredIDs), retiredIDs, firstErr)
+		return
+	}
+	// Ids, not a count: this line is the only record of what an operator would
+	// have to re-embed.
+	log.Printf("heuristics: retired %d orphaned embedding(s) with no graph node: %v", len(retiredIDs), retiredIDs)
 }
 
 // Trace delegates to the repository's ABSTRACTED_FROM traversal for

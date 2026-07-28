@@ -1,7 +1,8 @@
 // Package graph is the single seam every graph-touching service shares for
-// Neo4j access. Callers depend on Repository, never on the driver directly, so
-// a future swap to Amazon Neptune is a new implementation of this interface
-// rather than a rewrite across services. All Cypher is restricted to a
+// Neo4j access. Nothing outside this package touches the driver: callers depend
+// on Repository or on a narrower interface they declare themselves, so a future
+// swap to Amazon Neptune is a new implementation behind those interfaces rather
+// than a rewrite across services. All Cypher is restricted to a
 // Neptune-portable openCypher subset (MERGE/MATCH/CREATE/SET, parameterized
 // maps) with no APOC or db.* procedures, and every node is keyed on an
 // application-assigned UUID id property (never the driver's internal element id).
@@ -21,8 +22,11 @@ type CausalTriplet struct {
 	Outcome      domain.Outcome
 }
 
-// Repository is the graph abstraction shared by the Orchestrator, MCP Server,
-// and Sleep-Cycle Worker.
+// Repository is the whole Cypher surface, wider than any single caller uses:
+// only the Orchestrator's Server depends on it as a unit, and it exercises the
+// triplet writes alone. Every method added here has to be stubbed by that
+// Server's fakes whether or not the Server calls it, so prefer a narrow
+// contract at a new call site over widening this.
 type Repository interface {
 	// Node upserts, keyed on the application-assigned id.
 	CreateState(ctx context.Context, s domain.State) error

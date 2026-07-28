@@ -49,6 +49,15 @@
   by `trace_causal_chain` while returning nothing from `get_optimized_heuristics`.
   Never compare an embeddings-table observation taken before the gate with one
   taken after; re-publish (or re-embed) before drawing conclusions.
+- The graph side is not left alone either: the suite seeds fixture
+  `MetaHeuristic` nodes into the shared dev Neo4j and never removes them, so
+  residue accumulates run over run (a real instance reached 169 of 194 nodes,
+  from the `"abstraction"` and `"reducing threshold restores latency"` fixtures
+  among others). Combined with the truncate above, one `make test` leaves the two
+  stores diverged in **both** directions — nodes with no embedding, and stale
+  embeddings whose fixture node was seeded by an earlier run. When judging drift,
+  filter fixture definitions out first; when verifying against the live stack,
+  expect to restore the corpus after every gate run.
 - Audit records carry their detail as `map[string]any`, so a nil slice or a typed
   nil pointer stored in one is never `== nil`. Assert on content (length, a
   specific id) rather than `detail["k"] != nil`, which passes even when the value

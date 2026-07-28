@@ -514,7 +514,8 @@ func TestEmbeddingGrants(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
 
-	// orchestrator: SELECT only on embeddings.
+	// orchestrator: SELECT + DELETE on embeddings, no INSERT/UPDATE. It retires
+	// rows the graph no longer backs; it never writes one.
 	orchestrator := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
 	var count int
 	if err := orchestrator.QueryRow(ctx, "SELECT count(*) FROM meta_heuristic_embeddings").Scan(&count); err != nil {
@@ -527,7 +528,7 @@ func TestEmbeddingGrants(t *testing.T) {
 		t.Fatal("expected orchestrator INSERT on embeddings to be denied")
 	}
 
-	// service: SELECT/INSERT/UPDATE on embeddings.
+	// service: SELECT/INSERT/UPDATE/DELETE on embeddings.
 	service := pool(t, ctx, cfg.Postgres.ServiceDSN())
 	embeddings := store.NewEmbeddingStore(service)
 	nodeID := testutil.NewID(t)
@@ -536,5 +537,40 @@ func TestEmbeddingGrants(t *testing.T) {
 	}
 	if err := embeddings.Upsert(ctx, nodeID, vec768(0.3)); err != nil {
 		t.Fatalf("service update embedding: %v", err)
+	}
+	if err := embeddings.Delete(ctx, nodeID); err != nil {
+		t.Fatalf("service delete embedding: %v", err)
+	}
+	// The two seams can race on one orphan, so the loser must not see an error.
+	if err := embeddings.Delete(ctx, nodeID); err != nil {
+		t.Fatalf("service re-delete embedding: %v", err)
+	}
+
+	// Both seams retire on read as different roles, so DELETE has to reach each
+	// one or the repair only logs.
+	orphanID := testutil.NewID(t)
+	if err := embeddings.Upsert(ctx, orphanID, vec768(0.4)); err != nil {
+		t.Fatalf("seed orphan embedding: %v", err)
+	}
+	if err := store.NewEmbeddingStore(orchestrator).Delete(ctx, orphanID); err != nil {
+		t.Fatalf("orchestrator delete embedding: %v", err)
+	}
+	if err := orchestrator.QueryRow(ctx,
+		"SELECT count(*) FROM meta_heuristic_embeddings WHERE node_id = $1", orphanID,
+	).Scan(&count); err != nil {
+		t.Fatalf("orchestrator count after delete: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected the orphan row gone, found %d", count)
+	}
+
+	// 0008 widened the orchestrator to DELETE only. UPDATE is the neighbouring
+	// privilege a `GRANT DELETE, UPDATE` slip would have added silently, and the
+	// INSERT denial above would not catch it.
+	if _, err := orchestrator.Exec(ctx,
+		"UPDATE meta_heuristic_embeddings SET embedding = $1 WHERE node_id = $2",
+		pgvector.NewVector(vec768(0.5)), nodeID,
+	); err == nil {
+		t.Fatal("expected orchestrator UPDATE on embeddings to be denied")
 	}
 }
