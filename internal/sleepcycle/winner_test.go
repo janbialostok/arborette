@@ -5,7 +5,6 @@ import (
 
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/graph"
-	"github.com/arborette/arborette/internal/objective"
 )
 
 // TestOrderOneNodeIsNeverAWinner: the output is defined as conjunctions, so an
@@ -69,7 +68,7 @@ func TestOrderTwoNodeWithTheSameValueWins(t *testing.T) {
 // would reject. A sub-floor finding — however good its value — must not set S*,
 // and a legacy outcome with no recorded support reads as 0 and self-excludes.
 func TestBestSingleSegmentHoldsTheSupportFloor(t *testing.T) {
-	obj := objective.Objective{Label: testObjectiveLabel, Direction: domain.Maximize}
+	obj := objectiveFor(t, domain.Maximize)
 	// The at-floor finding carries the best floor-clearing value, so the
 	// inclusive boundary is discriminated: a <= regression would exclude it and
 	// hand S* to the dominated 4.0.
@@ -94,6 +93,13 @@ func TestBestSingleSegmentHoldsTheSupportFloor(t *testing.T) {
 	}
 	if got := bestSingleSegment(legacy, obj, 30); got != nil {
 		t.Fatalf("S* must be undefined when no finding meets the floor, got %v", *got)
+	}
+	// The exclusion holds at a floor of 0 too. A configured floor of zero means "no
+	// minimum", not "unrecorded support counts as evidence" — the rest of the
+	// package reads a zero row count as no measurement at all, and S* is the bar
+	// deciding what gets written back.
+	if got := bestSingleSegment(legacy, obj, 0); got != nil {
+		t.Fatalf("a support-less finding must not set S* with the floor disabled, got %v", *got)
 	}
 }
 
@@ -127,11 +133,18 @@ func TestRunHoldsBestSingleToTheConfiguredFloor(t *testing.T) {
 
 // TestMaxOrderOneIsDegenerate: with plenty of atoms but an order cap of 1 no
 // conjunction can exist, so the atom count alone would not catch it.
+//
+// The baseline is pinned at the findings' own value so nothing is publishable
+// either — the subject here is the search's degeneracy, and a run that published
+// its Phase-1 findings would still be correct but would stop exercising it.
+// Reaching publication is not evidence the search ran, so search_skipped is what
+// keeps a skipped search visible.
 func TestMaxOrderOneIsDegenerate(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxOrder = 1
 	h := newHarness(t, cfg)
 	h.repo.findings = findingsFor("a", "b", "c", "d", "e")
+	h.sandbox.baseline = 1.0
 
 	if err := h.run(t); err != nil {
 		t.Fatalf("a degenerate run is a successful run, got %v", err)
@@ -145,5 +158,39 @@ func TestMaxOrderOneIsDegenerate(t *testing.T) {
 	}
 	if rec.detail["max_order"] != 1 || rec.detail["atoms"] != 5 {
 		t.Fatalf("the audit must distinguish this case: %+v", rec.detail)
+	}
+	complete, ok := h.audits.find("sleepcycle_run_complete")
+	if !ok {
+		t.Fatalf("expected a run-complete audit: %+v", h.audits.records)
+	}
+	if complete.detail["search_skipped"] == nil {
+		t.Fatalf("a run that never searched must say so: %+v", complete.detail)
+	}
+}
+
+// TestNoConjunctionStillPublishesPhaseOne is the counterpart, and the reason an
+// order cap must not end the run: an unconjoinable goal still knows something
+// worth publishing, and skipping abstraction would leave every one of its
+// measured segments unreachable to a consuming agent.
+func TestNoConjunctionStillPublishesPhaseOne(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxOrder = 1
+	cfg.MinSupport = 30
+	h := newHarness(t, cfg)
+	h.repo.findings = findingsFor("a", "b")
+	h.sandbox.baseline = 0.5
+
+	if err := h.run(t); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if h.sandbox.execCalls != 1 {
+		t.Fatalf("no search should run when no conjunction is formable, got %d executes", h.sandbox.execCalls)
+	}
+	if len(h.repo.heuristics) != 2 {
+		t.Fatalf("both improving findings must publish, got %d heuristics", len(h.repo.heuristics))
+	}
+	complete, _ := h.audits.find("sleepcycle_run_complete")
+	if complete.detail["published"] != 2 {
+		t.Fatalf("published = %v, want 2", complete.detail["published"])
 	}
 }

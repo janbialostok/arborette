@@ -22,6 +22,7 @@ func TestConfigValidationRejectsBadTuning(t *testing.T) {
 		"max order below one":        func(c *Config) { c.MaxOrder = 0 },
 		"negative min support":       func(c *Config) { c.MinSupport = -1 },
 		"negative min lift":          func(c *Config) { c.MinLift = -0.1 },
+		"max publications below one": func(c *Config) { c.MaxPublications = 0 },
 	}
 	for name, breakIt := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -206,7 +207,9 @@ func TestEmptyCountSegmentCannotWin(t *testing.T) {
 	if len(h.repo.interventions) != 0 {
 		t.Fatalf("a zero-row segment must never win: %+v", h.repo.interventions)
 	}
-	if h.claude.abstractCalls != 0 {
+	// Both findings improve on the baseline and are published, so this segment must
+	// be named directly.
+	if h.didAbstract(t, "a", "b") {
 		t.Fatal("a zero-row segment must not reach abstraction")
 	}
 }
@@ -250,20 +253,27 @@ func TestAuditFailuresNeverBreakTheWork(t *testing.T) {
 // is a pure magnitude, so without the improvement test a segment that moves the
 // objective the WRONG way by more than MinLift would clear the bar and be written
 // back as a verified finding contradicted by its own measurement.
+//
+// The finding sits on the wrong side of the baseline so it is not itself
+// publishable. That is load-bearing rather than incidental: a depth-1 finding
+// introducing {a,b} carries that pair as its own effective segment, so a
+// publishable one would be abstracted under the very canonical this test asserts
+// against — naming the segment cannot separate them, and the Claude-call count is
+// the only assertion that can.
 func TestWrongDirectionSegmentNeverWins(t *testing.T) {
 	cfg := testConfig()
 	cfg.MinLift = 0.05
 	cfg.MinSupport = 30
 	h := newHarness(t, cfg)
 	h.goals.goal = minimizeGoal()
-	h.repo.findings = []graph.CausalTriplet{finding("1", 5.0, testObjectiveLabel, "a", "b")}
+	h.repo.findings = []graph.CausalTriplet{finding("1", 15.0, testObjectiveLabel, "a", "b")}
 	h.sandbox.baseline = 10.0
 	h.sandbox.measurements = map[string]sandboxMeasurement{
 		"a": {value: 8.0, support: 100},
 		"b": {value: 9.0, support: 100},
 		// Ten times S* in the wrong direction for a Minimize goal. Its magnitude
 		// clears MinLift nine times over, so only the direction check excludes it.
-		"a+b": {value: 50.0, support: 100},
+		"a+b": {value: 150.0, support: 100},
 	}
 
 	if err := h.run(t); err != nil {

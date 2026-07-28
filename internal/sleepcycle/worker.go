@@ -1,7 +1,9 @@
 // Package sleepcycle is the Sleep-Cycle Worker: a manually-triggered batch job
 // that searches the conjunction lattice of a goal's verified Phase-1 findings for
 // macro-segments beating any single segment, writes each winner back as a full
-// observational triplet, and abstracts it into a domain-agnostic Meta-Heuristic.
+// observational triplet, then selects the best segments the goal knows of —
+// Phase-1 findings and derived winners alike — and abstracts each into a
+// domain-agnostic Meta-Heuristic.
 //
 // It is a one-shot job, not a service: Run does the whole pass and returns.
 package sleepcycle
@@ -52,6 +54,7 @@ type Config struct {
 	MaxOrder        int
 	MinSupport      int
 	MinLift         float64
+	MaxPublications int
 }
 
 func (c Config) validate() error {
@@ -66,6 +69,8 @@ func (c Config) validate() error {
 		return fmt.Errorf("min support must not be negative, got %d", c.MinSupport)
 	case c.MinLift < 0:
 		return fmt.Errorf("min lift must not be negative, got %v", c.MinLift)
+	case c.MaxPublications < 1:
+		return fmt.Errorf("max publications must be at least 1, got %d", c.MaxPublications)
 	}
 	return nil
 }
@@ -160,19 +165,26 @@ type searchTarget struct {
 // Run executes one Sleep Cycle for a goal, in order: settle any prior run's
 // leftovers (staleness sweep, embedding resume), then introspect, pin the
 // objective and measure the global baseline, load the eligible findings, search
-// the lattice, write back the winners, and abstract each one.
+// the lattice, write back the winners, select what to publish, and abstract each
+// selection.
+//
+// Neither search outcome ends the run: the lattice finding nothing to write back
+// says nothing about whether the goal has segments worth publishing. See
+// materiallyBetter for why the two gates must stay separate.
 //
 // Failure disposition is deliberate and differs by stage. The sweep and the
 // resume pass are non-terminal: neither is a prerequisite for producing valid
 // macro-segments, and the resume pass may not even concern this goal. Loading the
 // goal, introspection, pinning, the baseline, and the eligible-finding read are
 // terminal — each is a hard input with nothing meaningful to degrade to. Per
-// candidate and per macro-segment, failures are isolated and the run continues.
+// candidate, per macro-segment, and per publication, failures are isolated and
+// the run continues.
 func (w *Worker) Run(ctx context.Context, goalID string) (err error) {
 	ctx, cancel := context.WithTimeout(ctx, runTimeout)
 	defer cancel()
 
-	winners, measurements := 0, 0
+	winners, measurements, published := 0, 0, 0
+	searchSkipped := ""
 	defer func() {
 		// A panic unwinds with err still nil; recover so a crashed run reports
 		// failed rather than success, and so one run's panic cannot escape the job.
@@ -192,11 +204,19 @@ func (w *Worker) Run(ctx context.Context, goalID string) (err error) {
 			})
 			return
 		}
-		w.report(auditCtx, "sleepcycle_run_complete", "job", map[string]any{
+		detail := map[string]any{
 			"optimization_function_id": goalID,
 			"winners":                  winners,
 			"measurements":             measurements,
-		})
+			"published":                published,
+		}
+		// Only present when the search never ran, so a run reporting zero
+		// measurements is never ambiguous between "searched and found nothing" and
+		// "had nothing to search".
+		if searchSkipped != "" {
+			detail["search_skipped"] = searchSkipped
+		}
+		w.report(auditCtx, "sleepcycle_run_complete", "job", detail)
 	}()
 
 	goal, err := w.goals.Get(ctx, goalID)
@@ -244,24 +264,28 @@ func (w *Worker) Run(ctx context.Context, goalID string) (err error) {
 	// predicates or when the order cap forbids conjoining at all. The order clause
 	// is load-bearing: with plenty of atoms and MaxOrder 1 the atom count alone
 	// would pass while no conjunction can exist.
+	var written []winner
 	if len(atoms) < 2 || w.cfg.MaxOrder < 2 {
-		w.noAbstraction(ctx, goalID, "no conjunction formable", len(atoms), bestSingle)
+		searchSkipped = "no conjunction formable"
+	} else {
+		policy := newBeamPolicy(atoms, w.cfg, baseline, obj.Direction)
+		outcome := w.runSearch(ctx, target, obj, policy)
+		measurements = len(outcome.measured)
+		if segments := w.materiallyBetter(outcome, bestSingle, obj); len(segments) > 0 {
+			written = w.writeWinners(ctx, target, obj, baseline, segments)
+			winners = len(written)
+		}
+	}
+
+	cands := append(w.candidatesFromFindings(ctx, goalID, findings, obj, baseline),
+		w.candidatesFromWinners(written, atoms, obj, baseline)...)
+	selected := selectPublications(cands, w.cfg.MaxPublications)
+	if len(selected) == 0 {
+		w.noAbstraction(ctx, goalID, "no candidate cleared publication selection", len(atoms), bestSingle)
 		return nil
 	}
 
-	policy := newBeamPolicy(atoms, w.cfg, baseline, obj.Direction)
-	outcome := w.runSearch(ctx, target, obj, policy)
-	measurements = len(outcome.measured)
-
-	segments := w.materiallyBetter(outcome, bestSingle, obj)
-	if len(segments) == 0 {
-		w.noAbstraction(ctx, goalID, "no macro-segment cleared the materially-better gate", len(atoms), bestSingle)
-		return nil
-	}
-
-	written := w.writeWinners(ctx, target, obj, baseline, segments)
-	winners = len(written)
-	w.abstractAll(ctx, target, obj, goal.GoalText, baseline, columns, atoms, written)
+	published = w.abstractAll(ctx, target, obj, goal.GoalText, baseline, columns, selected)
 	return nil
 }
 
@@ -289,12 +313,17 @@ func (w *Worker) measureBaseline(ctx context.Context, target searchTarget, obj o
 // the same support floor as the candidates S* gates, so a bar set by evidence the
 // gate itself would reject (including legacy outcomes with no recorded support,
 // which read as 0) is impossible. The result is nil when no eligible finding
-// yields a value at or above the floor, where S* is simply undefined and
-// materiallyBetter takes its degenerate-run path.
+// yields a value at or above the floor: S* is simply undefined, so nothing can
+// clear materiallyBetter and the search writes nothing back.
 func bestSingleSegment(findings []graph.CausalTriplet, obj objective.Objective, minSupport int64) *float64 {
 	var best *float64
 	for _, f := range findings {
-		if f.Outcome.Support < minSupport {
+		// Zero is excluded unconditionally, not just when a positive floor is set:
+		// the package treats an unrecorded row count as no evidence anywhere else
+		// (measure fails a zero-row segment, publication skips one), and a floor of 0
+		// must not be the one configuration where a legacy finding sets the bar that
+		// decides what gets written back.
+		if f.Outcome.Support <= 0 || f.Outcome.Support < minSupport {
 			continue
 		}
 		v, ok := objective.NumericValue(f.Outcome.Value, obj.Label)
@@ -312,7 +341,12 @@ func bestSingleSegment(findings []graph.CausalTriplet, obj objective.Objective, 
 // macro-segment must beat the best single segment in the objective's direction by
 // at least MinLift, relative. The comparison is of absolute objective scores, not
 // effect sizes. With no eligible findings S* is undefined, so nothing can clear
-// the bar and the run is degenerate.
+// the bar and nothing is written back.
+//
+// It measures the *search's* marginal value and therefore gates write-back only.
+// Publication is selected separately, over the union of Phase-1 findings and the
+// winners this gate passed: a bar phrased relative to S* gets harder to clear the
+// better Phase 1 did, which must not decide whether the goal publishes anything.
 func (w *Worker) materiallyBetter(outcome searchOutcome, bestSingle *float64, obj objective.Objective) []measuredNode {
 	if bestSingle == nil {
 		return nil
@@ -352,8 +386,13 @@ func (w *Worker) sweepStale(ctx context.Context, goalID string) {
 	})
 }
 
-// noAbstraction records that the run produced no Meta-Heuristic and why. A
-// degenerate run is a successful run, not a failure.
+// noAbstraction records that the run produced no Meta-Heuristic, with the search
+// inputs that explain it. A degenerate run is a successful run, not a failure.
+//
+// The reason string names the stage that came up empty; which flavour of
+// degenerate it was is read off the run-complete audit, whose search_skipped,
+// measurements, and winners together separate a search that never ran from one
+// that ran and found nothing material.
 //
 // best_single is recorded as nil when there were no eligible findings: S* is
 // undefined over an empty set, and a fabricated 0 would be indistinguishable from

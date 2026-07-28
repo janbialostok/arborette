@@ -19,44 +19,73 @@ import (
 // to one dataset — the opposite of what abstraction is for.
 const maxAbstractionRepairs = 1
 
-// abstractAll turns each persisted macro-segment into a Meta-Heuristic. Failures
-// are isolated per segment: one Claude error, exhausted repair, rejected
-// abstractedFrom, or embedding fault never aborts the others.
-func (w *Worker) abstractAll(ctx context.Context, target searchTarget, obj objective.Objective, goalText string, baseline float64, columns []string, atoms []atom, winners []winner) {
-	sources := map[string][]string{}
-	for _, a := range atoms {
-		sources[a.key] = a.sourceIDs
-	}
-	for _, won := range winners {
-		if err := w.abstractOne(ctx, target, obj, goalText, baseline, columns, sources, won); err != nil {
+// abstractAll turns each selected segment into a Meta-Heuristic, returning how
+// many are published and searchable when it finishes. Failures are isolated per
+// segment: one Claude error, exhausted repair, rejected abstractedFrom, or
+// embedding fault never aborts the others.
+//
+// The count is of segments that came out published, not of segments attempted, so
+// the run audit cannot report a healthy publication count for a run whose every
+// Claude call failed. A segment a previous run already published counts too — it
+// is reachable to a consumer either way.
+func (w *Worker) abstractAll(ctx context.Context, target searchTarget, obj objective.Objective, goalText string, baseline float64, columns []string, selected []candidate) int {
+	published := 0
+	for _, cand := range selected {
+		if err := w.abstractOne(ctx, target, obj, goalText, baseline, columns, cand); err != nil {
 			log.Printf("sleepcycle: abstract macro-segment: %v", err)
 			w.report(ctx, "sleepcycle_abstraction_failure", "failure", map[string]any{
 				"optimization_function_id": target.goalID,
-				"canonical_filter":         won.node.canonical,
+				"canonical_filter":         cand.canonical,
 				"error":                    err.Error(),
 			})
+			continue
 		}
+		published++
 	}
+	return published
 }
 
-// abstractOne processes one macro-segment, resuming rather than repeating work a
-// prior run already did. Progress is keyed off embedding_pending being false, not
-// off node existence: a crash between the graph write and the pgvector write
+// abstractOne processes one selected segment, resuming rather than repeating work
+// a prior run already did. Progress is keyed off embedding_pending being false,
+// not off node existence: a crash between the graph write and the pgvector write
 // leaves a node that exists but is not yet searchable, and that must be finished,
 // not skipped.
 //
 // An absent node is the normal first-run case; a transport error is not, which is
 // why the lookup branches three ways on the not-found sentinel.
-func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objective.Objective, goalText string, baseline float64, columns []string, sources map[string][]string, won winner) error {
-	mhID := derivedID(target.namespace, roleMetaHeuristic, won.node.canonical)
+func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objective.Objective, goalText string, baseline float64, columns []string, cand candidate) error {
+	mhID := derivedID(target.namespace, roleMetaHeuristic, cand.canonical)
 
 	existing, err := w.repo.GetMetaHeuristic(ctx, mhID)
 	switch {
-	case err == nil && !existing.EmbeddingPending:
-		return nil
 	case err == nil:
-		// Written but never embedded: finish the tail, skip the Claude call.
-		return w.embed(ctx, target.goalID, mhID, existing.Definition, nil)
+		// A later run can select this segment carrying provenance the first run never
+		// saw: a second Phase-1 finding reaching the same effective segment by a
+		// different branch order, or a derived macro-segment landing on it.
+		// ABSTRACTED_FROM is the only input to the staleness sweep, so a link never
+		// written is evidence whose rejection can never retire this heuristic.
+		// CreateMetaHeuristic MERGEs the node and each edge and leaves
+		// embedding_pending alone, so re-issuing it adds what is missing without
+		// disturbing a finished abstraction.
+		relinkErr := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: mhID, Definition: existing.Definition}, cand.abstractedFrom)
+		if !existing.EmbeddingPending {
+			// The heuristic is written and embedded, so it is reachable to a consumer
+			// whether or not this run managed to widen its evidence. Reporting it as
+			// unpublished would be the misleading answer — one flapping write window
+			// would read as a run that published nothing while the whole corpus is
+			// live — so the fault is surfaced on its own and the segment still counts.
+			if relinkErr != nil {
+				w.relinkFailure(ctx, target.goalID, mhID, relinkErr)
+			}
+			return nil
+		}
+		// Written but never embedded: finish the tail, skip the Claude call. Here the
+		// fault is terminal — embedding a node whose evidence was just rejected would
+		// publish it to similarity search on provenance the graph does not agree with.
+		if relinkErr != nil {
+			return fmt.Errorf("re-link meta-heuristic %q: %w", mhID, relinkErr)
+		}
+		return w.embed(ctx, target.goalID, mhID, existing.Definition, cand.abstractedFrom)
 	case !errors.Is(err, graph.ErrNotFound):
 		return fmt.Errorf("look up meta-heuristic %q: %w", mhID, err)
 	}
@@ -64,20 +93,19 @@ func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objec
 	seg := llm.MacroSegment{
 		ObjectiveLabel: obj.Label,
 		Direction:      obj.Direction,
-		Filters:        won.node.filters,
+		Filters:        cand.filters,
 		Baseline:       baseline,
-		Value:          won.value,
+		Value:          cand.value,
 	}
 	abstraction, err := w.abstractSegment(ctx, goalText, seg, columns)
 	if err != nil {
 		return err
 	}
 
-	abstractedFrom := abstractedFromIDs(won, sources)
-	if err := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: mhID, Definition: abstraction.Definition}, abstractedFrom); err != nil {
+	if err := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: mhID, Definition: abstraction.Definition}, cand.abstractedFrom); err != nil {
 		return fmt.Errorf("create meta-heuristic %q: %w", mhID, err)
 	}
-	return w.embed(ctx, target.goalID, mhID, abstraction.Definition, abstractedFrom)
+	return w.embed(ctx, target.goalID, mhID, abstraction.Definition, cand.abstractedFrom)
 }
 
 // abstractSegment generates a definition and repairs it while it still leaks a
@@ -105,31 +133,23 @@ func (w *Worker) abstractSegment(ctx context.Context, goalText string, seg llm.M
 	return abstraction, nil
 }
 
+// relinkFailure records evidence that could not be attached to an
+// already-published heuristic. It is its own action rather than an abstraction
+// failure so an operator can tell "never abstracted" from "abstracted, and one
+// run's evidence did not land" — the second leaves a live heuristic whose
+// provenance is narrower than the graph knows.
+func (w *Worker) relinkFailure(ctx context.Context, goalID, mhID string, err error) {
+	log.Printf("sleepcycle: re-link meta-heuristic %q: %v", mhID, err)
+	w.report(ctx, "sleepcycle_relink_failure", "failure", map[string]any{
+		"optimization_function_id": goalID,
+		"meta_heuristic_id":        mhID,
+		"error":                    err.Error(),
+	})
+}
+
 func leakedColumnsMessage(leaked []string) string {
 	return "these dataset column names are still present in the definition: " + strings.Join(leaked, ", ") +
 		"; replace each with a bracketed structural ontology term"
-}
-
-// abstractedFromIDs links a Meta-Heuristic to its evidence: the component
-// single-feature triplets every atom of the macro-segment came from, plus the
-// derived macro-segment's own Intervention and Outcome.
-//
-// The shared baseline State is deliberately excluded. trace_causal_chain's second
-// MATCH is unbound — it enumerates every complete path in the graph and keeps the
-// rows whose target is the State, Intervention, or Outcome. Since the baseline
-// State is one node per goal wired as the State of *every* derived triplet,
-// linking it would make each Meta-Heuristic's trace return all of them, silently
-// attributing other segments' evidence to it. Linking only the derived
-// Intervention and Outcome loses nothing: matching the Intervention already pulls
-// the complete path, which returns that State anyway. Component triplet ids are
-// safe because Phase 1 mints a unique State per triplet — the rule is about
-// shared nodes, not about the State label.
-func abstractedFromIDs(won winner, sources map[string][]string) []string {
-	var ids []string
-	for _, key := range won.node.keys {
-		ids = appendMissing(ids, sources[key]...)
-	}
-	return appendMissing(ids, won.interventionID, won.outcomeID)
 }
 
 // embed completes an abstraction: generate the vector, write it to pgvector, and

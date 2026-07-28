@@ -58,14 +58,9 @@ func newBeamPolicy(atoms []atom, cfg Config, baseline float64, direction domain.
 	return p
 }
 
-// delta is the measured value's movement in the objective's desired direction,
-// so ranking is a plain descending sort regardless of maximize or minimize.
+// delta is the frontier's ranking key.
 func (p *beamPolicy) delta(m Measurement) float64 {
-	d := m.Value - p.baseline
-	if p.direction == domain.Minimize {
-		return -d
-	}
-	return d
+	return directionalDelta(m.Value, p.baseline, p.direction)
 }
 
 func (p *beamPolicy) level1() []*Node {
@@ -225,5 +220,5 @@ func conjoin(parent *Node, a atom) *Node {
 func canonicalKeyOf(keys []string) string {
 	parts := slices.Clone(keys)
 	slices.Sort(parts)
-	return strings.Join(parts, "\n")
+	return strings.Join(parts, canonicalSeparator)
 }

@@ -136,3 +136,36 @@ func TestMinLiftFallback(t *testing.T) {
 		t.Fatalf("unparseable = %v, want the 0.05 default", cfg.SleepCycle.MinLift)
 	}
 }
+
+// TestMaxPublicationsFallback pins the publication cap's env wiring. Its name is
+// the one knob in the sleep-cycle set that drops the SEARCH segment, so a typo
+// would fall back to the default invisibly.
+func TestMaxPublicationsFallback(t *testing.T) {
+	setPostgresEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SleepCycle.MaxPublications != 20 {
+		t.Fatalf("unset = %v, want the 20 default", cfg.SleepCycle.MaxPublications)
+	}
+
+	t.Setenv("SLEEPCYCLE_MAX_PUBLICATIONS", "5")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SleepCycle.MaxPublications != 5 {
+		t.Fatalf("parsed = %v, want 5", cfg.SleepCycle.MaxPublications)
+	}
+
+	t.Setenv("SLEEPCYCLE_MAX_PUBLICATIONS", "not-a-number")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SleepCycle.MaxPublications != 20 {
+		t.Fatalf("unparseable = %v, want the 20 default", cfg.SleepCycle.MaxPublications)
+	}
+}

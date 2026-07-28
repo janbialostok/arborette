@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/arborette/arborette/internal/domain"
-	"github.com/arborette/arborette/internal/objective"
 )
 
 // stubPolicy is a deliberately ill-behaved SearchPolicy: it re-selects the same
@@ -47,10 +46,7 @@ func singleNode(t *testing.T, field string) *Node {
 func TestDriverMemoizesAReSelectedNode(t *testing.T) {
 	h := newHarness(t, testConfig())
 	h.sandbox.defaultValue = 5.0
-	obj, err := objective.Pin(tabularGoal().EvaluationMatrix)
-	if err != nil {
-		t.Fatalf("pin objective: %v", err)
-	}
+	obj := objectiveFor(t, domain.Maximize)
 	policy := &stubPolicy{node: singleNode(t, "a"), maxSelects: 3}
 
 	outcome := h.worker.runSearch(t.Context(), searchTarget{goalID: "g1", dataSourceRef: "ref.csv"}, obj, policy)
@@ -78,10 +74,7 @@ func TestDriverMemoizesAReSelectedNode(t *testing.T) {
 func TestDriverStopsWhenSelectContradictsDone(t *testing.T) {
 	h := newHarness(t, testConfig())
 	h.sandbox.defaultValue = 5.0
-	obj, err := objective.Pin(tabularGoal().EvaluationMatrix)
-	if err != nil {
-		t.Fatalf("pin objective: %v", err)
-	}
+	obj := objectiveFor(t, domain.Maximize)
 	policy := &stubPolicy{node: singleNode(t, "a"), maxSelects: 1}
 
 	outcome := h.worker.runSearch(t.Context(), searchTarget{goalID: "g1", dataSourceRef: "ref.csv"}, obj, policy)
@@ -128,10 +121,7 @@ func TestBeamUpdateIsIdempotent(t *testing.T) {
 func TestCancelledContextBoundsAReSelectingPolicy(t *testing.T) {
 	h := newHarness(t, testConfig())
 	h.sandbox.defaultValue = 1.0
-	obj, err := objective.Pin(tabularGoal().EvaluationMatrix)
-	if err != nil {
-		t.Fatalf("pin objective: %v", err)
-	}
+	obj := objectiveFor(t, domain.Maximize)
 	policy := &stubPolicy{node: singleNode(t, "a"), endless: true}
 
 	ctx, cancel := context.WithCancel(context.Background())

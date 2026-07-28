@@ -11,15 +11,18 @@ import (
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/llm"
+	"github.com/arborette/arborette/internal/objective"
 	"github.com/arborette/arborette/internal/sandboxclient"
 	"github.com/arborette/arborette/internal/store"
 )
 
 // testConfig is the tuning the search tests run at unless a case overrides it:
 // a floor of 0 and a lift of 0 keep support and lift out of the way so a test
-// exercises exactly the axis it names.
+// exercises exactly the axis it names. The publication cap is the production
+// default rather than 0, because every worker test constructs through
+// NewWorker's validation, which refuses a cap below 1.
 func testConfig() Config {
-	return Config{MaxMeasurements: 200, BeamWidth: 10, MaxOrder: 3, MinSupport: 0, MinLift: 0}
+	return Config{MaxMeasurements: 200, BeamWidth: 10, MaxOrder: 3, MinSupport: 0, MinLift: 0, MaxPublications: 20}
 }
 
 // segmentKey names a candidate by its filter columns, which is how the tests
@@ -45,15 +48,23 @@ func atomOn(field string) domain.Constraint {
 // finding builds one eligible Phase-1 triplet introducing the given atoms. Its
 // support of 100 clears every floor the tests configure, matching the fake
 // sandbox's defaultSupport, so S* stays defined unless a case says otherwise.
+//
+// The effective filter set defaults to the new one, which is what a depth-1
+// finding actually carries. Publication reads the effective set, so a fixture
+// leaving it unset would decode to an empty set and be skipped as the baseline —
+// use findingWithEffective for the depth-N shapes where the two differ.
 func finding(id string, value float64, label string, fields ...string) graph.CausalTriplet {
 	filters := make([]domain.Constraint, 0, len(fields))
 	for _, f := range fields {
 		filters = append(filters, atomOn(f))
 	}
 	return graph.CausalTriplet{
-		State:        domain.State{ID: "s-" + id},
-		Intervention: domain.Intervention{ID: "i-" + id, Properties: map[string]any{"new_filters": asProperty(filters)}},
-		Outcome:      domain.Outcome{ID: "o-" + id, VerificationStatus: domain.VerificationVerified, Value: map[string]any{label: value}, Support: 100},
+		State: domain.State{ID: "s-" + id},
+		Intervention: domain.Intervention{ID: "i-" + id, Properties: map[string]any{
+			"new_filters":       asProperty(filters),
+			"effective_filters": asProperty(filters),
+		}},
+		Outcome: domain.Outcome{ID: "o-" + id, VerificationStatus: domain.VerificationVerified, Value: map[string]any{label: value}, Support: 100},
 	}
 }
 
@@ -61,6 +72,19 @@ func finding(id string, value float64, label string, fields ...string) graph.Cau
 func findingWithSupport(id string, value float64, support int64, fields ...string) graph.CausalTriplet {
 	f := finding(id, value, testObjectiveLabel, fields...)
 	f.Outcome.Support = support
+	return f
+}
+
+// findingWithEffective builds a deeper finding, whose effective segment is the
+// cumulative branch its value was measured under rather than the single
+// predicate it introduced.
+func findingWithEffective(id string, value float64, support int64, newFields, effectiveFields []string) graph.CausalTriplet {
+	f := findingWithSupport(id, value, support, newFields...)
+	effective := make([]domain.Constraint, 0, len(effectiveFields))
+	for _, field := range effectiveFields {
+		effective = append(effective, atomOn(field))
+	}
+	f.Intervention.Properties["effective_filters"] = asProperty(effective)
 	return f
 }
 
@@ -427,6 +451,24 @@ func minimizeGoal() store.Goal {
 
 const testObjectiveLabel = "avg(revenue)"
 
+// objectiveFor is the pinned objective the constructor-level tests measure
+// against. It is derived from the goal fixture rather than hand-built so the
+// aggregation and value expression are the real ones — a test that drives
+// write-back directly persists those onto its nodes, and a hand-built objective
+// would write a shape no production run produces.
+func objectiveFor(t *testing.T, direction domain.TargetDirection) objective.Objective {
+	t.Helper()
+	goal := tabularGoal()
+	if direction == domain.Minimize {
+		goal = minimizeGoal()
+	}
+	obj, err := objective.Pin(goal.EvaluationMatrix)
+	if err != nil {
+		t.Fatalf("pin objective: %v", err)
+	}
+	return obj
+}
+
 // harness wires a Worker over fakes, returning both so a test can script inputs
 // and assert on what each collaborator saw.
 type harness struct {
@@ -462,4 +504,20 @@ func newHarness(t *testing.T, cfg Config) *harness {
 func (h *harness) run(t *testing.T) error {
 	t.Helper()
 	return h.worker.Run(context.Background(), "g1")
+}
+
+// didAbstract reports whether the run published the segment named by these test
+// atoms, addressing it by the same deterministic id the abstraction stage mints.
+// A test about one segment needs this rather than a Claude-call count: publication
+// draws on Phase-1 findings too, so other segments legitimately reach abstraction
+// in the same run.
+func (h *harness) didAbstract(t *testing.T, fields ...string) bool {
+	t.Helper()
+	id := derivedID(goalNamespace("g1"), roleMetaHeuristic, canonicalFor(t, fields...))
+	for _, mh := range h.repo.heuristics {
+		if mh.ID == id {
+			return true
+		}
+	}
+	return false
 }

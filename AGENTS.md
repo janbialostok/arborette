@@ -42,6 +42,17 @@
   (e.g. a status-sweep's affected-row count) — assert per-row effects instead. When
   asserting an `ORDER BY` over `now()`-defaulted timestamps, `time.Sleep` a couple
   ms between inserts so the ordering is deterministic.
+- `make test` **truncates** `meta_heuristic_embeddings` (`internal/testutil`), so a
+  run against the live stack destroys the pgvector rows of every Meta-Heuristic a
+  real Sleep-Cycle run published. The graph side is untouched, so those nodes keep
+  `embedding_pending = false` and the resume pass skips them — they stay reachable
+  by `trace_causal_chain` while returning nothing from `get_optimized_heuristics`.
+  Never compare an embeddings-table observation taken before the gate with one
+  taken after; re-publish (or re-embed) before drawing conclusions.
+- Audit records carry their detail as `map[string]any`, so a nil slice or a typed
+  nil pointer stored in one is never `== nil`. Assert on content (length, a
+  specific id) rather than `detail["k"] != nil`, which passes even when the value
+  is the nil the assertion means to catch.
 - Scripted-response test doubles (`fakeSandbox`, `fakeClaude`) return a nil error /
   empty success once their scripted slice is exhausted. A test for a bounded retry
   loop must therefore script one failure per attempt **plus** the initial one

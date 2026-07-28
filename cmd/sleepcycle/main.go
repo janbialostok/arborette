@@ -68,6 +68,7 @@ func main() {
 			MaxOrder:        cfg.SleepCycle.MaxOrder,
 			MinSupport:      cfg.SleepCycle.MinSupport,
 			MinLift:         cfg.SleepCycle.MinLift,
+			MaxPublications: cfg.SleepCycle.MaxPublications,
 		},
 	)
 	if err != nil {

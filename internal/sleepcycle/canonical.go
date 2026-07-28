@@ -12,6 +12,10 @@ import (
 	"github.com/arborette/arborette/internal/domain"
 )
 
+// canonicalSeparator joins the per-predicate encodings inside a canonical key;
+// canonicalComponents is its inverse.
+const canonicalSeparator = "\n"
+
 // Roles distinguish the ids derived from one canonical filter, so a
 // macro-segment's Intervention, Outcome, and Meta-Heuristic never collide.
 const (
@@ -84,7 +88,22 @@ func CanonicalFilters(filters []domain.Constraint) (string, error) {
 		encoded = append(encoded, key)
 	}
 	sort.Strings(encoded)
-	return strings.Join(encoded, "\n"), nil
+	return strings.Join(encoded, canonicalSeparator), nil
+}
+
+// canonicalComponents splits a canonical key back into its per-predicate
+// encodings, so a caller can reason about one key's predicates as a set.
+//
+// The split is sound because each part is a complete JSON object and
+// encoding/json escapes every control character inside a string: no categorical
+// value can smuggle in a separator and forge a component boundary, and no
+// component can come back empty. An empty key has no predicates at all rather
+// than one empty predicate, which is the case a bare strings.Split gets wrong.
+func canonicalComponents(canonical string) []string {
+	if canonical == "" {
+		return nil
+	}
+	return strings.Split(canonical, canonicalSeparator)
 }
 
 // goalNamespace derives the per-goal UUID namespace every derived id is minted

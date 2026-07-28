@@ -99,9 +99,14 @@ func TestAllFailingSearchEndsCleanly(t *testing.T) {
 
 // TestSandboxFailureAfterBaselineExitsCleanly is the same degradation seen end to
 // end: the run reaches degenerate detection and returns nil rather than failing.
+//
+// The baseline matches the findings' value so nothing is publishable, keeping the
+// degenerate path the subject — a publishable fixture would abstract its Phase-1
+// findings and never reach it.
 func TestSandboxFailureAfterBaselineExitsCleanly(t *testing.T) {
 	h := newHarness(t, testConfig())
 	h.repo.findings = findingsFor("a", "b")
+	h.sandbox.baseline = 1.0
 	h.sandbox.failAll = true
 
 	if err := h.run(t); err != nil {

@@ -9,13 +9,14 @@ import (
 )
 
 // winner is one macro-segment whose derived triplet is fully persisted, carrying
-// the ids the abstraction stage links back to. The measured support is not
-// carried here: it is already persisted on the Intervention and Outcome and
-// reported in the intervention audit, and the abstraction stage does not
-// consider it.
+// the ids the abstraction stage links back to and the row count backing its
+// value. The support is carried rather than re-read off the persisted Outcome
+// because publication ranks candidates by evidence weight, and a second graph
+// read for a number already in hand would be pure cost.
 type winner struct {
 	node           *Node
 	value          float64
+	support        int64
 	interventionID string
 	outcomeID      string
 }
@@ -147,6 +148,7 @@ func (w *Worker) writeSegment(ctx context.Context, target searchTarget, obj obje
 	return winner{
 		node:           seg.node,
 		value:          seg.measurement.Value,
+		support:        seg.measurement.Support,
 		interventionID: interventionID,
 		outcomeID:      outcomeID,
 	}, nil

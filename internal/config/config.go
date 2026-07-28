@@ -115,7 +115,10 @@ type MCPConfig struct {
 // survive each level; MaxOrder is the largest conjunction the search will form;
 // MinSupport is an absolute matched-row floor below which a candidate and every
 // superset of it are pruned; MinLift is the relative improvement over the best
-// single segment a macro-segment must clear to be written back.
+// single segment a macro-segment must clear to be written back. MaxPublications
+// caps how many segments one run abstracts into Meta-Heuristics — it tunes the
+// publication stage rather than the search, which is why its env name carries no
+// SEARCH segment.
 type SleepCycleConfig struct {
 	SandboxURL      string
 	OrchestratorURL string
@@ -124,6 +127,7 @@ type SleepCycleConfig struct {
 	MaxOrder        int
 	MinSupport      int
 	MinLift         float64
+	MaxPublications int
 }
 
 // AnthropicConfig points the Claude client at a model and key. Model is
@@ -237,6 +241,7 @@ func Load() (Config, error) {
 			MaxOrder:        intEnv("SLEEPCYCLE_SEARCH_MAX_ORDER", 3),
 			MinSupport:      intEnv("SLEEPCYCLE_SEARCH_MIN_SUPPORT", 30),
 			MinLift:         floatEnv("SLEEPCYCLE_SEARCH_MIN_LIFT", 0.05),
+			MaxPublications: intEnv("SLEEPCYCLE_MAX_PUBLICATIONS", 20),
 		},
 		Anthropic: AnthropicConfig{
 			APIKey: os.Getenv("ANTHROPIC_API_KEY"),
