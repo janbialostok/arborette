@@ -55,6 +55,7 @@ func main() {
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
 	goals := store.NewGoalRegistry(pool)
 	runs := store.NewRuns(pool)
+	queue := store.NewVerificationQueue(pool)
 	audits := store.NewAuditLog(pool)
 	embeddings := store.NewEmbeddingStore(pool)
 	heur := heuristics.NewService(provider, embeddings, repo)
@@ -73,10 +74,11 @@ func main() {
 	}
 
 	srv := orchestrator.NewServer(
-		repo, goals, runs, audits, objects, heur, claude, chat, sandbox,
+		repo, goals, runs, queue, audits, objects, heur, claude, chat, sandbox,
 		orchestrator.NewHub(), orchestrator.StubLauncher{},
 		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID},
 		cfg.Orchestrator.LocalImportDir, cfg.Orchestrator.SleepCycleJobName,
+		cfg.Orchestrator.HITLConfidenceThreshold, cfg.Orchestrator.BlockingLoopTimeout,
 	)
 
 	log.Printf("orchestrator: wired neo4j, postgres, object store, embeddings (dim=%d), serving HTTP on :%s", provider.Dimensions(), cfg.Orchestrator.Port)

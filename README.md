@@ -27,14 +27,14 @@ your customers already churns most, and how much worse that slice is than the wh
 - **`Intervention` is a name, not an action.** The word is retained across the data model, the
   graph triplets, and the REST surface, but in V1 an `Intervention` node is a reified *read-only
   data-segment definition* — a filter — and nothing is ever enacted.
-- **An extracted value is a typed model assertion, not a measurement.** On the document path the
-  outcome and its confidence are what Claude reported, not what a query computed, and they are
-  written `unverified`. The human-in-the-loop queue that would promote them to evidence is specified
-  but not yet built (see [Roadmap](#roadmap)), so today nothing extracted is treated as measured.
+- **An extracted value is a typed model assertion until a human says so.** On the document path the
+  outcome and its confidence are what Claude reported, not what a query computed, so it is written
+  `unverified` and stays out of Phase 2 until an analyst confirms or corrects it. Confidence only
+  decides what gets queued for review; it never promotes an extraction to evidence.
 - **Document goals run Phase 1 only.** A PDF data source is supported by the hypothesis loop's
   per-field extraction path, but the Sleep Cycle rejects a document goal outright: such a goal has no
-  numeric objective to optimize and no conjoinable segment to search. That is structural, so the
-  verification queue below would not change it.
+  numeric objective to optimize and no conjoinable segment to search. That is structural: human
+  review of the extracted values does not change it.
 
 ## How it works
 
@@ -99,13 +99,13 @@ Four things to know before writing an SSE client, none of them guessable from th
   same `{error}` payload, as a per-candidate failure. Nothing on the wire distinguishes them, and
   `loop_complete` carries no payload — a run's real outcome comes from `GET /goals`, which serves the
   persisted status and failure reason.
-- **Subscribing after a run ends blocks silently.** The hub drops a run's state at `loop_complete`
-  and lazily recreates an empty one for any id, so a late subscriber — or a typo'd id — attaches to
-  a run that will never emit. What you get is not an error but nothing at all: the response head is
-  only flushed alongside the first event, so there is not even a status code to check, and nothing
-  ever closes the connection. Mid-run reconnects are safe and replay recent history; only the
-  already-finished case hangs. Prefer a manual reader over `EventSource`, which would reconnect into
-  that hang every time a run completes.
+- **Subscribing after a run ends attaches to silence.** An unknown goal is a 404, and the response
+  head is flushed on subscribe so a status code is always available — but a *known* goal whose run
+  already finished attaches to a run that will never emit another event, and nothing closes the
+  connection. Keepalive comment frames arrive every 30s, so the connection stays healthy rather than
+  being reaped; they carry no events. Mid-run reconnects are safe and replay recent history. Prefer a
+  manual reader over `EventSource`, which would reconnect into that silence every time a run
+  completes.
 
 ### Phase 2 — Sleep Cycle
 
@@ -386,16 +386,20 @@ Nine targets:
 
 ### HTTP API
 
-The Orchestrator's nine routes:
+The Orchestrator's thirteen routes:
 
 | Method and path | Purpose |
 |---|---|
-| `POST /goals` | Register a goal (multipart: `goal` plus a file upload or `import_path`). Ingests, introspects, fits and dry-runs the Evaluation Matrix, persists, returns 201. Does not start Phase 1. |
+| `POST /goals` | Register a goal (multipart: `goal` plus a file upload or `import_path`; optional `confidence_threshold` — above 0, at most 1 — and `epoch_mode=speculative\|blocking` override the review defaults, and a bad value is a 400). Ingests, introspects, fits and dry-runs the Evaluation Matrix, persists, returns 201. Does not start Phase 1. |
 | `GET /goals` | List registered objectives with each one's latest run status (synthetic `no run` when never triggered). |
 | `POST /goals/{id}/hypothesis-loop` | Trigger Phase 1. |
 | `GET /goals/{id}/stream` | SSE progress for a goal's run. |
 | `POST /goals/{id}/chat` | One turn of the agent preview, streamed back as SSE. The browser holds the transcript and posts it each turn. Returns 503 until the MCP connector is configured — see `MCP_PUBLIC_URL` in `.env.example`. |
 | `POST /goals/{id}/sleep-cycle` | Trigger Phase 2. **Locally a stub: logs, audits, returns 202, runs nothing** — use `make sleep-cycle`. |
+| `GET /goals/{id}/verifications` | The human-review queue for a goal (`status=pending\|resolved` narrows it), plus the goal's effective threshold and epoch mode. |
+| `POST /goals/{id}/verifications/{outcomeID}` | Submit a review: `{"action":"confirm"\|"correct"\|"reject","corrected_value":"…"}`. 409 if the outcome was already resolved. |
+| `GET /goals/{id}/outcomes` | Every extracted value for a goal, not just the queued ones, so any result can be pulled up for review. |
+| `GET /goals/{id}/outcomes/{outcomeID}/excerpt` | The source text behind an extracted value — the located span, or the whole document when the value cannot be pinpointed in it. |
 | `GET /heuristics/search` | Semantic search over published Meta-Heuristics (`q` required; `k` defaults 10, clamped at 100). |
 | `GET /heuristics/{id}/trace` | Trace a Meta-Heuristic back to its supporting triplets. |
 | `POST /internal/audit` | The internal audit-write API other services record through. |
@@ -443,6 +447,13 @@ Sleep-Cycle tuning:
 | `SLEEPCYCLE_SEARCH_MIN_LIFT` | 0.05 | Relative improvement over `S*` required for write-back. |
 | `SLEEPCYCLE_MAX_PUBLICATIONS` | 20 | How many segments one run abstracts into Meta-Heuristics. Selection runs after the search, which is why the name carries no `SEARCH_` segment. |
 
+Human review of extracted values:
+
+| Variable | Default | What it gates |
+|---|---|---|
+| `HITL_CONFIDENCE_THRESHOLD` | 0.8 | Confidence below which an extraction is queued for review. A goal can override it at registration (`confidence_threshold`). This tunes queue volume only — what makes an extraction eligible for Phase 2 is an analyst's verdict, never its confidence. |
+| `HITL_BLOCKING_LOOP_TIMEOUT_MINUTES` | 1440 | Deadline for a run whose goal registered with `epoch_mode=blocking`. That mode waits for a verdict before refining below a queued extraction, and the loop is a single sequence, so one wait stalls everything behind it — hence a human-scale deadline instead of the usual 30 minutes. The default `speculative` mode never waits. |
+
 `.env.example` is the source of truth for every other variable — staging limits, the embedding
 model, the analyst-identity stub. It deliberately omits the host names (`NEO4J_URI`,
 `POSTGRES_HOST`, `S3_ENDPOINT`, `OLLAMA_URL`), which Compose injects per service and which you
@@ -455,11 +466,8 @@ the mapping that reaches it. `WEBUI_PORT` is the one that behaves as it reads.
 
 ### Next up (specified, not yet built)
 
-Two capabilities are specified in `.turbo/shells/` with no implementation yet:
+One capability is specified in `.turbo/shells/` with no implementation yet:
 
-- **Human-in-the-loop verification of extractions.** A queue for low-confidence document
-  extractions, its REST surface, write-through of the resolution onto the outcome's verification
-  status, and a confidence-binned view of a live run.
 - **The web UI for the review and preview surfaces.** HITL review with source excerpts, a confidence
   histogram, and a chat tab over `POST /goals/{id}/chat`.
 

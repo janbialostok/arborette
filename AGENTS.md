@@ -62,6 +62,12 @@
   nil pointer stored in one is never `== nil`. Assert on content (length, a
   specific id) rather than `detail["k"] != nil`, which passes even when the value
   is the nil the assertion means to catch.
+- A test double that ignores its `context.Context` cannot catch a context bug. The
+  real pools and drivers fail a call on a cancelled context, so a fake that does
+  not is why a handler passing the wrong context (the request's, where a detached
+  one is required) reads as correct. Have doubles that stand in for a store return
+  `ctx.Err()` when the context is done — the moment they do, a test asserting the
+  wrong thing fails loudly rather than passing for the wrong reason.
 - Scripted-response test doubles (`fakeSandbox`, `fakeClaude`) return a nil error /
   empty success once their scripted slice is exhausted. A test for a bounded retry
   loop must therefore script one failure per attempt **plus** the initial one

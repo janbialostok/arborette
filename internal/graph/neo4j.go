@@ -410,6 +410,131 @@ func (r *Neo4jRepository) UpdateOutcomeVerification(ctx context.Context, outcome
 	})
 }
 
+// CorrectOutcome applies an analyst's correction in one statement: the
+// replacement value, the locator recomputed against it, the resolution status,
+// and the inbound edge's confidence. See Repository for why they move together.
+func (r *Neo4jRepository) CorrectOutcome(ctx context.Context, outcomeID string, value map[string]any, provenance *domain.ProvenanceLocator, status domain.VerificationStatus, confidence float64) error {
+	marshalled, err := marshalProps(value)
+	if err != nil {
+		return err
+	}
+	locator, err := marshalProvenance(provenance)
+	if err != nil {
+		return err
+	}
+	return r.writeOp(ctx, "correct outcome "+outcomeID, func(tx neo4j.ManagedTransaction) (any, error) {
+		return tx.Run(ctx,
+			"MATCH (i:"+labelIntervention+")-[e:"+domain.Produced+"]->(o:"+labelOutcome+" {id: $id}) "+
+				"SET o.value = $value, o.provenance = $provenance, o.verification_status = $status, e.confidence = $confidence",
+			map[string]any{
+				"id":         outcomeID,
+				"value":      marshalled,
+				"provenance": locator,
+				"status":     string(status),
+				"confidence": confidence,
+			},
+		)
+	})
+}
+
+func (r *Neo4jRepository) ListExtractionOutcomes(ctx context.Context, goalID string) ([]ExtractionOutcome, error) {
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (i:"+labelIntervention+" {goal_id: $goalID, type: $type})-[e:"+domain.Produced+"]->(o:"+labelOutcome+") "+
+				"RETURN o, i, e.confidence AS confidence",
+			map[string]any{"goalID": goalID, "type": string(domain.InterventionExtract)},
+		)
+		if err != nil {
+			return nil, err
+		}
+		recs, err := result.Collect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]ExtractionOutcome, 0, len(recs))
+		for _, rec := range recs {
+			outcome, err := extractionOutcomeFromRecord(rec)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, outcome)
+		}
+		return out, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list extraction outcomes for %q: %w", goalID, err)
+	}
+	return res.([]ExtractionOutcome), nil
+}
+
+func (r *Neo4jRepository) GetExtractionOutcome(ctx context.Context, outcomeID string) (ExtractionOutcome, error) {
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (i:"+labelIntervention+" {type: $type})-[e:"+domain.Produced+"]->(o:"+labelOutcome+" {id: $id}) "+
+				"RETURN o, i, e.confidence AS confidence",
+			map[string]any{"id": outcomeID, "type": string(domain.InterventionExtract)},
+		)
+		if err != nil {
+			return nil, err
+		}
+		recs, err := result.Collect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// A miss returns nil rather than an error, for the same reason getNode
+		// does: an error out of a transaction function costs a rollback round-trip
+		// on what is a normal not-found answer.
+		switch len(recs) {
+		case 0:
+			return nil, nil
+		case 1:
+			return extractionOutcomeFromRecord(recs[0])
+		default:
+			return nil, fmt.Errorf("id resolves to %d extraction outcomes", len(recs))
+		}
+	})
+	if err != nil {
+		return ExtractionOutcome{}, fmt.Errorf("get extraction outcome %q: %w", outcomeID, err)
+	}
+	if res == nil {
+		return ExtractionOutcome{}, fmt.Errorf("get extraction outcome %q: %w", outcomeID, ErrNotFound)
+	}
+	return res.(ExtractionOutcome), nil
+}
+
+func extractionOutcomeFromRecord(rec *neo4j.Record) (ExtractionOutcome, error) {
+	oNode, err := recordNode(rec, "o")
+	if err != nil {
+		return ExtractionOutcome{}, err
+	}
+	iNode, err := recordNode(rec, "i")
+	if err != nil {
+		return ExtractionOutcome{}, err
+	}
+	outcome, err := outcomeFromNode(stringProp(oNode.Props["id"]), oNode)
+	if err != nil {
+		return ExtractionOutcome{}, err
+	}
+	intervention, err := interventionFromNode(stringProp(iNode.Props["id"]), iNode)
+	if err != nil {
+		return ExtractionOutcome{}, err
+	}
+	confidence, _ := rec.Get("confidence")
+	weight, _ := confidence.(float64)
+	field, _ := intervention.Properties["field"].(string)
+	method, _ := intervention.Properties["method"].(string)
+	return ExtractionOutcome{
+		OutcomeID:          outcome.ID,
+		GoalID:             outcome.GoalID,
+		Field:              field,
+		Method:             method,
+		Value:              outcome.Value,
+		Provenance:         outcome.Provenance,
+		VerificationStatus: outcome.VerificationStatus,
+		Confidence:         weight,
+	}, nil
+}
+
 func (r *Neo4jRepository) TraceCausalChain(ctx context.Context, metaHeuristicID string) ([]CausalTriplet, error) {
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,

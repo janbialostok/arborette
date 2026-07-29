@@ -22,6 +22,22 @@ type CausalTriplet struct {
 	Outcome      domain.Outcome
 }
 
+// ExtractionOutcome is an extract-type Outcome joined to the two things a bare
+// node read cannot supply: the field and method from its producing Intervention,
+// and the self-reported Confidence carried on the PRODUCED edge. The human
+// verification surface needs all three -- the field keys the outcome's value
+// map, and the confidence is what review is judging.
+type ExtractionOutcome struct {
+	OutcomeID          string
+	GoalID             string
+	Field              string
+	Method             string
+	Value              map[string]any
+	Provenance         *domain.ProvenanceLocator
+	VerificationStatus domain.VerificationStatus
+	Confidence         float64
+}
+
 // Repository is the whole Cypher surface, wider than any single caller uses:
 // only the Orchestrator's Server depends on it as a unit, and it exercises the
 // triplet writes alone. Every method added here has to be stubbed by that
@@ -56,8 +72,20 @@ type Repository interface {
 	ListEmbeddingPending(ctx context.Context) ([]domain.MetaHeuristic, error)
 
 	// UpdateOutcomeVerification applies an HITL resolution to an Outcome and its
-	// inbound PRODUCED-edge confidence.
+	// inbound PRODUCED-edge confidence. CorrectOutcome is its correction
+	// counterpart: it additionally replaces the extracted value and the locator
+	// recomputed against it, and writes all four in one statement so a failure
+	// cannot leave a corrected value under an unreviewed status.
 	UpdateOutcomeVerification(ctx context.Context, outcomeID string, status domain.VerificationStatus, confidence float64) error
+	CorrectOutcome(ctx context.Context, outcomeID string, value map[string]any, provenance *domain.ProvenanceLocator, status domain.VerificationStatus, confidence float64) error
+
+	// ListExtractionOutcomes returns every extract-type outcome for a goal, and
+	// GetExtractionOutcome one by id, each joined to its producing intervention
+	// and PRODUCED edge. GetExtractionOutcome yields ErrNotFound for an unknown id
+	// and for a query-type outcome, which is verified by construction and never
+	// human-resolvable.
+	ListExtractionOutcomes(ctx context.Context, goalID string) ([]ExtractionOutcome, error)
+	GetExtractionOutcome(ctx context.Context, outcomeID string) (ExtractionOutcome, error)
 
 	// TraceCausalChain walks ABSTRACTED_FROM from a Meta-Heuristic back to the
 	// State/Intervention/Outcome triplet(s) that support it.

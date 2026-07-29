@@ -9,15 +9,29 @@ import (
 	"github.com/arborette/arborette/internal/domain"
 )
 
+// EpochMode is how a goal's hypothesis loop treats pending human verifications.
+// speculative (the default) never waits: the loop prunes on unverified
+// confidence while verifications resolve in the background. blocking trades loop
+// speed for pruning decisions taken only on verified values.
+type EpochMode string
+
+const (
+	EpochSpeculative EpochMode = "speculative"
+	EpochBlocking    EpochMode = "blocking"
+)
+
 // Goal is a registered optimization goal as persisted in goal_registry. A goal
 // carries exactly one objective form: a tabular goal has an EvaluationMatrix
 // (TargetFields empty); a document goal has TargetFields (a zero-value matrix).
+// ConfidenceThreshold is nil when the goal takes the service-wide HITL default.
 type Goal struct {
 	OptimizationFunctionID string
 	GoalText               string
 	EvaluationMatrix       domain.EvaluationMatrix
 	TargetFields           []domain.TargetField
 	DataSourceRef          string
+	ConfidenceThreshold    *float64
+	EpochMode              EpochMode
 	CreatedAt              time.Time
 }
 
@@ -34,6 +48,11 @@ type GoalRegistry struct {
 func NewGoalRegistry(pool *Pool) *GoalRegistry {
 	return &GoalRegistry{pool: pool}
 }
+
+// goalColumns is the read projection Get and List share, so their column order
+// and scan order cannot drift apart.
+const goalColumns = "optimization_function_id, goal_text, evaluation_matrix, datasource_ref, " +
+	"target_fields, confidence_threshold, epoch_mode, created_at"
 
 // Insert persists a registered goal. A document goal writes a NULL
 // evaluation_matrix and populated target_fields; a tabular goal does the reverse.
@@ -52,10 +71,16 @@ func (g *GoalRegistry) Insert(ctx context.Context, goal Goal) error {
 			return fmt.Errorf("marshal evaluation matrix: %w", err)
 		}
 	}
+	epochMode := goal.EpochMode
+	if epochMode == "" {
+		epochMode = EpochSpeculative
+	}
 	_, err = g.pool.Exec(ctx,
-		"INSERT INTO goal_registry (optimization_function_id, goal_text, evaluation_matrix, datasource_ref, target_fields) "+
-			"VALUES ($1, $2, $3, $4, $5)",
+		"INSERT INTO goal_registry "+
+			"(optimization_function_id, goal_text, evaluation_matrix, datasource_ref, target_fields, confidence_threshold, epoch_mode) "+
+			"VALUES ($1, $2, $3, $4, $5, $6, $7)",
 		goal.OptimizationFunctionID, goal.GoalText, matrix, goal.DataSourceRef, targetFields,
+		goal.ConfidenceThreshold, epochMode,
 	)
 	if err != nil {
 		return fmt.Errorf("insert goal: %w", err)
@@ -72,10 +97,10 @@ func (g *GoalRegistry) Get(ctx context.Context, optimizationFunctionID string) (
 	var goal Goal
 	var matrix, targetFields []byte
 	err := g.pool.QueryRow(ctx,
-		"SELECT optimization_function_id, goal_text, evaluation_matrix, datasource_ref, target_fields, created_at "+
-			"FROM goal_registry WHERE optimization_function_id = $1",
+		"SELECT "+goalColumns+" FROM goal_registry WHERE optimization_function_id = $1",
 		optimizationFunctionID,
-	).Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix, &goal.DataSourceRef, &targetFields, &goal.CreatedAt)
+	).Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix, &goal.DataSourceRef, &targetFields,
+		&goal.ConfidenceThreshold, &goal.EpochMode, &goal.CreatedAt)
 	if err != nil {
 		return Goal{}, fmt.Errorf("get goal %q: %w", optimizationFunctionID, err)
 	}
@@ -90,8 +115,7 @@ func (g *GoalRegistry) Get(ctx context.Context, optimizationFunctionID string) (
 // goals decodes without a NULL-column error.
 func (g *GoalRegistry) List(ctx context.Context) ([]Goal, error) {
 	rows, err := g.pool.Query(ctx,
-		"SELECT optimization_function_id, goal_text, evaluation_matrix, datasource_ref, target_fields, created_at "+
-			"FROM goal_registry ORDER BY created_at DESC",
+		"SELECT "+goalColumns+" FROM goal_registry ORDER BY created_at DESC",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list goals: %w", err)
@@ -103,7 +127,8 @@ func (g *GoalRegistry) List(ctx context.Context) ([]Goal, error) {
 		var goal Goal
 		var matrix, targetFields []byte
 		if err := rows.Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix,
-			&goal.DataSourceRef, &targetFields, &goal.CreatedAt); err != nil {
+			&goal.DataSourceRef, &targetFields, &goal.ConfidenceThreshold, &goal.EpochMode,
+			&goal.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan goal row: %w", err)
 		}
 		if err := decodeGoalObjective(&goal, matrix, targetFields); err != nil {

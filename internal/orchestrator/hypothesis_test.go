@@ -853,9 +853,13 @@ func TestWriteExtractionTripletScopesNodesToTheGoal(t *testing.T) {
 	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
 
 	field := domain.TargetField{Name: "invoice_total"}
-	if err := srv.writeExtractionTriplet(context.Background(), documentGoal([]domain.TargetField{field}),
-		field, "ocr", 0.5, "42", 0.9, nil); err != nil {
+	outcomeID, err := srv.writeExtractionTriplet(context.Background(), documentGoal([]domain.TargetField{field}),
+		field, "ocr", 0.5, "42", 0.9, nil)
+	if err != nil {
 		t.Fatalf("write extraction triplet: %v", err)
+	}
+	if outcomeID != repo.outcomes[0].ID {
+		t.Fatalf("returned outcome id %q does not identify the persisted outcome %q", outcomeID, repo.outcomes[0].ID)
 	}
 
 	if len(repo.states) != 1 || len(repo.interventions) != 1 || len(repo.outcomes) != 1 {

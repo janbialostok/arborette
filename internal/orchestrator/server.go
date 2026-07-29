@@ -13,6 +13,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -82,6 +84,21 @@ type runStore interface {
 	LatestByGoal(ctx context.Context, goalIDs []string) (map[string]store.Run, error)
 }
 
+// verificationQueue is the human-review queue surface the loop (routing) and the
+// verification handlers (listing, claiming, repairing) share. Enqueue and
+// EnqueueResolved are separate rather than one upsert because they answer
+// different questions: the loop queues a below-threshold outcome for later
+// review, while a resolution of a never-queued outcome records review that has
+// already happened.
+type verificationQueue interface {
+	Enqueue(ctx context.Context, entry store.VerificationEntry) error
+	EnqueueResolved(ctx context.Context, entry store.VerificationEntry, resolution store.QueueResolution, correctedValue string) error
+	Resolve(ctx context.Context, outcomeID string, resolution store.QueueResolution, correctedValue string) error
+	Unclaim(ctx context.Context, outcomeID string, resolution store.QueueResolution) error
+	GetByOutcome(ctx context.Context, outcomeID string) (store.VerificationEntry, error)
+	ListForGoal(ctx context.Context, goalID string, status store.QueueStatus) ([]store.VerificationEntry, error)
+}
+
 type auditStore interface {
 	Append(ctx context.Context, record store.AuditRecord) error
 }
@@ -98,21 +115,32 @@ type heuristicsService interface {
 }
 
 // Server is the HTTP surface of the orchestrator, holding its collaborators.
+// histograms holds the confidence distribution of each in-flight run, keyed by
+// goal like the hub; see registerHistogram for why that state is in-memory and
+// how its lifetime is serialized against the hub's.
 type Server struct {
-	repo              graph.Repository
-	goals             goalStore
-	runs              runStore
-	audits            auditStore
-	objects           objectStore
-	heur              heuristicsService
-	claude            claudeClient
-	chat              chatStreamer
-	sandbox           sandboxExecutor
-	hub               *Hub
-	jobs              JobLauncher
-	identity          Identity
-	localImportDir    string
-	sleepCycleJobName string
+	repo                graph.Repository
+	goals               goalStore
+	runs                runStore
+	queue               verificationQueue
+	audits              auditStore
+	objects             objectStore
+	heur                heuristicsService
+	claude              claudeClient
+	chat                chatStreamer
+	sandbox             sandboxExecutor
+	hub                 *Hub
+	jobs                JobLauncher
+	identity            Identity
+	localImportDir      string
+	sleepCycleJobName   string
+	hitlThreshold       float64
+	blockingLoopTimeout time.Duration
+	verificationPoll    time.Duration
+	keepaliveInterval   time.Duration
+
+	histMu     sync.Mutex
+	histograms map[string]*confidenceHistogram
 }
 
 // NewServer wires the server from its collaborators (infra-constructor
@@ -121,6 +149,7 @@ func NewServer(
 	repo graph.Repository,
 	goals goalStore,
 	runs runStore,
+	queue verificationQueue,
 	audits auditStore,
 	objects objectStore,
 	heur heuristicsService,
@@ -131,22 +160,30 @@ func NewServer(
 	jobs JobLauncher,
 	identity Identity,
 	localImportDir, sleepCycleJobName string,
+	hitlThreshold float64,
+	blockingLoopTimeout time.Duration,
 ) *Server {
 	return &Server{
-		repo:              repo,
-		goals:             goals,
-		runs:              runs,
-		audits:            audits,
-		objects:           objects,
-		heur:              heur,
-		claude:            claude,
-		chat:              chat,
-		sandbox:           sandbox,
-		hub:               hub,
-		jobs:              jobs,
-		identity:          identity,
-		localImportDir:    localImportDir,
-		sleepCycleJobName: sleepCycleJobName,
+		repo:                repo,
+		goals:               goals,
+		runs:                runs,
+		queue:               queue,
+		audits:              audits,
+		objects:             objects,
+		heur:                heur,
+		claude:              claude,
+		chat:                chat,
+		sandbox:             sandbox,
+		hub:                 hub,
+		jobs:                jobs,
+		identity:            identity,
+		localImportDir:      localImportDir,
+		sleepCycleJobName:   sleepCycleJobName,
+		hitlThreshold:       hitlThreshold,
+		blockingLoopTimeout: blockingLoopTimeout,
+		verificationPoll:    defaultVerificationPoll,
+		keepaliveInterval:   defaultKeepaliveInterval,
+		histograms:          map[string]*confidenceHistogram{},
 	}
 }
 
@@ -159,6 +196,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /goals/{id}/stream", s.handleStream)
 	mux.HandleFunc("POST /goals/{id}/chat", s.handleChat)
 	mux.HandleFunc("POST /goals/{id}/sleep-cycle", s.handleTriggerSleepCycle)
+	mux.HandleFunc("GET /goals/{id}/verifications", s.handleListVerifications)
+	mux.HandleFunc("POST /goals/{id}/verifications/{outcomeID}", s.handleResolveVerification)
+	mux.HandleFunc("GET /goals/{id}/outcomes", s.handleListOutcomes)
+	mux.HandleFunc("GET /goals/{id}/outcomes/{outcomeID}/excerpt", s.handleOutcomeExcerpt)
 	mux.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
 	mux.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)
 	mux.HandleFunc("POST /internal/audit", s.handleAudit)

@@ -11,9 +11,18 @@ const replayBufferSize = 256
 
 // Event is one progress item published to a run's subscribers and serialized as
 // an SSE data frame.
+//
+// Coalesce marks an event whose latest value supersedes its predecessors (a
+// cumulative distribution, not an append-only fact), so the replay buffer keeps
+// only the newest frame of that type instead of one per update -- without it a
+// per-triplet cumulative frame would roughly double a run's frame count and
+// evict the earliest triplets the buffer is sized to replay. It is a hub-internal
+// routing hint and is deliberately untagged for the wire: frames are marshalled
+// whole, so an exported field would appear in every event a client parses.
 type Event struct {
-	Type    string         `json:"type"`
-	Payload map[string]any `json:"payload,omitempty"`
+	Type     string         `json:"type"`
+	Payload  map[string]any `json:"payload,omitempty"`
+	Coalesce bool           `json:"-"`
 }
 
 // Hub is an in-memory pub/sub keyed by optimization_function_id. Because the
@@ -30,6 +39,16 @@ type Hub struct {
 type runState struct {
 	buffer      []Event
 	subscribers map[chan Event]struct{}
+}
+
+func (rs *runState) replaceBuffered(ev Event) bool {
+	for i := range rs.buffer {
+		if rs.buffer[i].Type == ev.Type {
+			rs.buffer[i] = ev
+			return true
+		}
+	}
+	return false
 }
 
 // NewHub builds an empty hub.
@@ -76,14 +95,17 @@ func (h *Hub) Subscribe(id string) (replay []Event, ch chan Event, cancel func()
 	return replay, ch, cancel
 }
 
-// Publish appends the event to the run's replay buffer and fans it out to live
+// Publish records the event in the run's replay buffer and fans it out to live
 // subscribers. A slow subscriber's send is dropped rather than blocking the
-// loop.
+// loop. A coalescing event replaces its predecessor in place, so a replay keeps
+// the buffer's original ordering rather than jumping the newest value to the end.
 func (h *Hub) Publish(id string, ev Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	rs := h.run(id)
-	rs.buffer = append(rs.buffer, ev)
+	if !ev.Coalesce || !rs.replaceBuffered(ev) {
+		rs.buffer = append(rs.buffer, ev)
+	}
 	if len(rs.buffer) > replayBufferSize {
 		rs.buffer = rs.buffer[len(rs.buffer)-replayBufferSize:]
 	}
@@ -93,6 +115,22 @@ func (h *Hub) Publish(id string, ev Event) {
 		default:
 		}
 	}
+}
+
+// PublishLive is Publish for an event that only makes sense while a run is
+// streaming. It drops the event when no run state exists rather than creating
+// it, which plain Publish does -- a late frame would otherwise resurrect state
+// Complete just evicted, and nothing would ever clean it up again. Concurrent
+// runs for one goal share this key, so a still-running run can publish after a
+// sibling completed; that is exactly the case this guards.
+func (h *Hub) PublishLive(id string, ev Event) {
+	h.mu.Lock()
+	live := h.runs[id] != nil
+	h.mu.Unlock()
+	if !live {
+		return
+	}
+	h.Publish(id, ev)
 }
 
 // Complete evicts the run: it closes and drops every subscriber channel (ending

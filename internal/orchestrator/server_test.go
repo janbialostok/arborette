@@ -12,7 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -79,9 +81,154 @@ func (f *fakeRuns) LatestByGoal(_ context.Context, _ []string) (map[string]store
 	return f.latest, f.latestErr
 }
 
+// fakeQueue is an in-memory verification queue keyed by outcome, reproducing the
+// store's guarded-claim semantics (a claim on an already-resolved entry loses)
+// so handler tests exercise the real ownership and repair branches. Hooks let a
+// test force a failure or observe compensation.
+type fakeQueue struct {
+	mu                sync.Mutex
+	entries           map[string]store.VerificationEntry
+	enqueued          []store.VerificationEntry
+	unclaimed         []string
+	enqueueErr        error
+	getErr            error
+	resolveErr        error
+	getByOutcomeCalls int
+}
+
+func newFakeQueue(entries ...store.VerificationEntry) *fakeQueue {
+	q := &fakeQueue{entries: map[string]store.VerificationEntry{}}
+	for _, e := range entries {
+		q.entries[e.OutcomeID] = e
+	}
+	return q
+}
+
+func (q *fakeQueue) Enqueue(_ context.Context, entry store.VerificationEntry) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.enqueueErr != nil {
+		return q.enqueueErr
+	}
+	entry.Status = store.QueuePending
+	q.entries[entry.OutcomeID] = entry
+	q.enqueued = append(q.enqueued, entry)
+	return nil
+}
+
+func (q *fakeQueue) EnqueueResolved(_ context.Context, entry store.VerificationEntry, resolution store.QueueResolution, correctedValue string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.enqueueErr != nil {
+		return q.enqueueErr
+	}
+	if _, exists := q.entries[entry.OutcomeID]; exists {
+		return store.ErrAlreadyResolved
+	}
+	entry.Status = store.QueueResolved
+	entry.Resolution = resolution
+	entry.CorrectedValue = correctedValue
+	q.entries[entry.OutcomeID] = entry
+	q.enqueued = append(q.enqueued, entry)
+	return nil
+}
+
+func (q *fakeQueue) Resolve(_ context.Context, outcomeID string, resolution store.QueueResolution, correctedValue string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.resolveErr != nil {
+		return q.resolveErr
+	}
+	entry, ok := q.entries[outcomeID]
+	if !ok || entry.Status != store.QueuePending {
+		return store.ErrAlreadyResolved
+	}
+	entry.Status = store.QueueResolved
+	entry.Resolution = resolution
+	entry.CorrectedValue = correctedValue
+	q.entries[outcomeID] = entry
+	return nil
+}
+
+func (q *fakeQueue) Unclaim(ctx context.Context, outcomeID string, resolution store.QueueResolution) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entry, ok := q.entries[outcomeID]
+	if !ok || entry.Status != store.QueueResolved || entry.Resolution != resolution {
+		return nil
+	}
+	entry.Status = store.QueuePending
+	entry.Resolution = ""
+	entry.CorrectedValue = ""
+	q.entries[outcomeID] = entry
+	q.unclaimed = append(q.unclaimed, outcomeID)
+	return nil
+}
+
+func (q *fakeQueue) GetByOutcome(_ context.Context, outcomeID string) (store.VerificationEntry, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.getByOutcomeCalls++
+	if q.getErr != nil {
+		return store.VerificationEntry{}, q.getErr
+	}
+	entry, ok := q.entries[outcomeID]
+	if !ok {
+		return store.VerificationEntry{}, pgx.ErrNoRows
+	}
+	return entry, nil
+}
+
+// entry and pendingOutcomes read queue state under the lock, so a test can
+// assert on (or act on) it while the loop polls from its own goroutine.
+func (q *fakeQueue) entry(outcomeID string) store.VerificationEntry {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.entries[outcomeID]
+}
+
+func (q *fakeQueue) pendingOutcomes() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var ids []string
+	for id, entry := range q.entries {
+		if entry.Status == store.QueuePending {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func (q *fakeQueue) ListForGoal(_ context.Context, goalID string, status store.QueueStatus) ([]store.VerificationEntry, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.getErr != nil {
+		return nil, q.getErr
+	}
+	var out []store.VerificationEntry
+	for _, e := range q.entries {
+		if e.OptimizationFunctionID != goalID {
+			continue
+		}
+		if status != "" && e.Status != status {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
 type fakeAudits struct{ records []store.AuditRecord }
 
-func (f *fakeAudits) Append(_ context.Context, r store.AuditRecord) error {
+func (f *fakeAudits) Append(ctx context.Context, r store.AuditRecord) error {
+	// A real pool fails a write on a cancelled context, so this does too --
+	// otherwise a handler that passes the wrong context looks correct here.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.records = append(f.records, r)
 	return nil
 }
@@ -188,13 +335,48 @@ func (f *fakeClaude) Extract(_ context.Context, _ []byte, _ domain.TargetField, 
 	return f.extractValue, f.extractConfidence, nil
 }
 
+// verificationCall records one applied resolution so a handler test can assert
+// what reached the graph.
+type verificationCall struct {
+	outcomeID  string
+	status     domain.VerificationStatus
+	confidence float64
+}
+
+// valueCall records the value half of one correction written back to an outcome.
+type valueCall struct {
+	outcomeID  string
+	value      map[string]any
+	provenance *domain.ProvenanceLocator
+}
+
 // fakeRepo is a no-op graph.Repository that records the nodes writeTriplet
 // persists, so a loop test can assert the objective-label keying end to end.
+// The extraction-outcome fields additionally back the verification handlers:
+// extraction is returned by both outcome reads, and the update hooks record what
+// a resolution wrote or fail it on demand.
 type fakeRepo struct {
 	states        []domain.State
 	interventions []domain.Intervention
 	outcomes      []domain.Outcome
 	produced      []domain.ProducedEdge
+
+	mu             sync.Mutex
+	statuses       map[string]domain.VerificationStatus
+	extractionGets int
+	// extractionReadErrs fails that many reads before succeeding, standing in for
+	// a transient graph fault during a long blocking wait.
+	extractionReadErrs int
+	// onVerify fires after a successful verification write, so a test can make
+	// the client disconnect at exactly that moment.
+	onVerify       func()
+	extraction     graph.ExtractionOutcome
+	extractionErr  error
+	extractionList []graph.ExtractionOutcome
+	verifications  []verificationCall
+	verifyErr      error
+	values         []valueCall
+	valueErr       error
 }
 
 func (f *fakeRepo) CreateState(_ context.Context, s domain.State) error {
@@ -206,7 +388,13 @@ func (f *fakeRepo) CreateIntervention(_ context.Context, i domain.Intervention) 
 	return nil
 }
 func (f *fakeRepo) CreateOutcome(_ context.Context, o domain.Outcome) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.outcomes = append(f.outcomes, o)
+	if f.statuses == nil {
+		f.statuses = map[string]domain.VerificationStatus{}
+	}
+	f.statuses[o.ID] = o.VerificationStatus
 	return nil
 }
 func (f *fakeRepo) GetState(_ context.Context, _ string) (domain.State, error) {
@@ -233,8 +421,80 @@ func (f *fakeRepo) ClearEmbeddingPending(_ context.Context, _ string) error { re
 func (f *fakeRepo) ListEmbeddingPending(_ context.Context) ([]domain.MetaHeuristic, error) {
 	return nil, nil
 }
-func (f *fakeRepo) UpdateOutcomeVerification(_ context.Context, _ string, _ domain.VerificationStatus, _ float64) error {
+func (f *fakeRepo) UpdateOutcomeVerification(_ context.Context, outcomeID string, status domain.VerificationStatus, confidence float64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.onVerify != nil {
+		f.onVerify()
+	}
+	if f.verifyErr != nil {
+		return f.verifyErr
+	}
+	f.verifications = append(f.verifications, verificationCall{outcomeID: outcomeID, status: status, confidence: confidence})
+	// The recorded write is what a later read must observe, so the repair path,
+	// the compensation check, and the loop's blocking gate all see the same state
+	// a real graph would return.
+	f.extraction.VerificationStatus = status
+	f.setStatusLocked(outcomeID, status)
 	return nil
+}
+
+// setStatusLocked records an outcome's status for reads by id. Callers hold f.mu.
+func (f *fakeRepo) setStatusLocked(outcomeID string, status domain.VerificationStatus) {
+	if f.statuses == nil {
+		f.statuses = map[string]domain.VerificationStatus{}
+	}
+	f.statuses[outcomeID] = status
+}
+func (f *fakeRepo) CorrectOutcome(_ context.Context, outcomeID string, value map[string]any, provenance *domain.ProvenanceLocator, status domain.VerificationStatus, confidence float64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.valueErr != nil {
+		return f.valueErr
+	}
+	f.setStatusLocked(outcomeID, status)
+	f.values = append(f.values, valueCall{outcomeID: outcomeID, value: value, provenance: provenance})
+	f.verifications = append(f.verifications, verificationCall{outcomeID: outcomeID, status: status, confidence: confidence})
+	f.extraction.VerificationStatus = status
+	f.extraction.Value = value
+	f.extraction.Provenance = provenance
+	return nil
+}
+
+// polls reports how many times the blocking gate read an outcome's status.
+func (f *fakeRepo) polls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.extractionGets
+}
+
+func (f *fakeRepo) ListExtractionOutcomes(_ context.Context, _ string) ([]graph.ExtractionOutcome, error) {
+	return f.extractionList, f.extractionErr
+}
+func (f *fakeRepo) GetExtractionOutcome(ctx context.Context, outcomeID string) (graph.ExtractionOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.extractionGets++
+	if err := ctx.Err(); err != nil {
+		return graph.ExtractionOutcome{}, err
+	}
+	if f.extractionReadErrs > 0 {
+		f.extractionReadErrs--
+		return graph.ExtractionOutcome{}, errors.New("neo4j unreachable")
+	}
+	if f.extractionErr != nil {
+		return graph.ExtractionOutcome{}, f.extractionErr
+	}
+	// An outcome this fake actually persisted reads back with its own status, so
+	// the loop's blocking gate observes verdicts the way it would against a real
+	// graph; handler tests that seed only `extraction` keep using it.
+	if status, ok := f.statuses[outcomeID]; ok {
+		out := f.extraction
+		out.OutcomeID = outcomeID
+		out.VerificationStatus = status
+		return out, nil
+	}
+	return f.extraction, nil
 }
 func (f *fakeRepo) TraceCausalChain(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
 	return nil, nil
@@ -313,6 +573,10 @@ func (f *fakeChat) Chat(ctx context.Context, system string, msgs []llm.ChatMessa
 	return f.err
 }
 
+// testHITLThreshold is the review threshold every test server runs with, fixed
+// here so a test states confidences relative to a known bar.
+const testHITLThreshold = 0.8
+
 func newTestServer(goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
 	return newTestServerRepo(nil, goals, audits, objects, heur, claude, sandbox)
 }
@@ -320,8 +584,20 @@ func newTestServer(goals goalStore, audits auditStore, objects objectStore, heur
 // newTestServerRepo is newTestServer with an explicit graph.Repository, for loop
 // tests that assert the nodes writeTriplet persists.
 func newTestServerRepo(repo graph.Repository, goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
-	return NewServer(repo, goals, &fakeRuns{}, audits, objects, heur, claude, &fakeChat{}, sandbox,
-		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, "", "arborette-sleepcycle")
+	return newTestServerQueue(repo, newFakeQueue(), goals, audits, objects, heur, claude, sandbox)
+}
+
+// newTestServerQueue is newTestServerRepo with an explicit verification queue,
+// for the review handlers and the loop's routing and blocking-gate paths.
+func newTestServerQueue(repo graph.Repository, queue verificationQueue, goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
+	srv := NewServer(repo, goals, &fakeRuns{}, queue, audits, objects, heur, claude, &fakeChat{}, sandbox,
+		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, "", "arborette-sleepcycle",
+		testHITLThreshold, time.Minute)
+	// The blocking gate and the stream keepalive are both paced for humans; a
+	// test asserting that they fire at all should not pay for that.
+	srv.verificationPoll = time.Millisecond
+	srv.keepaliveInterval = time.Millisecond
+	return srv
 }
 
 // multipartBody builds a multipart/form-data body with the given fields and an
@@ -562,8 +838,8 @@ func TestIngestLocalReadsWithinMount(t *testing.T) {
 		t.Fatalf("write file: %v", err)
 	}
 	objects := &fakeObjects{}
-	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeChat{}, &fakeSandbox{},
-		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, dir, "job")
+	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, newFakeQueue(), &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeChat{}, &fakeSandbox{},
+		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, dir, "job", testHITLThreshold, time.Minute)
 
 	ref, err := srv.ingestLocal(context.Background(), "data.csv")
 	if err != nil {
@@ -585,8 +861,8 @@ func TestIngestLocalRejectsSymlinkEscape(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 	objects := &fakeObjects{}
-	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeChat{}, &fakeSandbox{},
-		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, mount, "job")
+	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, newFakeQueue(), &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeChat{}, &fakeSandbox{},
+		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, mount, "job", testHITLThreshold, time.Minute)
 
 	if _, err := srv.ingestLocal(context.Background(), "link.csv"); !errors.Is(err, errPathEscape) {
 		t.Fatalf("error = %v, want errPathEscape", err)
@@ -597,7 +873,8 @@ func TestIngestLocalRejectsSymlinkEscape(t *testing.T) {
 }
 
 func TestHandleStreamReplaysBufferedEvents(t *testing.T) {
-	srv := newTestServer(&fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
+	goals := &fakeGoals{get: store.Goal{OptimizationFunctionID: "run-1"}}
+	srv := newTestServer(goals, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
 	srv.hub.Publish("run-1", Event{Type: "triplet", Payload: map[string]any{"value": 5.0}})
 
 	// An already-cancelled context: the replay is written before the loop checks

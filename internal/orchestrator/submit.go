@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +40,39 @@ var (
 	errNoImportDir = errors.New("on-disk import is not configured")
 )
 
+// reviewSettings are a goal's optional human-review overrides, carried from the
+// registration form to whichever insert path the source kind selects. A nil
+// threshold means the goal takes the service-wide default.
+type reviewSettings struct {
+	threshold *float64
+	epochMode store.EpochMode
+}
+
+// parseReviewSettings reads the optional review overrides off the registration
+// form. Both are validated here rather than at first use, so a typo is a
+// rejected registration instead of a goal that silently runs under the defaults.
+func parseReviewSettings(r *http.Request) (reviewSettings, error) {
+	var settings reviewSettings
+	if raw := strings.TrimSpace(r.FormValue("confidence_threshold")); raw != "" {
+		threshold, err := strconv.ParseFloat(raw, 64)
+		// NaN has to be rejected explicitly: ParseFloat accepts it, and every
+		// comparison against it is false, so a range check alone lets it through --
+		// after which no extraction ever clears the threshold and the settings
+		// cannot be marshalled back to the analyst.
+		if err != nil || math.IsNaN(threshold) || threshold <= 0 || threshold > 1 {
+			return reviewSettings{}, errors.New("confidence_threshold must be a number greater than 0 and at most 1")
+		}
+		settings.threshold = &threshold
+	}
+	switch mode := store.EpochMode(strings.TrimSpace(r.FormValue("epoch_mode"))); mode {
+	case "", store.EpochSpeculative, store.EpochBlocking:
+		settings.epochMode = mode
+	default:
+		return reviewSettings{}, errors.New(`epoch_mode must be "speculative" or "blocking"`)
+	}
+	return settings, nil
+}
+
 // handleSubmitGoal registers an analyst goal: it ingests the data source into the
 // object store, introspects the source as a precondition, fits the Evaluation
 // Matrix to that schema, validates the fitted objective by a dry-run against the
@@ -54,6 +89,11 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	goal := strings.TrimSpace(r.FormValue("goal"))
 	if goal == "" {
 		writeErr(w, http.StatusBadRequest, "goal is required")
+		return
+	}
+	review, err := parseReviewSettings(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -76,7 +116,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	// of fields to extract accurately. Branch here so the tabular objective-fitting
 	// path below is never entered for a document goal.
 	if introspect.Schema.Kind == string(datasource.KindDocument) {
-		s.submitDocumentGoal(ctx, w, goal, ref, introspect.Sample)
+		s.submitDocumentGoal(ctx, w, goal, ref, introspect.Sample, review)
 		return
 	}
 	schema := toSandboxSchema(introspect.Schema)
@@ -117,6 +157,8 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		GoalText:               goal,
 		EvaluationMatrix:       matrix,
 		DataSourceRef:          ref,
+		ConfidenceThreshold:    review.threshold,
+		EpochMode:              review.epochMode,
 	}); err != nil {
 		log.Printf("orchestrator: insert goal: %v", err)
 		writeErr(w, http.StatusInternalServerError, "internal error")
@@ -140,7 +182,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 // the tabular path (optimization_function_id), so the caller cannot tell the two
 // intake flows apart. A Claude fault is a 502, matching the tabular generation
 // failure mapping.
-func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, goal, ref, sample string) {
+func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, goal, ref, sample string, review reviewSettings) {
 	fields, err := s.claude.IntrospectDocumentFields(ctx, goal, sample)
 	if err != nil {
 		log.Printf("orchestrator: introspect document fields: %v", err)
@@ -158,6 +200,8 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 		GoalText:               goal,
 		TargetFields:           fields,
 		DataSourceRef:          ref,
+		ConfidenceThreshold:    review.threshold,
+		EpochMode:              review.epochMode,
 	}); err != nil {
 		log.Printf("orchestrator: insert goal: %v", err)
 		writeErr(w, http.StatusInternalServerError, "internal error")
@@ -310,19 +354,27 @@ func contentTypeForPath(path string) string {
 func (s *Server) writeIntakeErr(w http.ResponseWriter, err error) {
 	var se *SandboxError
 	if errors.As(err, &se) {
-		switch {
-		case se.Status == http.StatusBadRequest:
-			writeErr(w, http.StatusBadRequest, se.Message)
-		case se.Status == http.StatusNotFound:
-			writeErr(w, http.StatusNotFound, se.Message)
-		default:
-			log.Printf("orchestrator: sandbox fault during intake: %v", err)
-			writeErr(w, http.StatusBadGateway, "sandbox unavailable")
-		}
+		writeSandboxStatus(w, se, "intake")
 		return
 	}
 	log.Printf("orchestrator: intake sandbox call: %v", err)
 	writeErr(w, http.StatusBadGateway, "sandbox unavailable")
+}
+
+// writeSandboxStatus maps a sandbox fault to a status for whichever phase hit
+// it. The phase reaches the log rather than the response so an operator grepping
+// a fault knows whether it came from registering a goal or from reviewing one,
+// without the analyst's error text differing between the two.
+func writeSandboxStatus(w http.ResponseWriter, se *SandboxError, phase string) {
+	switch se.Status {
+	case http.StatusBadRequest:
+		writeErr(w, http.StatusBadRequest, se.Message)
+	case http.StatusNotFound:
+		writeErr(w, http.StatusNotFound, se.Message)
+	default:
+		log.Printf("orchestrator: sandbox fault during %s: %v", phase, se)
+		writeErr(w, http.StatusBadGateway, "sandbox unavailable")
+	}
 }
 
 // writeIngestErr maps an ingestion error to a status: validation and escape

@@ -1,0 +1,43 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 433 >>
+stream
+BT
+/F1 14 Tf
+1 0 0 1 72 720 Tm (Acme Supply Co. - Invoice) Tj
+1 0 0 1 72 690 Tm (Invoice Number: INV-2026-0042) Tj
+1 0 0 1 72 665 Tm (Invoice Date: 2026-01-14) Tj
+1 0 0 1 72 640 Tm (Effective Date: 2026-02-01) Tj
+1 0 0 1 72 615 Tm (Customer: Northwind Trading) Tj
+1 0 0 1 72 590 Tm (Payment Terms: Net 30) Tj
+1 0 0 1 72 560 Tm (Subtotal: 1200.00) Tj
+1 0 0 1 72 535 Tm (Tax: 96.00) Tj
+1 0 0 1 72 510 Tm (Invoice Total: 1296.00) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000724 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+794
+%%EOF

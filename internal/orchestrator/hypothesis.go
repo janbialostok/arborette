@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/arborette/arborette/internal/domain"
+	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/llm"
 	"github.com/arborette/arborette/internal/objective"
 	"github.com/arborette/arborette/internal/sandboxclient"
@@ -37,10 +38,10 @@ var (
 // raise it in step with defaultDepth.
 const loopTimeout = 30 * time.Minute
 
-// statusWriteTimeout bounds the run's terminal status write. It runs on a
-// context detached from the loop's own deadline/cancellation, so a run whose
-// loopTimeout expired still records its terminal status instead of stranding at
-// running.
+// statusWriteTimeout bounds a write that must land even though the context which
+// triggered it may already be dead -- the run's terminal status, a branch
+// failure recorded after the deadline expired, or a resolution's audit after the
+// analyst's client hung up. See detached, which derives such a context.
 const statusWriteTimeout = 5 * time.Second
 
 // maxProposalRepairs bounds how many times a node's proposal is re-requested when
@@ -66,18 +67,31 @@ func (s *Server) handleTriggerLoop(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	timeout := s.loopTimeoutFor(goal)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), loopTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		s.runLoop(ctx, goal, runID)
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]any{"optimization_function_id": goal.OptimizationFunctionID})
 }
 
+// loopTimeoutFor bounds a run. A blocking-mode run waits on human review at
+// every queued extraction, so it is bounded on a human timescale instead of the
+// machine-paced default, which review would otherwise blow through and flip the
+// run to failed.
+func (s *Server) loopTimeoutFor(goal store.Goal) time.Duration {
+	if epochModeOf(goal) == store.EpochBlocking {
+		return s.blockingLoopTimeout
+	}
+	return loopTimeout
+}
+
 // runLoop drives the hypothesis tree: introspect the data source, pin the
 // objective and measure the root baseline, then expand each root candidate.
 func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 	id := goal.OptimizationFunctionID
+	hist := s.registerHistogram(id)
 	// termErr holds a terminal (root) failure; nil means the run completed. Only
 	// the root-failure sites below set it, so a per-candidate branch failure (a
 	// separate function with no access to it) never flips the run to failed.
@@ -105,6 +119,10 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		if err := s.runs.SetStatus(writeCtx, runID, status, reason); err != nil {
 			log.Printf("orchestrator: hypothesis loop %q: set run status: %v", id, err)
 		}
+		// Stop tracking before the terminal publish: a resolution racing the end
+		// of the run must not push a distribution into a run the hub is about to
+		// evict (see deregisterHistogram).
+		s.deregisterHistogram(id, hist)
 		s.hub.Publish(id, Event{Type: "loop_complete"})
 		s.hub.Complete(id)
 	}()
@@ -113,7 +131,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 	// one extraction sub-tree per target field. Branch before pinning the objective so a
 	// document goal never trips errNoObjective on the tabular path below.
 	if goal.IsDocument() {
-		termErr = s.runDocumentLoop(ctx, goal)
+		termErr = s.runDocumentLoop(ctx, goal, hist)
 		return
 	}
 
@@ -160,7 +178,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 	}
 
 	for _, cand := range rootCandidates {
-		s.processCandidate(ctx, goal, obj, schema, nil, baseline, cand, 1)
+		s.processCandidate(ctx, goal, obj, schema, nil, baseline, cand, 1, hist)
 	}
 }
 
@@ -168,7 +186,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 // set, writes the causal triplet, and — if the candidate improves the objective
 // within constraints and the depth cap is not reached — proposes and expands its
 // refinement children.
-func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj objective.Objective, schema llm.SandboxSchema, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, depth int) {
+func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj objective.Objective, schema llm.SandboxSchema, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, depth int, hist *confidenceHistogram) {
 	id := goal.OptimizationFunctionID
 	effective := concatFilters(parentFilters, cand.Filters)
 
@@ -193,11 +211,16 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 		log.Printf("orchestrator: hypothesis loop %q: sandbox returned no row count for a counted measurement", id)
 	}
 
-	if err := s.writeTriplet(ctx, goal, obj, parentFilters, baseline, cand, effective, value, support); err != nil {
+	outcomeID, err := s.writeTriplet(ctx, goal, obj, parentFilters, baseline, cand, effective, value, support)
+	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: write triplet: %v", id, err)
 		s.branchFailure(ctx, id, effective, err)
 		return
 	}
+	// A query measurement is verified by construction, so it lands in the top
+	// bucket; counting it keeps the live distribution spanning the whole run
+	// rather than only its extractions.
+	s.recordConfidence(id, hist, outcomeID, verifiedConfidence)
 
 	if !objective.Improves(baseline, value, obj.Direction) {
 		return
@@ -222,7 +245,7 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 		return
 	}
 	for _, c := range children {
-		s.processCandidate(ctx, goal, obj, schema, effective, value, c, depth+1)
+		s.processCandidate(ctx, goal, obj, schema, effective, value, c, depth+1, hist)
 	}
 }
 
@@ -250,7 +273,7 @@ var extractionMethods = []string{
 // It returns a terminal error only for a run-fatal setup failure (the text or
 // bytes fetch); per-field branch failures are non-terminal, like the tabular
 // per-candidate branches.
-func (s *Server) runDocumentLoop(ctx context.Context, goal store.Goal) error {
+func (s *Server) runDocumentLoop(ctx context.Context, goal store.Goal, hist *confidenceHistogram) error {
 	id := goal.OptimizationFunctionID
 
 	textResp, err := s.sandbox.DocumentText(ctx, DocumentTextRequest{DataSourceRef: goal.DataSourceRef})
@@ -276,7 +299,7 @@ func (s *Server) runDocumentLoop(ctx context.Context, goal store.Goal) error {
 		// Each competing method is a sibling at the field root; the field root's
 		// baseline confidence is 0, so the first extraction must clear 0 to expand.
 		for _, method := range extractionMethods {
-			s.processExtractionCandidate(ctx, goal, field, pdf, textResp.Pages, method, 0.0, 1)
+			s.processExtractionCandidate(ctx, goal, field, pdf, textResp.Pages, method, 0.0, 1, hist)
 		}
 	}
 	return nil
@@ -291,7 +314,7 @@ func (s *Server) runDocumentLoop(ctx context.Context, goal store.Goal) error {
 // processCandidate, which is welded to the tabular objective (aggregation,
 // direction, matrix constraints); extraction has none of those, and runs no
 // constraint check.
-func (s *Server) processExtractionCandidate(ctx context.Context, goal store.Goal, field domain.TargetField, pdf []byte, pages []string, method string, parentConfidence float64, depth int) {
+func (s *Server) processExtractionCandidate(ctx context.Context, goal store.Goal, field domain.TargetField, pdf []byte, pages []string, method string, parentConfidence float64, depth int, hist *confidenceHistogram) {
 	id := goal.OptimizationFunctionID
 
 	value, confidence, err := s.claude.Extract(ctx, pdf, field, method)
@@ -301,9 +324,22 @@ func (s *Server) processExtractionCandidate(ctx context.Context, goal store.Goal
 	}
 
 	locator := locateProvenance(pages, value)
-	if err := s.writeExtractionTriplet(ctx, goal, field, method, parentConfidence, value, confidence, locator); err != nil {
+	outcomeID, err := s.writeExtractionTriplet(ctx, goal, field, method, parentConfidence, value, confidence, locator)
+	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: write extraction triplet: %v", id, err)
 		s.branchFailure(ctx, id, nil, err)
+		return
+	}
+	// Count before routing: once the entry is queued an analyst can resolve it,
+	// and a resolution arriving before the outcome is counted would find nothing
+	// to move between buckets.
+	s.recordConfidence(id, hist, outcomeID, confidence)
+	queued, queueErr := s.routeForVerification(ctx, goal, field, outcomeID, value, confidence, locator)
+	blocking := epochModeOf(goal) == store.EpochBlocking
+	if queueErr != nil && blocking {
+		// Blocking mode cannot degrade into speculative behavior on a queue
+		// failure, so the branch fails instead.
+		s.branchFailure(ctx, id, nil, fmt.Errorf("blocking mode could not queue the extraction for review: %w", queueErr))
 		return
 	}
 
@@ -313,8 +349,96 @@ func (s *Server) processExtractionCandidate(ctx context.Context, goal store.Goal
 	if depth >= defaultDepth {
 		return
 	}
+	// Refining below an unreviewed extraction is what blocking mode exists to
+	// prevent, so the wait sits after the pruning checks: a branch that stops
+	// here never needed the verification it would otherwise have waited for.
+	if queued && blocking {
+		status, err := s.awaitResolution(ctx, id, outcomeID)
+		if err != nil {
+			// The wait only ends in error when the run's deadline expired or it was
+			// cancelled, so the audit for it has to be written detached -- on the
+			// dead context it would be dropped, losing the one record that explains
+			// why a blocking run stopped.
+			failCtx, cancelFail := detached(ctx)
+			s.branchFailure(failCtx, id, nil, err)
+			cancelFail()
+			return
+		}
+		if status == domain.VerificationRejected {
+			return
+		}
+	}
 	for _, m := range extractionMethods {
-		s.processExtractionCandidate(ctx, goal, field, pdf, pages, m, confidence, depth+1)
+		s.processExtractionCandidate(ctx, goal, field, pdf, pages, m, confidence, depth+1, hist)
+	}
+}
+
+// routeForVerification queues an extraction whose confidence falls below the
+// goal's review threshold, reporting whether it was queued and why not. A queue
+// failure is logged rather than returned to the measurement path -- routing a
+// result for review must never cost the measurement itself, the same posture the
+// loop takes toward audit failures -- but it is surfaced to the caller, because
+// blocking mode cannot treat an unqueued extraction as reviewable.
+func (s *Server) routeForVerification(ctx context.Context, goal store.Goal, field domain.TargetField, outcomeID, value string, confidence float64, locator *domain.ProvenanceLocator) (bool, error) {
+	if confidence >= s.effectiveThreshold(goal) {
+		return false, nil
+	}
+	entry := store.VerificationEntry{
+		QueueID:                uuid.NewString(),
+		OptimizationFunctionID: goal.OptimizationFunctionID,
+		OutcomeID:              outcomeID,
+		Field:                  field.Name,
+		ExtractedValue:         value,
+		Provenance:             locator,
+		Confidence:             confidence,
+	}
+	if err := s.queue.Enqueue(ctx, entry); err != nil {
+		log.Printf("orchestrator: hypothesis loop %q: enqueue verification: %v", goal.OptimizationFunctionID, err)
+		return false, err
+	}
+	return true, nil
+}
+
+// defaultVerificationPoll paces the blocking gate's wait. Reviews take minutes
+// at best, so the poll is coarse enough to cost nothing over a long wait and
+// fine enough that the loop resumes promptly once a verdict lands.
+const defaultVerificationPoll = 2 * time.Second
+
+// awaitResolution blocks until a queued extraction's verdict has landed on the
+// outcome itself, returning the resulting verification status. A read failure is
+// logged and retried rather than ending the wait: at the poll cadence a
+// day-long wait issues tens of thousands of reads, and abandoning the branch on
+// one transient fault would discard the very review a human is in the middle of.
+// It watches the
+// graph rather than the queue row deliberately: the row is claimed before the
+// verdict is written through, so resuming on the claim would let the loop prune
+// or refine on a resolution that could still fail and be rolled back -- the
+// opposite of what blocking mode promises. The loop is a single goroutine, so
+// this stalls the whole traversal behind this node, the trade a goal makes by
+// choosing blocking mode. The run's deadline bounds the wait: an expiry (or a
+// cancelled run) ends it as a branch failure rather than hanging.
+func (s *Server) awaitResolution(ctx context.Context, goalID, outcomeID string) (domain.VerificationStatus, error) {
+	ticker := time.NewTicker(s.verificationPoll)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		outcome, err := s.repo.GetExtractionOutcome(ctx, outcomeID)
+		switch {
+		case errors.Is(err, graph.ErrNotFound):
+			// The outcome is gone; no verdict can ever arrive for it.
+			return "", err
+		case err != nil:
+			log.Printf("orchestrator: hypothesis loop %q: read verdict for %q: %v", goalID, outcomeID, err)
+		case outcome.VerificationStatus != domain.VerificationUnverified:
+			return outcome.VerificationStatus, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -350,8 +474,10 @@ func locateProvenance(pages []string, needle string) *domain.ProvenanceLocator {
 // not a causal effect); the PRODUCED edge is tagged accordingly (see
 // domain.EpistemicSource). The start state is the objective measured at the
 // parent's effective filters (the baseline the candidate is judged against);
-// query outcomes are always verified with PRODUCED confidence fixed at 1.0.
-func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objective.Objective, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, effective []domain.Constraint, value float64, support int64) error {
+// query outcomes are always verified with PRODUCED confidence fixed at 1.0. It
+// returns the outcome's id so the caller can count it in the run's confidence
+// distribution.
+func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objective.Objective, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, effective []domain.Constraint, value float64, support int64) (string, error) {
 	stateID := uuid.NewString()
 	state := domain.State{ID: stateID, GoalID: goal.OptimizationFunctionID, Properties: map[string]any{
 		domain.PropDataSourceRef:        goal.DataSourceRef,
@@ -361,7 +487,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 		"value":                         baseline,
 	}}
 	if err := s.repo.CreateState(ctx, state); err != nil {
-		return err
+		return "", err
 	}
 
 	interventionID := uuid.NewString()
@@ -372,20 +498,20 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 		domain.PropEffectiveFilters:     effective,
 	}}
 	if err := s.repo.CreateIntervention(ctx, intervention); err != nil {
-		return err
+		return "", err
 	}
 
 	outcomeID := uuid.NewString()
 	outcome := domain.Outcome{ID: outcomeID, GoalID: goal.OptimizationFunctionID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{obj.Label: value}, Support: support}
 	if err := s.repo.CreateOutcome(ctx, outcome); err != nil {
-		return err
+		return "", err
 	}
 
 	if err := s.repo.CreatePreConditionFor(ctx, stateID, interventionID); err != nil {
-		return err
+		return "", err
 	}
-	if err := s.repo.CreateProduced(ctx, interventionID, outcomeID, domain.ProducedEdge{EffectSize: value - baseline, Confidence: 1.0, EpistemicSource: domain.EpistemicObservational}); err != nil {
-		return err
+	if err := s.repo.CreateProduced(ctx, interventionID, outcomeID, domain.ProducedEdge{EffectSize: value - baseline, Confidence: verifiedConfidence, EpistemicSource: domain.EpistemicObservational}); err != nil {
+		return "", err
 	}
 
 	// Audit every intervention and outcome, not only failures.
@@ -417,7 +543,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 		"filters":                 renderConstraints(effective),
 		domain.PropNewFilters:     renderConstraints(cand.Filters),
 	}})
-	return nil
+	return outcomeID, nil
 }
 
 // writeExtractionTriplet is the extract-path analog of writeTriplet: it persists
@@ -427,8 +553,9 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 // provenance locator, and a PRODUCED confidence that is the model's self-reported
 // value rather than the fixed 1.0. The effect size is the confidence delta over
 // the parent, mirroring the query path's value delta over its baseline. The
-// epistemic source stays observational.
-func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, field domain.TargetField, method string, parentConfidence float64, value string, confidence float64, locator *domain.ProvenanceLocator) error {
+// epistemic source stays observational. It returns the outcome's id so the
+// caller can route it for review and count it in the run's distribution.
+func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, field domain.TargetField, method string, parentConfidence float64, value string, confidence float64, locator *domain.ProvenanceLocator) (string, error) {
 	stateID := uuid.NewString()
 	state := domain.State{ID: stateID, GoalID: goal.OptimizationFunctionID, Properties: map[string]any{
 		domain.PropDataSourceRef: goal.DataSourceRef,
@@ -436,7 +563,7 @@ func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, fi
 		"confidence":             parentConfidence,
 	}}
 	if err := s.repo.CreateState(ctx, state); err != nil {
-		return err
+		return "", err
 	}
 
 	interventionID := uuid.NewString()
@@ -445,7 +572,7 @@ func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, fi
 		"method": method,
 	}}
 	if err := s.repo.CreateIntervention(ctx, intervention); err != nil {
-		return err
+		return "", err
 	}
 
 	outcomeID := uuid.NewString()
@@ -459,18 +586,18 @@ func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, fi
 		Provenance:         locator,
 	}
 	if err := s.repo.CreateOutcome(ctx, outcome); err != nil {
-		return err
+		return "", err
 	}
 
 	if err := s.repo.CreatePreConditionFor(ctx, stateID, interventionID); err != nil {
-		return err
+		return "", err
 	}
 	if err := s.repo.CreateProduced(ctx, interventionID, outcomeID, domain.ProducedEdge{
 		EffectSize:      confidence - parentConfidence,
 		Confidence:      confidence,
 		EpistemicSource: domain.EpistemicObservational,
 	}); err != nil {
-		return err
+		return "", err
 	}
 
 	if err := s.recordAudit(ctx, "hypothesis_intervention", "intervention", map[string]any{
@@ -502,7 +629,7 @@ func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, fi
 		"value":           value,
 		"provenance":      locator,
 	}})
-	return nil
+	return outcomeID, nil
 }
 
 // renderConstraints renders each filter to a predicate chip for the triplet SSE

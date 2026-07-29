@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config is the union of every service's configuration. A given service only
@@ -91,12 +92,20 @@ type SandboxConfig struct {
 // SleepCycleJobName is the named job the Phase-2 trigger launches; LocalImportDir
 // is the read-only mount the on-disk ingestion path resolves relative paths
 // against (a path escaping it is rejected).
+//
+// HITLConfidenceThreshold is the service-wide default below which an extracted
+// value is queued for human review; a goal may override it. BlockingLoopTimeout
+// bounds a run whose goal opted into blocking epoch mode -- such a run waits on
+// human review at each queued node, so it needs a human-scale deadline rather
+// than the loop's own machine-scale one.
 type OrchestratorConfig struct {
-	Port              string
-	SandboxURL        string
-	AnalystID         string
-	SleepCycleJobName string
-	LocalImportDir    string
+	Port                    string
+	SandboxURL              string
+	AnalystID               string
+	SleepCycleJobName       string
+	LocalImportDir          string
+	HITLConfidenceThreshold float64
+	BlockingLoopTimeout     time.Duration
 }
 
 // MCPConfig drives the MCP Server, arborette's read-side interface for
@@ -233,11 +242,13 @@ func Load() (Config, error) {
 			MaxTempDirSize: env("SANDBOX_MAX_TEMP_DIR_SIZE", "2GiB"),
 		},
 		Orchestrator: OrchestratorConfig{
-			Port:              env("ORCHESTRATOR_PORT", "8080"),
-			SandboxURL:        env("SANDBOX_URL", "http://sandbox:8081"),
-			AnalystID:         env("ARBORETTE_ANALYST_ID", "analyst-stub"),
-			SleepCycleJobName: env("SLEEPCYCLE_JOB_NAME", "arborette-sleepcycle"),
-			LocalImportDir:    env("ARBORETTE_LOCAL_IMPORT_DIR", "/import"),
+			Port:                    env("ORCHESTRATOR_PORT", "8080"),
+			SandboxURL:              env("SANDBOX_URL", "http://sandbox:8081"),
+			AnalystID:               env("ARBORETTE_ANALYST_ID", "analyst-stub"),
+			SleepCycleJobName:       env("SLEEPCYCLE_JOB_NAME", "arborette-sleepcycle"),
+			LocalImportDir:          env("ARBORETTE_LOCAL_IMPORT_DIR", "/import"),
+			HITLConfidenceThreshold: floatEnv("HITL_CONFIDENCE_THRESHOLD", 0.8),
+			BlockingLoopTimeout:     time.Duration(intEnv("HITL_BLOCKING_LOOP_TIMEOUT_MINUTES", 1440)) * time.Minute,
 		},
 		MCP: MCPConfig{
 			Port:               env("MCP_PORT", "8082"),
