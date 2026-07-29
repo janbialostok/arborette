@@ -90,7 +90,7 @@ func TestSubmitGoalErrorPaths(t *testing.T) {
 
 	t.Run("on-disk file not found maps to 404", func(t *testing.T) {
 		dir := t.TempDir()
-		srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{},
+		srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeChat{}, &fakeSandbox{},
 			NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, dir, "job")
 		if _, err := srv.ingestLocal(t.Context(), "missing.csv"); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("error = %v, want os.ErrNotExist", err)

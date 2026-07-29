@@ -53,6 +53,14 @@ type claudeClient interface {
 	Extract(ctx context.Context, pdf []byte, field domain.TargetField, method string) (string, float64, error)
 }
 
+// chatStreamer is the streaming Claude the agent-preview endpoint drives. It is
+// a separate collaborator from claudeClient because the preview runs on a
+// different API surface -- streamed, and connected to the MCP server -- and
+// because a handler streaming to the browser needs no structured-output calls.
+type chatStreamer interface {
+	Chat(ctx context.Context, system string, msgs []llm.ChatMessage, emit func(llm.ChatEvent) error) error
+}
+
 type sandboxExecutor interface {
 	Introspect(ctx context.Context, req IntrospectRequest) (IntrospectResponse, error)
 	Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error)
@@ -98,6 +106,7 @@ type Server struct {
 	objects           objectStore
 	heur              heuristicsService
 	claude            claudeClient
+	chat              chatStreamer
 	sandbox           sandboxExecutor
 	hub               *Hub
 	jobs              JobLauncher
@@ -116,6 +125,7 @@ func NewServer(
 	objects objectStore,
 	heur heuristicsService,
 	claude claudeClient,
+	chat chatStreamer,
 	sandbox sandboxExecutor,
 	hub *Hub,
 	jobs JobLauncher,
@@ -130,6 +140,7 @@ func NewServer(
 		objects:           objects,
 		heur:              heur,
 		claude:            claude,
+		chat:              chat,
 		sandbox:           sandbox,
 		hub:               hub,
 		jobs:              jobs,
@@ -146,6 +157,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /goals", s.handleListGoals)
 	mux.HandleFunc("POST /goals/{id}/hypothesis-loop", s.handleTriggerLoop)
 	mux.HandleFunc("GET /goals/{id}/stream", s.handleStream)
+	mux.HandleFunc("POST /goals/{id}/chat", s.handleChat)
 	mux.HandleFunc("POST /goals/{id}/sleep-cycle", s.handleTriggerSleepCycle)
 	mux.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
 	mux.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)

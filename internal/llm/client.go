@@ -1,11 +1,14 @@
-// Package llm wraps the official Anthropic SDK behind the two structured-output
-// calls the Orchestrator's Active Hypothesis Loop needs: translating an analyst
-// goal into an Evaluation Matrix, and proposing candidate interventions for the
-// hypothesis tree. It is the single contained seam where the codebase departs
-// from the hand-rolled-HTTP convention (internal/embedding/ollama.go): the SDK
-// is pure Go (no CGO), so it is safe under the CGO_ENABLED=0 orchestrator build,
-// and structured outputs plus model-ID currency are materially more involved
-// than a hand-rolled client would justify.
+// Package llm wraps the official Anthropic SDK behind the Claude calls the
+// services need. Client issues the structured-output calls -- matrix fitting,
+// document-field derivation, intervention proposal, extraction, and abstraction.
+// ChatClient streams the analyst-facing agent preview over the beta Messages
+// API.
+//
+// This is the single contained seam where the codebase departs from the
+// hand-rolled-HTTP convention (internal/embedding/ollama.go): the SDK is pure Go
+// (no CGO), so it is safe under the CGO_ENABLED=0 service builds, and structured
+// outputs, streaming, and model-ID currency are materially more involved than a
+// hand-rolled client would justify.
 package llm
 
 import (
@@ -502,7 +505,7 @@ const filterShapeGuide = ` Each filter is {"field":<column>,"op":<operator>,"val
 func treePrompt(goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Analyst goal:\n%s\n\n", goalText)
-	fmt.Fprintf(&b, "Evaluation Matrix:\n%s\n\n", matrixSummary(matrix))
+	fmt.Fprintf(&b, "Evaluation Matrix:\n%s\n\n", MatrixSummary(matrix))
 	fmt.Fprintf(&b, "Available columns:\n%s\n\n", columnSummary(schema))
 	if node.IsRoot {
 		fmt.Fprintf(&b, "This is the root node. Propose up to %d candidate interventions (filters only) that "+
@@ -520,7 +523,11 @@ func treePrompt(goalText string, matrix domain.EvaluationMatrix, schema SandboxS
 	return b.String()
 }
 
-func matrixSummary(matrix domain.EvaluationMatrix) string {
+// MatrixSummary renders an Evaluation Matrix as the readable target/constraint
+// lines Claude is shown. Exported so every prompt describing an objective renders
+// it identically; two renderings that drift would describe the same run
+// differently to the same model.
+func MatrixSummary(matrix domain.EvaluationMatrix) string {
 	var b strings.Builder
 	for _, t := range matrix.Targets {
 		fmt.Fprintf(&b, "- %s %s\n", t.Direction, domain.RenderObjectiveLabel(t.Aggregation, t.ValueExpression()))

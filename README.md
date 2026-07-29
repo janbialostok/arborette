@@ -386,7 +386,7 @@ Nine targets:
 
 ### HTTP API
 
-The Orchestrator's eight routes:
+The Orchestrator's nine routes:
 
 | Method and path | Purpose |
 |---|---|
@@ -394,6 +394,7 @@ The Orchestrator's eight routes:
 | `GET /goals` | List registered objectives with each one's latest run status (synthetic `no run` when never triggered). |
 | `POST /goals/{id}/hypothesis-loop` | Trigger Phase 1. |
 | `GET /goals/{id}/stream` | SSE progress for a goal's run. |
+| `POST /goals/{id}/chat` | One turn of the agent preview, streamed back as SSE. The browser holds the transcript and posts it each turn. Returns 503 until the MCP connector is configured — see `MCP_PUBLIC_URL` in `.env.example`. |
 | `POST /goals/{id}/sleep-cycle` | Trigger Phase 2. **Locally a stub: logs, audits, returns 202, runs nothing** — use `make sleep-cycle`. |
 | `GET /heuristics/search` | Semantic search over published Meta-Heuristics (`q` required; `k` defaults 10, clamped at 100). |
 | `GET /heuristics/{id}/trace` | Trace a Meta-Heuristic back to its supporting triplets. |
@@ -423,7 +424,8 @@ under [Prerequisites](#prerequisites).
 
 | Variable | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude access for matrix fitting, tree proposal, extraction, and abstraction. |
+| `ANTHROPIC_API_KEY` | Claude access for matrix fitting, tree proposal, extraction, abstraction, and the agent chat preview. |
+| `MCP_AUTHORIZATION_TOKEN` | Bearer token the MCP server checks when set; empty disables auth, leaning on the same trusted-network assumption every other published port makes. Setting `MCP_PUBLIC_URL` without a token makes the MCP server refuse to start. |
 | `NEO4J_USER` / `_PASSWORD` | Graph credentials. Compose pins the user to `neo4j`, so only the password is really free. |
 | `POSTGRES_OWNER_USER` / `_PASSWORD` | Superuser: provisions the runtime roles and owns the migrated tables. |
 | `POSTGRES_ORCHESTRATOR_USER` / `_PASSWORD` | The Orchestrator's runtime role — the only one with audit-table privileges. |
@@ -453,16 +455,13 @@ the mapping that reaches it. `WEBUI_PORT` is the one that behaves as it reads.
 
 ### Next up (specified, not yet built)
 
-Three capabilities are specified in `.turbo/shells/` with no implementation yet:
+Two capabilities are specified in `.turbo/shells/` with no implementation yet:
 
 - **Human-in-the-loop verification of extractions.** A queue for low-confidence document
   extractions, its REST surface, write-through of the resolution onto the outcome's verification
   status, and a confidence-binned view of a live run.
-- **A conversational agent over the published knowledge.** An Orchestrator chat endpoint calling
-  Claude with the native MCP connector against the MCP server, scoped to the two read-only tools, so
-  an analyst can interrogate the accumulated heuristics instead of reading the graph.
-- **The web UI for both.** HITL review with source excerpts, a confidence histogram, and a preview
-  agent tab.
+- **The web UI for the review and preview surfaces.** HITL review with source excerpts, a confidence
+  histogram, and a chat tab over `POST /goals/{id}/chat`.
 
 ### In flight
 
@@ -484,8 +483,9 @@ Open themes, each with the reason it is open:
 - **Performance.** Every Sleep-Cycle measurement re-stages the dataset from the object store and
   re-parses it, so a 200-measurement run pays that cost ~200 times over an identical file. The
   Meta-Heuristic read path also fetches nodes one per similarity hit.
-- **Service-boundary and auth hardening.** The service topology is built for a localhost trust
-  model, and the boundaries between services carry no authentication of their own. This needs a
+- **Service-boundary and auth hardening.** Only the MCP server authenticates, and only because the
+  agent preview requires dialing it from outside the network; every other boundary, the
+  Orchestrator's own API included, carries no authentication and no rate limiting. This needs a
   deliberate pass before anything is exposed beyond a laptop.
 
 ### V2 — the dual-engine architecture

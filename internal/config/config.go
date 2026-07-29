@@ -103,9 +103,16 @@ type OrchestratorConfig struct {
 // downstream agents. Port is the streamable-HTTP listen port; OrchestratorURL
 // is the compose hostname of the Orchestrator the submit_analyst_goal tool
 // proxies goal registration to (the MCP server never writes state directly).
+// AuthorizationToken is the bearer token the server requires (a secret with no
+// default; empty disables auth). PublicURL is the publicly reachable address of
+// this server -- deliberately distinct from OrchestratorURL-style in-network
+// hostnames, because the party that dials it is Anthropic's infrastructure, not
+// another compose service.
 type MCPConfig struct {
-	Port            string
-	OrchestratorURL string
+	Port               string
+	OrchestratorURL    string
+	AuthorizationToken string
+	PublicURL          string
 }
 
 // SleepCycleConfig drives the Sleep-Cycle Worker: the two services it calls plus
@@ -130,12 +137,15 @@ type SleepCycleConfig struct {
 	MaxPublications int
 }
 
-// AnthropicConfig points the Claude client at a model and key. Model is
-// overridable so a cheaper/faster structured-output model can back demos without
-// a code change; APIKey is a secret with no default.
+// AnthropicConfig points the Claude clients at their models and key. Model is
+// the structured-output model backing the analytical calls, overridable so a
+// cheaper/faster model can back demos without a code change; ChatModel backs the
+// interactive agent-preview surface, where latency matters more than analytical
+// depth, so the two are tuned separately. APIKey is a secret with no default.
 type AnthropicConfig struct {
-	APIKey string
-	Model  string
+	APIKey    string
+	Model     string
+	ChatModel string
 }
 
 // dsn assembles a libpq/pgx keyword DSN for one role against the shared host.
@@ -230,8 +240,10 @@ func Load() (Config, error) {
 			LocalImportDir:    env("ARBORETTE_LOCAL_IMPORT_DIR", "/import"),
 		},
 		MCP: MCPConfig{
-			Port:            env("MCP_PORT", "8082"),
-			OrchestratorURL: env("ORCHESTRATOR_URL", "http://orchestrator:8080"),
+			Port:               env("MCP_PORT", "8082"),
+			OrchestratorURL:    env("ORCHESTRATOR_URL", "http://orchestrator:8080"),
+			AuthorizationToken: os.Getenv("MCP_AUTHORIZATION_TOKEN"),
+			PublicURL:          os.Getenv("MCP_PUBLIC_URL"),
 		},
 		SleepCycle: SleepCycleConfig{
 			SandboxURL:      env("SANDBOX_URL", "http://sandbox:8081"),
@@ -244,8 +256,9 @@ func Load() (Config, error) {
 			MaxPublications: intEnv("SLEEPCYCLE_MAX_PUBLICATIONS", 20),
 		},
 		Anthropic: AnthropicConfig{
-			APIKey: os.Getenv("ANTHROPIC_API_KEY"),
-			Model:  env("ANTHROPIC_MODEL", "claude-opus-4-8"),
+			APIKey:    os.Getenv("ANTHROPIC_API_KEY"),
+			Model:     env("ANTHROPIC_MODEL", "claude-opus-4-8"),
+			ChatModel: env("ANTHROPIC_CHAT_MODEL", "claude-sonnet-5"),
 		},
 	}
 	return cfg, nil

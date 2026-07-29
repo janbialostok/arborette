@@ -52,10 +52,16 @@ func main() {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "arborette-mcp", Version: "0.1.0"}, nil)
 	mcpserver.RegisterTools(srv, queries, orchClient)
 
-	// A single http.Handler value: arborette's downstream Agent Chat Backend
-	// wraps this with bearer-token middleware to expose it publicly, without
-	// touching the tool handlers or transport.
-	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+	// A configured public URL is the operator declaring this server internet-
+	// reachable, and this process is the only one that sees that declaration and
+	// the token together.
+	if cfg.MCP.PublicURL != "" && cfg.MCP.AuthorizationToken == "" {
+		log.Fatalf("mcpserver: MCP_PUBLIC_URL is set but MCP_AUTHORIZATION_TOKEN is empty; refusing to serve a public listener without auth")
+	}
+
+	// Claude's MCP connector dials this listener from outside the network.
+	handler := service.BearerAuth(cfg.MCP.AuthorizationToken,
+		mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 
 	if err := service.RunHTTPServer("mcpserver", ":"+cfg.MCP.Port, handler); err != nil {
 		log.Fatalf("mcpserver: http server: %v", err)

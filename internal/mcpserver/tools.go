@@ -12,6 +12,14 @@ import (
 	"github.com/arborette/arborette/internal/heuristics"
 )
 
+// The registered tool names, exported because the chat connector's allowlist is
+// pinned against them.
+const (
+	ToolGetOptimizedHeuristics = "get_optimized_heuristics"
+	ToolTraceCausalChain       = "trace_causal_chain"
+	ToolSubmitAnalystGoal      = "submit_analyst_goal"
+)
+
 // defaultSearchK is the similarity-search result count used when a call omits or
 // malforms k; maxSearchK clamps how large a top-k a caller can request. These
 // mirror the Orchestrator's REST handler so both read surfaces behave alike.
@@ -112,15 +120,15 @@ type tools struct {
 func RegisterTools(s *mcp.Server, heur heuristicsQuerier, goals goalSubmitter) {
 	t := &tools{heur: heur, goals: goals}
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "get_optimized_heuristics",
+		Name:        ToolGetOptimizedHeuristics,
 		Description: "Return the Meta-Heuristics most relevant to an operational-state description, ranked by semantic similarity.",
 	}, t.getOptimizedHeuristics)
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "trace_causal_chain",
+		Name:        ToolTraceCausalChain,
 		Description: "Trace a Meta-Heuristic back to the State/Intervention/Outcome triplets that support it.",
 	}, t.traceCausalChain)
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "submit_analyst_goal",
+		Name:        ToolSubmitAnalystGoal,
 		Description: "Register an analyst optimization goal against a data source on the import mount, proxied to the orchestrator.",
 	}, t.submitAnalystGoal)
 }

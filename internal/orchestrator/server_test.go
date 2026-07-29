@@ -294,6 +294,25 @@ func (f *fakeLauncher) Launch(_ context.Context, jobName string, args map[string
 	return f.err
 }
 
+// fakeChat stands in for the streaming Claude, recording what the handler passed.
+type fakeChat struct {
+	events []llm.ChatEvent
+	err    error
+	ctx    context.Context
+	system string
+	msgs   []llm.ChatMessage
+}
+
+func (f *fakeChat) Chat(ctx context.Context, system string, msgs []llm.ChatMessage, emit func(llm.ChatEvent) error) error {
+	f.ctx, f.system, f.msgs = ctx, system, msgs
+	for _, ev := range f.events {
+		if err := emit(ev); err != nil {
+			return err
+		}
+	}
+	return f.err
+}
+
 func newTestServer(goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
 	return newTestServerRepo(nil, goals, audits, objects, heur, claude, sandbox)
 }
@@ -301,7 +320,7 @@ func newTestServer(goals goalStore, audits auditStore, objects objectStore, heur
 // newTestServerRepo is newTestServer with an explicit graph.Repository, for loop
 // tests that assert the nodes writeTriplet persists.
 func newTestServerRepo(repo graph.Repository, goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
-	return NewServer(repo, goals, &fakeRuns{}, audits, objects, heur, claude, sandbox,
+	return NewServer(repo, goals, &fakeRuns{}, audits, objects, heur, claude, &fakeChat{}, sandbox,
 		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, "", "arborette-sleepcycle")
 }
 
@@ -543,7 +562,7 @@ func TestIngestLocalReadsWithinMount(t *testing.T) {
 		t.Fatalf("write file: %v", err)
 	}
 	objects := &fakeObjects{}
-	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{},
+	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeChat{}, &fakeSandbox{},
 		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, dir, "job")
 
 	ref, err := srv.ingestLocal(context.Background(), "data.csv")
@@ -566,7 +585,7 @@ func TestIngestLocalRejectsSymlinkEscape(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 	objects := &fakeObjects{}
-	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{},
+	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeChat{}, &fakeSandbox{},
 		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, mount, "job")
 
 	if _, err := srv.ingestLocal(context.Background(), "link.csv"); !errors.Is(err, errPathEscape) {
@@ -596,5 +615,8 @@ func TestHandleStreamReplaysBufferedEvents(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
 		t.Fatalf("content-type = %q, want text/event-stream", ct)
+	}
+	if !rec.Flushed {
+		t.Fatalf("events were not flushed as they were written")
 	}
 }
