@@ -46,6 +46,35 @@ function transportError(err: unknown): Response {
 // declare it; this widens the init type without an `any` cast.
 type NodeRequestInit = RequestInit & { duplex?: "half"; dispatcher?: Dispatcher };
 
+const SSE_HEADERS: HeadersInit = {
+  "content-type": "text/event-stream; charset=utf-8",
+  "cache-control": "no-cache, no-transform",
+  connection: "keep-alive",
+  // Defeat reverse-proxy response buffering so frames flush immediately.
+  "x-accel-buffering": "no",
+};
+
+// passThrough relays the upstream response verbatim, carrying its status and
+// content-type so an orchestrator {error} body reaches the browser parseable.
+function passThrough(upstream: Response): Response {
+  const headers = new Headers();
+  const contentType = upstream.headers.get("content-type");
+  if (contentType) headers.set("content-type", contentType);
+  return new Response(upstream.body, { status: upstream.status, headers });
+}
+
+// eventStream dresses a streaming reply as SSE. Both stream endpoints resolve
+// the goal before setting any SSE header, so a fault answers JSON and only a 2xx
+// may be relabelled -- relabelling an {error} body would hand the browser
+// something it can parse as neither.
+function eventStream(upstream: Response): Response {
+  if (!upstream.ok) return passThrough(upstream);
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: SSE_HEADERS,
+  });
+}
+
 // forward proxies a JSON or multipart request, preserving status and body. The
 // request body is streamed through (never buffered/parsed) so the multipart
 // 512 MiB upload path and its Content-Type boundary survive intact; streaming a
@@ -60,8 +89,15 @@ export async function forward(
   if (contentType) headers.set("content-type", contentType);
 
   const init: NodeRequestInit = { method: req.method, headers };
-  const hasBody = req.method !== "GET" && req.method !== "HEAD" && req.body != null;
-  if (hasBody) {
+  const reads = req.method === "GET" || req.method === "HEAD";
+  // A read follows the client away: nothing upstream is left half-done by
+  // abandoning it, and the excerpt endpoint re-parses a whole document per call,
+  // so a browser that navigates off should not leave the sandbox working. A
+  // write never does, whatever its timeout — the handler behind it audits and
+  // records on the request's own context, so cancelling mid-flight can land the
+  // effect while losing its audit record.
+  if (reads) init.signal = req.signal;
+  if (!reads && req.body != null) {
     init.body = req.body;
     init.duplex = "half";
   }
@@ -73,14 +109,7 @@ export async function forward(
   } catch (err) {
     return transportError(err);
   }
-
-  const outHeaders = new Headers();
-  const upstreamType = upstream.headers.get("content-type");
-  if (upstreamType) outHeaders.set("content-type", upstreamType);
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: outHeaders,
-  });
+  return passThrough(upstream);
 }
 
 export function forwardSubmit(req: Request, path: string): Promise<Response> {
@@ -99,15 +128,38 @@ export async function forwardStream(req: Request, path: string): Promise<Respons
   } catch (err) {
     return transportError(err);
   }
+  return eventStream(upstream);
+}
 
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache, no-transform",
-      connection: "keep-alive",
-      // Defeat reverse-proxy response buffering so frames flush immediately.
-      "x-accel-buffering": "no",
-    },
-  });
+// forwardStreamSubmit is forwardStream for an endpoint whose stream is asked for
+// with a POST body, which neither of the other two helpers covers: forwardStream
+// sends no body, and forward leaves undici's inactivity timers armed, which would
+// abort a turn that goes quiet while the agent thinks. The chat endpoint commits
+// its 200 lazily, which eventStream already accounts for.
+export async function forwardStreamSubmit(
+  req: Request,
+  path: string,
+): Promise<Response> {
+  const headers = new Headers({ accept: "text/event-stream" });
+  const contentType = req.headers.get("content-type");
+  if (contentType) headers.set("content-type", contentType);
+
+  const init: NodeRequestInit = {
+    method: "POST",
+    headers,
+    signal: req.signal,
+    dispatcher: streamDispatcher(),
+  };
+  if (req.body != null) {
+    init.body = req.body;
+    init.duplex = "half";
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(upstreamURL(req, path), init);
+  } catch (err) {
+    return transportError(err);
+  }
+  return eventStream(upstream);
 }

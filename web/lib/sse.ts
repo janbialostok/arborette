@@ -5,9 +5,13 @@ import type { OrchestratorEvent } from "./orchestrator";
 // It resolves when the stream ends — the server closes it on loop_complete, or
 // a drop cuts it — and rejects on a read error. Using a manual reader (not
 // EventSource) lets the caller own termination and avoid auto-reconnect storms.
-export async function consumeStream(
+//
+// The frame type is a parameter because the service streams two unrelated
+// unions over the same wire format — a run's progress and a chat turn — and
+// they never mix on one connection.
+export async function consumeStream<T = OrchestratorEvent>(
   body: ReadableStream<Uint8Array>,
-  onEvent: (ev: OrchestratorEvent) => void,
+  onEvent: (ev: T) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   const reader = body.getReader();
@@ -30,7 +34,7 @@ export async function consumeStream(
         const json = dataLine.slice(5).trim();
         if (!json) continue;
         try {
-          onEvent(JSON.parse(json) as OrchestratorEvent);
+          onEvent(JSON.parse(json) as T);
         } catch {
           // Skip a malformed frame rather than tearing down the whole stream.
         }

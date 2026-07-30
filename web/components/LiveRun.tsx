@@ -3,17 +3,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   errorMessage,
+  isExtraction,
   listGoals,
   streamUrl,
   triggerHypothesisLoop,
   triggerSleepCycle,
   type BranchFailurePayload,
+  type ConfidenceDistribution,
   type OrchestratorEvent,
   type TripletPayload,
 } from "@/lib/orchestrator";
 import { getRunRecord, markCompleted, markTriggered } from "@/lib/runState";
 import { consumeStream } from "@/lib/sse";
+import { ConfidenceHistogram } from "@/components/ConfidenceHistogram";
 import { EffectReadout } from "@/components/EffectReadout";
+import { ExtractionReadout } from "@/components/ExtractionReadout";
 import { Button, Callout, cn, Panel, SectionLabel } from "@/components/ui";
 
 // No event has arrived this long after connecting → decide what the silence
@@ -57,6 +61,11 @@ export function LiveRun({ id }: { id: string }) {
   const [triggerError, setTriggerError] = useState<string | null>(null);
   const [sleep, setSleep] = useState<SleepState>({ status: "idle" });
   const [failureReason, setFailureReason] = useState<string | null>(null);
+  // Every run publishes a distribution — a measuring run counts its outcomes at
+  // certainty — so this being non-null says nothing about which kind is running;
+  // the render site decides whose distribution is worth plotting.
+  const [distribution, setDistribution] =
+    useState<ConfidenceDistribution | null>(null);
 
   const triggeredRef = useRef(initial.triggered);
   const completedRef = useRef(initial.completed);
@@ -117,6 +126,13 @@ export function LiveRun({ id }: { id: string }) {
         case "branch_failure":
           append({ kind: "failure", seq: seqRef.current++, payload: ev.payload });
           setPhase((p) => (p === "complete" ? p : "live"));
+          break;
+        case "confidence_distribution":
+          // Each frame is a whole snapshot, so the newest one replaces the last
+          // rather than accumulating. It carries no liveness on its own — a
+          // resolution publishes one from outside the run — so the phase is left
+          // to the triplets it always arrives alongside.
+          setDistribution(ev.payload);
           break;
         case "loop_complete":
           clearIdle();
@@ -285,6 +301,7 @@ export function LiveRun({ id }: { id: string }) {
       statusFetchedRef.current = true;
       setFailureReason(null);
       setItems([]);
+      setDistribution(null);
       setSleep({ status: "idle" });
       setPhase("connecting");
       setGeneration((g) => g + 1); // Force a fresh subscription for the new run.
@@ -314,10 +331,15 @@ export function LiveRun({ id }: { id: string }) {
     (i): i is Extract<FeedItem, { kind: "triplet" }> => i.kind === "triplet",
   );
   const failures = items.filter((i) => i.kind === "failure").length;
+  // Only a measured triplet has an effect to normalize against; an extraction
+  // run contributes none, which leaves the scale at zero and unused.
   const scale = triplets.reduce(
-    (max, t) => Math.max(max, Math.abs(t.payload.effect_size)),
+    (max, t) =>
+      isExtraction(t.payload) ? max : Math.max(max, Math.abs(t.payload.effect_size)),
     0,
   );
+  // A run's stream is homogeneous, so one extraction identifies the whole run.
+  const extracting = triplets.some((t) => isExtraction(t.payload));
   const isRunning = phase === "connecting" || phase === "starting" || phase === "live";
   // "Settled" = the run is finished (completed or failed) or was never started —
   // the states that expose the sleep-cycle action and the re-run hint.
@@ -374,9 +396,16 @@ export function LiveRun({ id }: { id: string }) {
         </Callout>
       )}
 
+      {/* A measuring run's outcomes are all at certainty, so its plot would be
+          one full bar saying nothing. */}
+      {extracting && distribution && (
+        <ConfidenceHistogram distribution={distribution} />
+      )}
+
       <Feed
         items={items}
         scale={scale}
+        extracting={extracting}
         phase={phase}
         onRun={runPhase1}
         running={triggering}
@@ -459,12 +488,14 @@ function StatusPill({ phase }: { phase: Phase }) {
 function Feed({
   items,
   scale,
+  extracting,
   phase,
   onRun,
   running,
 }: {
   items: FeedItem[];
   scale: number;
+  extracting: boolean;
   phase: Phase;
   onRun: () => void;
   running: boolean;
@@ -517,7 +548,9 @@ function Feed({
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
-        <SectionLabel>Causal triplets · newest first</SectionLabel>
+        <SectionLabel>
+          {extracting ? "Extracted fields" : "Causal triplets"} · newest first
+        </SectionLabel>
         {phase === "reconnecting" && (
           <span className="text-xs text-warn">reconnecting…</span>
         )}
@@ -538,7 +571,13 @@ function Feed({
           }
           // Index from oldest so animation delays are stable as newer items prepend.
           const idx = tripletIndex++;
-          return (
+          return isExtraction(item.payload) ? (
+            <ExtractionReadout
+              key={item.seq}
+              triplet={item.payload}
+              index={idx}
+            />
+          ) : (
             <EffectReadout
               key={item.seq}
               triplet={item.payload}

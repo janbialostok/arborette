@@ -97,3 +97,7 @@
   service (:8083) serves the pre-built standalone image and will **not** reflect
   local `web/` edits, so bring the backend up with `make up` but drive the frontend
   through `make web-dev`, not the :8083 container.
+- The frontend has its own unit suites under `web/lib/` (vitest, no infrastructure
+  needed) with no Make target: run them with `npm test` from `web/`. They cover the
+  typed orchestrator client, the SSE frame parser, and the pure logic behind the
+  review, chat, and histogram views.

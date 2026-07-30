@@ -627,7 +627,9 @@ func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, fi
 		"method":          method,
 		"confidence":      confidence,
 		"value":           value,
-		"provenance":      locator,
+		// The domain locator carries no json tags, so publishing it directly would
+		// put PascalCase keys on a wire that is snake_case everywhere else.
+		"provenance": toProvenanceDTO(locator),
 	}})
 	return outcomeID, nil
 }

@@ -52,6 +52,7 @@ type chatFrame struct {
 	Type    string `json:"type"`
 	Text    string `json:"text,omitempty"`
 	Tool    string `json:"tool,omitempty"`
+	ToolID  string `json:"tool_id,omitempty"`
 	IsError bool   `json:"is_error,omitempty"`
 	Message string `json:"message,omitempty"`
 }
@@ -163,9 +164,9 @@ func toChatFrame(ev llm.ChatEvent) (chatFrame, bool) {
 	case llm.ChatEventText:
 		return chatFrame{Type: chatFrameText, Text: ev.Text}, true
 	case llm.ChatEventToolUse:
-		return chatFrame{Type: chatFrameToolUse, Tool: ev.Tool}, true
+		return chatFrame{Type: chatFrameToolUse, Tool: ev.Tool, ToolID: ev.ToolID}, true
 	case llm.ChatEventToolResult:
-		return chatFrame{Type: chatFrameToolResult, IsError: ev.IsError}, true
+		return chatFrame{Type: chatFrameToolResult, ToolID: ev.ToolID, IsError: ev.IsError}, true
 	case llm.ChatEventDone:
 		return chatFrame{Type: chatFrameDone}, true
 	case llm.ChatEventError:

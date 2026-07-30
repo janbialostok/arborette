@@ -65,10 +65,15 @@ type ChatMessage struct {
 // ChatEvent is one item of a streamed chat turn. Which fields carry meaning
 // depends on Type: Text on ChatEventText, Tool on ChatEventToolUse, IsError on
 // ChatEventToolResult, and Message on ChatEventError.
+//
+// ToolID is the API's identifier for a call, present on both tool events so a
+// consumer can pair a result with the call it answers rather than guessing from
+// arrival order — which a turn opening two tools at once would get wrong.
 type ChatEvent struct {
 	Type    string
 	Text    string
 	Tool    string
+	ToolID  string
 	IsError bool
 	Message string
 }
@@ -128,11 +133,8 @@ func (c *ChatClient) Chat(ctx context.Context, system string, msgs []ChatMessage
 			Name:               chatServerName,
 			URL:                c.mcpURL,
 			AuthorizationToken: anthropic.String(c.mcpToken),
-			ToolConfiguration: anthropic.BetaRequestMCPServerToolConfigurationParam{
-				AllowedTools: chatAllowedTools,
-			},
 		}},
-		Tools: []anthropic.BetaToolUnionParam{anthropic.BetaToolUnionParamOfMCPToolset(chatServerName)},
+		Tools: []anthropic.BetaToolUnionParam{scopedToolset()},
 	}
 
 	turns := len(params.Messages)
@@ -205,9 +207,11 @@ func (c *ChatClient) streamTurn(ctx context.Context, params anthropic.BetaMessag
 func toolEvent(block anthropic.BetaRawContentBlockStartEventContentBlockUnion) (ChatEvent, bool) {
 	switch block := block.AsAny().(type) {
 	case anthropic.BetaMCPToolUseBlock:
-		return ChatEvent{Type: ChatEventToolUse, Tool: block.Name}, true
+		return ChatEvent{Type: ChatEventToolUse, Tool: block.Name, ToolID: block.ID}, true
 	case anthropic.BetaMCPToolResultBlock:
-		return ChatEvent{Type: ChatEventToolResult, IsError: block.IsError}, true
+		// A result names the call it answers rather than the tool it ran, which is
+		// why only the use event carries a name.
+		return ChatEvent{Type: ChatEventToolResult, ToolID: block.ToolUseID, IsError: block.IsError}, true
 	default:
 		return ChatEvent{}, false
 	}
@@ -231,6 +235,27 @@ func terminalEvent(stop anthropic.BetaStopReason) ChatEvent {
 	default:
 		return ChatEvent{Type: ChatEventDone}
 	}
+}
+
+// scopedToolset builds the toolset entry that both exposes the MCP server's
+// tools and confines the agent to the read-only ones.
+//
+// The scoping lives here, not in the server definition's tool_configuration:
+// under the connector beta that field is rejected outright, so a request
+// carrying it never reaches the model. Denying by default and enabling the
+// allow-list by name also fails closed -- a tool the server grows later stays
+// off until it is named here, rather than being exposed the day it ships.
+func scopedToolset() anthropic.BetaToolUnionParam {
+	configs := make(map[string]anthropic.BetaMCPToolConfigParam, len(chatAllowedTools))
+	for _, name := range chatAllowedTools {
+		configs[name] = anthropic.BetaMCPToolConfigParam{Enabled: anthropic.Bool(true)}
+	}
+	toolset := anthropic.BetaToolUnionParamOfMCPToolset(chatServerName)
+	toolset.OfMCPToolset.DefaultConfig = anthropic.BetaMCPToolDefaultConfigParam{
+		Enabled: anthropic.Bool(false),
+	}
+	toolset.OfMCPToolset.Configs = configs
+	return toolset
 }
 
 // toBetaMessages converts the browser-held transcript into request params. The

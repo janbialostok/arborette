@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { consumeStream } from "./sse";
-import type { OrchestratorEvent } from "./orchestrator";
+import type { ChatFrame, OrchestratorEvent } from "./orchestrator";
 
 // Build a ReadableStream that emits each string as its own Uint8Array chunk, so
 // tests control exactly where chunk boundaries fall relative to frame boundaries.
@@ -82,5 +82,52 @@ describe("consumeStream", () => {
       AbortSignal.abort(),
     );
     expect(events).toEqual([]);
+  });
+});
+
+// The chat endpoint streams a different union over the same framing, so the
+// parser is exercised against it directly rather than assumed to carry over.
+async function collectChat(chunks: string[]): Promise<ChatFrame[]> {
+  const frames: ChatFrame[] = [];
+  await consumeStream<ChatFrame>(streamOf(chunks), (ev) => frames.push(ev));
+  return frames;
+}
+
+describe("consumeStream · chat frames", () => {
+  it("parses a tool-using turn split across chunk boundaries", async () => {
+    const frames = await collectChat([
+      'data: {"type":"chat_tool_use","tool":"get_optimized_heuristics"}\n\n',
+      'data: {"type":"chat_tool_result"}\n\ndata: {"type":"chat_te',
+      'xt","text":"Two heuristics "}\n\n',
+      'data: {"type":"chat_text","text":"cover that segment."}\n\n',
+      'data: {"type":"chat_done"}\n\n',
+    ]);
+    expect(frames).toEqual([
+      { type: "chat_tool_use", tool: "get_optimized_heuristics" },
+      { type: "chat_tool_result" },
+      { type: "chat_text", text: "Two heuristics " },
+      { type: "chat_text", text: "cover that segment." },
+      { type: "chat_done" },
+    ]);
+  });
+
+  it("carries a failed tool result and an in-band error message", async () => {
+    const frames = await collectChat([
+      'data: {"type":"chat_tool_use","tool":"trace_causal_chain"}\n\n',
+      'data: {"type":"chat_tool_result","is_error":true}\n\n',
+      'data: {"type":"chat_error","message":"the agent is unavailable"}\n\n',
+    ]);
+    expect(frames).toEqual([
+      { type: "chat_tool_use", tool: "trace_causal_chain" },
+      { type: "chat_tool_result", is_error: true },
+      { type: "chat_error", message: "the agent is unavailable" },
+    ]);
+  });
+
+  it("ends without a terminal frame when the turn is cut off", async () => {
+    const frames = await collectChat([
+      'data: {"type":"chat_text","text":"Looking at "}\n\n',
+    ]);
+    expect(frames.some((f) => f.type === "chat_done")).toBe(false);
   });
 });

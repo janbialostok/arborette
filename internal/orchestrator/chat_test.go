@@ -56,8 +56,8 @@ func chatFrames(t *testing.T, body string) []chatFrame {
 func TestHandleChatStreamsFrames(t *testing.T) {
 	chat := &fakeChat{events: []llm.ChatEvent{
 		{Type: llm.ChatEventText, Text: "Looking"},
-		{Type: llm.ChatEventToolUse, Tool: "get_optimized_heuristics"},
-		{Type: llm.ChatEventToolResult},
+		{Type: llm.ChatEventToolUse, Tool: "get_optimized_heuristics", ToolID: "mcptu_1"},
+		{Type: llm.ChatEventToolResult, ToolID: "mcptu_1"},
 		{Type: llm.ChatEventText, Text: " -- cryosleep raises it."},
 		{Type: llm.ChatEventDone},
 	}}
@@ -88,6 +88,10 @@ func TestHandleChatStreamsFrames(t *testing.T) {
 	}
 	if frames[0].Text != "Looking" || frames[1].Tool != "get_optimized_heuristics" {
 		t.Fatalf("frame payloads not carried through: %+v", frames)
+	}
+	if frames[1].ToolID != "mcptu_1" || frames[2].ToolID != "mcptu_1" {
+		t.Fatalf("tool_id was not carried onto both tool frames: use=%q result=%q",
+			frames[1].ToolID, frames[2].ToolID)
 	}
 	if !rec.Flushed {
 		t.Fatalf("frames were not flushed as they were written")

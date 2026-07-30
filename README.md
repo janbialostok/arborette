@@ -87,7 +87,10 @@ wedged dependency would hang the work indefinitely.
 Four things to know before writing an SSE client, none of them guessable from the wire:
 
 - **Frames are unnamed.** The server emits `data: <json>` with no `event:` line, so the discriminator
-  is the JSON payload's own `type` — `triplet`, `branch_failure`, or a terminal `loop_complete`. An
+  is the JSON payload's own `type` — `triplet`, `branch_failure`, `confidence_distribution`, or a
+  terminal `loop_complete`. A `confidence_distribution` frame is a whole snapshot superseding the
+  last rather than a delta, and it is not a liveness signal: resolving a verification republishes one
+  onto the goal's stream from outside any run. An
   `addEventListener('triplet', …)` handler would never fire. Note `type` alone is not quite enough:
   a `triplet` from a tabular goal and one from a document goal carry different payloads, and the
   overlap is the dangerous part — both have a `value`, a number on one path and a string on the
@@ -342,8 +345,11 @@ Search is semantic over the published Meta-Heuristics' embeddings; it returns
 the agent-facing equivalent of both.
 
 Little of this walkthrough actually requires curl. The web UI's landing page is the goal-submission
-form, `/goals` lists registered objectives with their run status, opening one shows the live run,
-and `/heuristics` browses what was published. Only step 4 is Make-only, for the reason given there.
+form, `/goals` lists registered objectives with their run status, and `/heuristics` browses what was
+published. A goal page carries three tabs, mirrored into `?tab=` so any of them is linkable: **Run**
+follows the live stream, **Verify** works the review queue against the source excerpts each value
+was read from, and **Preview agent** chats with the accumulated graph. Only step 4 is Make-only, for
+the reason given there.
 
 ### Working on the web UI
 
@@ -429,6 +435,7 @@ under [Prerequisites](#prerequisites).
 | Variable | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` | Claude access for matrix fitting, tree proposal, extraction, abstraction, and the agent chat preview. |
+| `MCP_PUBLIC_URL` | Where Anthropic's infrastructure dials the MCP server for the agent chat. It connects inbound, so the in-network `http://mcpserver:8082` cannot serve — locally this is a tunnel to port 8082. Unset, a goal's Preview agent tab answers "agent preview is not configured". |
 | `MCP_AUTHORIZATION_TOKEN` | Bearer token the MCP server checks when set; empty disables auth, leaning on the same trusted-network assumption every other published port makes. Setting `MCP_PUBLIC_URL` without a token makes the MCP server refuse to start. |
 | `NEO4J_USER` / `_PASSWORD` | Graph credentials. Compose pins the user to `neo4j`, so only the password is really free. |
 | `POSTGRES_OWNER_USER` / `_PASSWORD` | Superuser: provisions the runtime roles and owns the migrated tables. |
@@ -463,13 +470,6 @@ exception: Compose publishes `8080`, `8081`, and `8082` as literals, so changing
 the mapping that reaches it. `WEBUI_PORT` is the one that behaves as it reads.
 
 ## Roadmap
-
-### Next up (specified, not yet built)
-
-One capability is specified in `.turbo/shells/` with no implementation yet:
-
-- **The web UI for the review and preview surfaces.** HITL review with source excerpts, a confidence
-  histogram, and a chat tab over `POST /goals/{id}/chat`.
 
 ### In flight
 

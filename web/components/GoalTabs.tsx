@@ -1,0 +1,89 @@
+"use client";
+
+import { useState } from "react";
+import { chatUrl } from "@/lib/orchestrator";
+import { AgentChat } from "@/components/AgentChat";
+import { LiveRun } from "@/components/LiveRun";
+import { VerificationQueue } from "@/components/VerificationQueue";
+import { cn } from "@/components/ui";
+
+const TABS = [
+  { id: "run", label: "Run" },
+  { id: "verify", label: "Verify" },
+  { id: "agent", label: "Preview agent" },
+] as const;
+
+type TabID = (typeof TABS)[number]["id"];
+
+export function GoalTabs({
+  id,
+  initialTab,
+}: {
+  id: string;
+  initialTab?: string;
+}) {
+  const [tab, setTab] = useState<TabID>(() => toTab(initialTab));
+  // The run is always mounted, however the page was opened: it owns the live
+  // subscription, and a stream joined late misses everything the replay buffer
+  // has already dropped — so it is rendered unconditionally and never consults
+  // this set. The other two mount on first visit and stay mounted, so switching
+  // away never costs their loaded state.
+  const [visited, setVisited] = useState<Set<TabID>>(
+    () => new Set<TabID>([toTab(initialTab)]),
+  );
+
+  // The URL mirrors the tab so a view is linkable, but the state — not the URL —
+  // decides what renders: a router navigation would re-render the route and put
+  // the run's subscription and accumulated triplets at risk.
+  function select(next: TabID) {
+    setTab(next);
+    setVisited((seen) => (seen.has(next) ? seen : new Set(seen).add(next)));
+    const url = new URL(window.location.href);
+    url.searchParams.set("tab", next);
+    window.history.replaceState(null, "", url);
+  }
+
+  return (
+    <div className="flex flex-col">
+      {/* Buttons with aria-pressed, not links with aria-current: no navigation
+          happens here, and the app's other in-page segmented controls express
+          the same "one of N selected" state the same way. */}
+      <div className="flex items-center gap-1 border-b border-line">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => select(t.id)}
+            aria-pressed={tab === t.id}
+            className={cn(
+              "-mb-px border-b-2 px-3 py-2.5 text-sm transition-colors",
+              tab === t.id
+                ? "border-signal text-signal"
+                : "border-transparent text-muted hover:text-fg",
+            )}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <div className={cn(tab !== "run" && "hidden")}>
+        <LiveRun id={id} />
+      </div>
+      {visited.has("verify") && (
+        <div className={cn(tab !== "verify" && "hidden")}>
+          <VerificationQueue id={id} />
+        </div>
+      )}
+      {visited.has("agent") && (
+        <div className={cn(tab !== "agent" && "hidden")}>
+          <AgentChat endpoint={chatUrl(id)} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function toTab(value: string | undefined): TabID {
+  return TABS.some((t) => t.id === value) ? (value as TabID) : "run";
+}

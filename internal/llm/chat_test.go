@@ -75,13 +75,19 @@ type capturedRequest struct {
 		Name               string `json:"name"`
 		URL                string `json:"url"`
 		AuthorizationToken string `json:"authorization_token"`
-		ToolConfiguration  struct {
-			AllowedTools []string `json:"allowed_tools"`
-		} `json:"tool_configuration"`
+		// Captured raw so the test can assert the field is absent: the connector
+		// beta rejects a request carrying it at all.
+		ToolConfiguration json.RawMessage `json:"tool_configuration"`
 	} `json:"mcp_servers"`
 	Tools []struct {
 		Type          string `json:"type"`
 		MCPServerName string `json:"mcp_server_name"`
+		DefaultConfig struct {
+			Enabled *bool `json:"enabled"`
+		} `json:"default_config"`
+		Configs map[string]struct {
+			Enabled *bool `json:"enabled"`
+		} `json:"configs"`
 	} `json:"tools"`
 	Thinking struct {
 		Type string `json:"type"`
@@ -170,14 +176,31 @@ func TestChatSendsConnectorRequest(t *testing.T) {
 	if server.URL != "https://tunnel.example/mcp" || server.AuthorizationToken != "mcp-token" {
 		t.Fatalf("connector target not sent: %+v", server)
 	}
-	want := []string{"get_optimized_heuristics", "trace_causal_chain"}
-	if !reflect.DeepEqual(server.ToolConfiguration.AllowedTools, want) {
-		t.Fatalf("allowed_tools = %v, want %v (goal submission must stay excluded)", server.ToolConfiguration.AllowedTools, want)
+	// The connector beta rejects tool_configuration outright, so the request must
+	// not carry it -- sending it fails the whole turn, not just the scoping.
+	if len(server.ToolConfiguration) != 0 {
+		t.Fatalf("tool_configuration = %s, want it absent under the connector beta", server.ToolConfiguration)
 	}
 	// The connector needs both halves: the server definition and a toolset entry
 	// referencing it by name.
 	if len(req.Tools) != 1 || req.Tools[0].Type != "mcp_toolset" || req.Tools[0].MCPServerName != server.Name {
 		t.Fatalf("tools did not activate the connector toolset: %+v", req.Tools)
+	}
+	// Scoping rides the toolset and fails closed: every tool is off by default and
+	// only the read-only two are switched back on, so goal submission stays
+	// excluded even though the server offers it.
+	toolset := req.Tools[0]
+	if toolset.DefaultConfig.Enabled == nil || *toolset.DefaultConfig.Enabled {
+		t.Fatalf("default_config.enabled = %v, want an explicit false", toolset.DefaultConfig.Enabled)
+	}
+	if len(toolset.Configs) != len(chatAllowedTools) {
+		t.Fatalf("configs = %+v, want exactly the %d allowed tools", toolset.Configs, len(chatAllowedTools))
+	}
+	for _, name := range chatAllowedTools {
+		cfg, ok := toolset.Configs[name]
+		if !ok || cfg.Enabled == nil || !*cfg.Enabled {
+			t.Fatalf("configs[%q] = %+v, want it explicitly enabled", name, cfg)
+		}
 	}
 	if len(req.System) != 1 || req.System[0].Text != "system prompt" {
 		t.Fatalf("system prompt not sent: %+v", req.System)
@@ -232,7 +255,10 @@ func TestChatReportsFailedToolResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []ChatEvent{{Type: ChatEventToolResult, IsError: true}, {Type: ChatEventDone}}
+	want := []ChatEvent{
+		{Type: ChatEventToolResult, ToolID: "mcptu_1", IsError: true},
+		{Type: ChatEventDone},
+	}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events = %+v, want %+v", events, want)
 	}
@@ -256,7 +282,10 @@ func TestChatSkipsNonTextDeltas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []ChatEvent{{Type: ChatEventToolUse, Tool: "trace_causal_chain"}, {Type: ChatEventDone}}
+	want := []ChatEvent{
+		{Type: ChatEventToolUse, Tool: "trace_causal_chain", ToolID: "mcptu_1"},
+		{Type: ChatEventDone},
+	}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events = %+v, want %+v (tool-call JSON must not reach the transcript)", events, want)
 	}
@@ -324,8 +353,8 @@ func TestChatEmitsToolRoundTrip(t *testing.T) {
 	}
 	want := []ChatEvent{
 		{Type: ChatEventText, Text: "Checking the graph"},
-		{Type: ChatEventToolUse, Tool: "get_optimized_heuristics"},
-		{Type: ChatEventToolResult},
+		{Type: ChatEventToolUse, Tool: "get_optimized_heuristics", ToolID: "mcptu_1"},
+		{Type: ChatEventToolResult, ToolID: "mcptu_1"},
 		{Type: ChatEventDone},
 	}
 	if !reflect.DeepEqual(events, want) {

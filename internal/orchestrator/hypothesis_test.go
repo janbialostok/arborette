@@ -843,6 +843,70 @@ func TestWriteTripletScopesNodesToTheGoal(t *testing.T) {
 	}
 }
 
+// TestWriteExtractionTripletPublishesSnakeCasePayload pins the extraction
+// triplet's wire shape: the web client reads this frame by key, and the locator
+// is the one field on it built from a domain type carrying no json tags.
+func TestWriteExtractionTripletPublishesSnakeCasePayload(t *testing.T) {
+	repo := &fakeRepo{}
+	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
+
+	field := domain.TargetField{Name: "invoice_total"}
+	locator := &domain.ProvenanceLocator{Page: 2, CharStart: 195, CharEnd: 202}
+
+	goal := documentGoal([]domain.TargetField{field})
+	replay, ch, cancel := srv.hub.Subscribe(goal.OptimizationFunctionID)
+	defer cancel()
+	if _, err := srv.writeExtractionTriplet(context.Background(),
+		goal, field, "ocr", 0.5, "1296.00", 0.9, locator); err != nil {
+		t.Fatalf("write extraction triplet: %v", err)
+	}
+
+	var payload map[string]any
+	for _, ev := range append(replay, drain(ch)...) {
+		if ev.Type == "triplet" {
+			payload = ev.Payload
+		}
+	}
+	if payload == nil {
+		t.Fatal("no triplet event was published")
+	}
+	for _, key := range []string{"state_id", "intervention_id", "outcome_id", "field", "method", "value", "confidence"} {
+		if _, ok := payload[key]; !ok {
+			t.Fatalf("triplet payload is missing %q: %v", key, payload)
+		}
+	}
+	prov, ok := payload["provenance"].(*provenanceDTO)
+	if !ok {
+		t.Fatalf("provenance = %T, want the snake_case DTO the review endpoints use", payload["provenance"])
+	}
+	// Marshaled rather than field-compared: the keys are the contract, and they
+	// exist only as struct tags.
+	encoded, err := json.Marshal(prov)
+	if err != nil {
+		t.Fatalf("marshal provenance: %v", err)
+	}
+	if got, want := string(encoded), `{"page":2,"char_start":195,"char_end":202}`; got != want {
+		t.Fatalf("provenance on the wire = %s, want %s", got, want)
+	}
+}
+
+// drain collects what is already queued on a hub channel without blocking on
+// the run that would otherwise close it.
+func drain(ch chan Event) []Event {
+	var out []Event
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return out
+			}
+			out = append(out, ev)
+		default:
+			return out
+		}
+	}
+}
+
 // TestWriteExtractionTripletScopesNodesToTheGoal is the same contract on the
 // document path. The Sleep Cycle rejects document goals outright, so nothing
 // reads these today — but an unscoped node is invisible to every goal-filtered

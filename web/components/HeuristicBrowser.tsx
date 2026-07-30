@@ -8,6 +8,7 @@ import {
   type HeuristicMatch,
   type TraceTriplet,
 } from "@/lib/orchestrator";
+import { renderValue } from "@/lib/format";
 import {
   Badge,
   Button,
@@ -290,10 +291,4 @@ function VerificationBadge({ status }: { status: string }) {
     rejected: "negative",
   };
   return <Badge tone={tone[status] ?? "neutral"}>{status || "unknown"}</Badge>;
-}
-
-function renderValue(val: unknown): string {
-  if (val == null) return "—";
-  if (typeof val === "object") return JSON.stringify(val);
-  return String(val);
 }

@@ -1,4 +1,4 @@
-import type { TripletPayload } from "@/lib/orchestrator";
+import type { QueryTripletPayload } from "@/lib/orchestrator";
 import { cn } from "@/components/ui";
 
 // EffectReadout renders one causal triplet as a diverging effect-size bar:
@@ -15,7 +15,7 @@ export function EffectReadout({
   scale,
   index,
 }: {
-  triplet: TripletPayload;
+  triplet: QueryTripletPayload;
   scale: number;
   index: number;
 }) {
