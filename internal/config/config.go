@@ -23,7 +23,7 @@ type Config struct {
 	Orchestrator OrchestratorConfig
 	MCP          MCPConfig
 	SleepCycle   SleepCycleConfig
-	Anthropic    AnthropicConfig
+	LLM          LLMConfig
 }
 
 // Neo4jConfig holds the bolt connection details for the graph store.
@@ -130,12 +130,36 @@ type SleepCycleConfig struct {
 	MaxPublications int
 }
 
+// LLMConfig selects the LLM provider and holds each provider's credentials.
+// Provider is one of "anthropic", "deepinfra", or "ollama".
+type LLMConfig struct {
+	Provider  string
+	Anthropic AnthropicConfig
+	DeepInfra DeepInfraConfig
+	Ollama    OllamaLLMConfig
+}
+
 // AnthropicConfig points the Claude client at a model and key. Model is
 // overridable so a cheaper/faster structured-output model can back demos without
 // a code change; APIKey is a secret with no default.
 type AnthropicConfig struct {
 	APIKey string
 	Model  string
+}
+
+// DeepInfraConfig points the DeepInfra client at a model and key. BaseURL is
+// optional and defaults to https://api.deepinfra.com/v1/openai.
+type DeepInfraConfig struct {
+	APIKey  string
+	Model   string
+	BaseURL string
+}
+
+// OllamaLLMConfig points the Ollama LLM client at a local model. Endpoint is
+// the Ollama server URL; Model is the model name to use.
+type OllamaLLMConfig struct {
+	Endpoint string
+	Model    string
 }
 
 // dsn assembles a libpq/pgx keyword DSN for one role against the shared host.
@@ -243,9 +267,21 @@ func Load() (Config, error) {
 			MinLift:         floatEnv("SLEEPCYCLE_SEARCH_MIN_LIFT", 0.05),
 			MaxPublications: intEnv("SLEEPCYCLE_MAX_PUBLICATIONS", 20),
 		},
-		Anthropic: AnthropicConfig{
-			APIKey: os.Getenv("ANTHROPIC_API_KEY"),
-			Model:  env("ANTHROPIC_MODEL", "claude-opus-4-8"),
+		LLM: LLMConfig{
+			Provider: env("LLM_PROVIDER", "anthropic"),
+			Anthropic: AnthropicConfig{
+				APIKey: os.Getenv("ANTHROPIC_API_KEY"),
+				Model:  env("ANTHROPIC_MODEL", "claude-opus-4-8"),
+			},
+			DeepInfra: DeepInfraConfig{
+				APIKey:  os.Getenv("DEEP_INFRA_API_KEY"),
+				Model:   env("DEEP_INFRA_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
+				BaseURL: env("DEEP_INFRA_BASE_URL", "https://api.deepinfra.com/v1/openai"),
+			},
+			Ollama: OllamaLLMConfig{
+				Endpoint: env("OLLAMA_LLM_ENDPOINT", "http://localhost:11434"),
+				Model:    env("OLLAMA_LLM_MODEL", "llama3"),
+			},
 		},
 	}
 	return cfg, nil

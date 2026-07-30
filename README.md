@@ -182,9 +182,12 @@ correct behavior reads as a broken system; all are called out inline.
 
 ### Prerequisites
 
-Docker with Compose, and an Anthropic API key. `ANTHROPIC_API_KEY` is the **only variable with no
-working default**, so `cp .env.example .env` and replacing that one placeholder is the entire
-configuration step for a default local run.
+Docker with Compose, and an LLM API key for the chosen provider. For the default Anthropic
+provider, `ANTHROPIC_API_KEY` must be set — it is the **only variable with no working default**,
+so `cp .env.example .env` and replacing that one placeholder is the entire configuration step for
+a default local run. To use DeepInfra instead, set `LLM_PROVIDER=deepinfra` and
+`DEEP_INFRA_API_KEY`; for a local Ollama model, set `LLM_PROVIDER=ollama` and
+`OLLAMA_LLM_MODEL` to your installed model.
 
 Everything in the Quickstart runs through Docker. The host-side Make targets need their own
 toolchains: Go 1.24 plus a C compiler for `build`, `test`, and the `migrate-*` targets (see the CGO
@@ -418,12 +421,19 @@ MCP is read-side consumption plus goal registration: a pure-MCP consumer can reg
 ### Configuration
 
 The credentials worth knowing about. `.env.example` ships working placeholders for all of them
-except `ANTHROPIC_API_KEY` — when the rest must be replaced, and why before the first `make up`, is
-under [Prerequisites](#prerequisites).
+except the LLM API key — when the rest must be replaced, and why before the first `make up`, is
+under [Prerequisites](#prerequisites). Three LLM providers are supported (set via `LLM_PROVIDER`):
 
 | Variable | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude access for matrix fitting, tree proposal, extraction, and abstraction. |
+| `LLM_PROVIDER` | LLM backend: `anthropic` (default), `deepinfra`, or `ollama`. |
+| `ANTHROPIC_API_KEY` | Claude access (required for `LLM_PROVIDER=anthropic`). |
+| `ANTHROPIC_MODEL` | Claude model override (default `claude-opus-4-8`). |
+| `DEEP_INFRA_API_KEY` | DeepInfra API key (required for `LLM_PROVIDER=deepinfra`). |
+| `DEEP_INFRA_MODEL` | DeepInfra model (default `meta-llama/Llama-3.3-70B-Instruct`). |
+| `DEEP_INFRA_BASE_URL` | DeepInfra API base URL (default `https://api.deepinfra.com/v1/openai`). |
+| `OLLAMA_LLM_ENDPOINT` | Ollama server URL (default `http://localhost:11434`). |
+| `OLLAMA_LLM_MODEL` | Ollama model (default `llama3`). |
 | `NEO4J_USER` / `_PASSWORD` | Graph credentials. Compose pins the user to `neo4j`, so only the password is really free. |
 | `POSTGRES_OWNER_USER` / `_PASSWORD` | Superuser: provisions the runtime roles and owns the migrated tables. |
 | `POSTGRES_ORCHESTRATOR_USER` / `_PASSWORD` | The Orchestrator's runtime role — the only one with audit-table privileges. |
