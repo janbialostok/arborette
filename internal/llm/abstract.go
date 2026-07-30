@@ -1,15 +1,12 @@
 package llm
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"unicode"
 	"unicode/utf8"
-
-	"github.com/anthropics/anthropic-sdk-go"
 
 	"github.com/arborette/arborette/internal/domain"
 )
@@ -37,35 +34,6 @@ type OntologyTerm struct {
 type Abstraction struct {
 	Definition    string
 	OntologyTerms []OntologyTerm
-}
-
-// AbstractMetaHeuristic generalizes one measured macro-segment into a
-// domain-agnostic Meta-Heuristic, stripping the dataset's column names and values
-// in favor of a universal structural ontology.
-func (c *Client) AbstractMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment) (Abstraction, error) {
-	body, err := c.complete(ctx, anthropic.OutputConfigEffortHigh, metaHeuristicSchema(),
-		metaHeuristicSystem, macroSegmentPrompt(goalText, seg))
-	if err != nil {
-		return Abstraction{}, err
-	}
-	return decodeAbstraction(body)
-}
-
-// RepairMetaHeuristic re-abstracts after the prior definition leaked a concrete
-// column name: it re-generates with that definition and the exact leak named, so
-// the model can replace the offending term. One generation per call; the caller
-// bounds how many times it retries.
-func (c *Client) RepairMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment, prior Abstraction, validationErr string) (Abstraction, error) {
-	user := macroSegmentPrompt(goalText, seg) +
-		"\nThis definition still referenced concrete, dataset-bound terms:\n" + prior.Definition +
-		"\n\nThe rejection:\n" + validationErr +
-		"\n\nRewrite the definition so every variable is a bracketed ontology term and no raw column name survives."
-	body, err := c.complete(ctx, anthropic.OutputConfigEffortHigh, metaHeuristicSchema(),
-		metaHeuristicRepairSystem, user)
-	if err != nil {
-		return Abstraction{}, err
-	}
-	return decodeAbstraction(body)
 }
 
 // LeakedConcreteTerms returns the column names that survive verbatim in a

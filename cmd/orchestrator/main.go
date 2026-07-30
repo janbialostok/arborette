@@ -59,8 +59,11 @@ func main() {
 	audits := store.NewAuditLog(pool)
 	embeddings := store.NewEmbeddingStore(pool)
 	heur := heuristics.NewService(provider, embeddings, repo)
-	claude := llm.NewClient(cfg.Anthropic.APIKey, cfg.Anthropic.Model)
-	chat := llm.NewChatClient(cfg.Anthropic.APIKey, cfg.Anthropic.ChatModel, cfg.MCP.PublicURL, cfg.MCP.AuthorizationToken)
+	claude, err := llm.NewClient(cfg.LLM)
+	if err != nil {
+		log.Fatalf("orchestrator: llm client: %v", err)
+	}
+	chat := llm.NewChatClient(cfg.LLM.Anthropic.APIKey, cfg.LLM.Anthropic.ChatModel, cfg.MCP.PublicURL, cfg.MCP.AuthorizationToken)
 	sandbox := orchestrator.NewSandboxClient(cfg.Orchestrator.SandboxURL, nil)
 
 	// Runs whose loop was abandoned by a prior crash or shutdown never ran their

@@ -10,6 +10,10 @@
   ancient `aws-sdk-go-v2/service/s3` (predating `Options.BaseEndpoint`). Keep
   `service/s3` explicitly required at a current version, or the object-store
   client's `BaseEndpoint`/`UsePathStyle` (MinIO/S3 selection) will not compile.
+- The LLM provider is selected at runtime via `LLM_PROVIDER` (anthropic/deepinfra/ollama). The
+  Anthropic backend requires `github.com/anthropics/anthropic-sdk-go` at **v1.58.0** (pinned by
+  the orchestrator's structured-output usage). DeepInfra and Ollama use hand-rolled HTTP clients
+  and carry no SDK dependency — switching providers is a config change, not a `go.mod` change.
 - `github.com/modelcontextprotocol/go-sdk` (the MCP server) must stay at **v1.3.1**
   — the version `github.com/anthropics/anthropic-sdk-go` v1.58.0 transitively
   requires. Pinning it lower (e.g. v0.8.0) makes `go mod tidy` silently downgrade

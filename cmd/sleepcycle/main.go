@@ -54,10 +54,14 @@ func main() {
 	}
 
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
+	claude, err := llm.NewClient(cfg.LLM)
+	if err != nil {
+		log.Fatalf("sleepcycle: llm client: %v", err)
+	}
 	worker, err := sleepcycle.NewWorker(
 		repo,
 		sandboxclient.NewClient(cfg.SleepCycle.SandboxURL, nil),
-		llm.NewClient(cfg.Anthropic.APIKey, cfg.Anthropic.Model),
+		claude,
 		provider,
 		store.NewEmbeddingStore(pool),
 		store.NewGoalRegistry(pool),
