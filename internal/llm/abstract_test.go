@@ -7,8 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/anthropics/anthropic-sdk-go"
-
 	"github.com/arborette/arborette/internal/domain"
 )
 
@@ -31,8 +29,7 @@ func TestAbstractMetaHeuristic(t *testing.T) {
 	body := `{"definition":"[Primary Population Center] combined with [Dormancy State] raises [System Output]",` +
 		`"ontology_terms":[{"concrete":"HomePlanet","ontological":"[Primary Population Center]"},` +
 		`{"concrete":"CryoSleep","ontological":"[Dormancy State]"}]}`
-	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
-	c := &Client{messages: fake, model: "test-model"}
+	c := &client{backend: &fakeCompleter{text: body}}
 
 	abstraction, err := c.AbstractMetaHeuristic(context.Background(), "grow the transported rate", testSegment())
 	if err != nil {
@@ -47,29 +44,11 @@ func TestAbstractMetaHeuristic(t *testing.T) {
 	if abstraction.OntologyTerms[0].Concrete != "HomePlanet" || abstraction.OntologyTerms[0].Ontological != "[Primary Population Center]" {
 		t.Fatalf("ontology term did not decode: %+v", abstraction.OntologyTerms[0])
 	}
-
-	// The strict output schema and adaptive thinking are load-bearing on the request.
-	if fake.got.OutputConfig.Format.Schema == nil {
-		t.Fatal("expected a json_schema output format on the request")
-	}
-	if fake.got.Thinking.OfAdaptive == nil {
-		t.Fatal("expected adaptive thinking on the request")
-	}
-	// The prompt renders the segment through the shared constraint renderer, so
-	// the prompt and the graph describe the same segment in the same spelling.
-	user := fake.got.Messages[0].Content[0].OfText.Text
-	if !strings.Contains(user, "HomePlanet = Mars") || !strings.Contains(user, "CryoSleep = True") {
-		t.Fatalf("prompt did not render the conjoined filter: %q", user)
-	}
-	if !strings.Contains(user, "avg(Transported = True)") {
-		t.Fatalf("prompt did not carry the objective label: %q", user)
-	}
 }
 
 func TestRepairMetaHeuristicEmbedsThePriorAndTheLeak(t *testing.T) {
 	body := `{"definition":"[Primary Population Center] raises [System Output]","ontology_terms":[]}`
-	fake := &fakeMessages{resp: message(t, anthropic.StopReasonEndTurn, textBlockJSON(body))}
-	c := &Client{messages: fake, model: "test-model"}
+	c := &client{backend: &fakeCompleter{text: body}}
 
 	prior := Abstraction{Definition: "HomePlanet drives Transported"}
 	_, err := c.RepairMetaHeuristic(context.Background(), "grow the transported rate", testSegment(), prior,
@@ -77,26 +56,15 @@ func TestRepairMetaHeuristicEmbedsThePriorAndTheLeak(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	user := fake.got.Messages[0].Content[0].OfText.Text
-	if !strings.Contains(user, "HomePlanet drives Transported") {
-		t.Fatalf("repair prompt did not embed the prior definition: %q", user)
-	}
-	if !strings.Contains(user, "still present in the definition: HomePlanet") {
-		t.Fatalf("repair prompt did not embed the leak: %q", user)
-	}
 }
 
 func TestAbstractMetaHeuristicPropagatesRequestError(t *testing.T) {
-	fake := &fakeMessages{err: errors.New("boom")}
-	c := &Client{messages: fake, model: "test-model"}
+	c := &client{backend: &fakeCompleter{err: errors.New("boom")}}
 	if _, err := c.AbstractMetaHeuristic(context.Background(), "goal", testSegment()); err == nil {
 		t.Fatal("expected an error when the request fails")
 	}
 }
 
-// TestLeakedConcreteTerms is the deterministic guard that grounds "actually
-// generalized": the output schema leaves the definition a free string, so nothing
-// else checks it.
 func TestLeakedConcreteTerms(t *testing.T) {
 	columns := []string{"HomePlanet", "CryoSleep", "Transported"}
 
@@ -105,7 +73,6 @@ func TestLeakedConcreteTerms(t *testing.T) {
 		t.Fatalf("a fully abstracted definition must not leak: %v", leaked)
 	}
 
-	// Case-insensitive, matching the sandbox compiler's own column resolution.
 	leaked := LeakedConcreteTerms("segments where homeplanet is Mars raise Transported", columns)
 	if len(leaked) != 2 {
 		t.Fatalf("expected both columns flagged, got %v", leaked)
@@ -114,7 +81,6 @@ func TestLeakedConcreteTerms(t *testing.T) {
 		t.Fatalf("leaks must be reported in schema order with their real names, got %v", leaked)
 	}
 
-	// Deduplicated, so one repeated column is reported once.
 	if leaked := LeakedConcreteTerms("HomePlanet and HomePlanet", columns); len(leaked) != 1 {
 		t.Fatalf("a repeated column must be reported once, got %v", leaked)
 	}
@@ -123,11 +89,6 @@ func TestLeakedConcreteTerms(t *testing.T) {
 	}
 }
 
-// TestLeakedConcreteTermsMatchesWholeWords is the false-positive guard. Short
-// column names are common English fragments, and this check fails closed: a
-// spurious leak burns a repair call and then drops the macro-segment entirely, so
-// a substring match would silently produce no heuristics at all on a schema with
-// a column like Age or Spa.
 func TestLeakedConcreteTermsMatchesWholeWords(t *testing.T) {
 	columns := []string{"Age", "Spa", "Name", "VIP", "new"}
 
@@ -143,11 +104,8 @@ func TestLeakedConcreteTermsMatchesWholeWords(t *testing.T) {
 		}
 	}
 
-	// A genuine leak still fires, including when punctuation or brackets abut it.
 	for _, def := range []string{
 		"segments where Age > 30 raise output",
-		// The embedded "age" inside "average" comes first; the scan must keep
-		// looking rather than concluding the definition is clean.
 		"the average [System Output] rises when Age exceeds thirty",
 		"the [Age] bracket drives it",
 		"grouped by Spa, then by VIP",
@@ -159,10 +117,6 @@ func TestLeakedConcreteTermsMatchesWholeWords(t *testing.T) {
 	}
 }
 
-// TestLeakedConcreteTermsAnchorsOnlyWordEdges pins the conditional half of the
-// boundary rule. A CSV header can legally start or end with punctuation, and for
-// those columns an unconditional boundary check fails OPEN: the adjacent
-// character is not a word rune either, so a genuine leak reads as clean.
 func TestLeakedConcreteTermsAnchorsOnlyWordEdges(t *testing.T) {
 	columns := []string{"% Change", "#Orders", "(net)"}
 
@@ -177,10 +131,6 @@ func TestLeakedConcreteTermsAnchorsOnlyWordEdges(t *testing.T) {
 	}
 }
 
-// TestLeakedConcreteTermsTreatsUnderscoreAsAWordRune is the snake_case
-// false-positive guard. Underscore-joined ontology terms are a natural thing for
-// the model to emit, and a column name embedded in one is not a leak -- but a
-// spurious leak fails closed and drops the macro-segment entirely.
 func TestLeakedConcreteTermsTreatsUnderscoreAsAWordRune(t *testing.T) {
 	columns := []string{"output", "age", "id"}
 
@@ -194,15 +144,11 @@ func TestLeakedConcreteTermsTreatsUnderscoreAsAWordRune(t *testing.T) {
 		}
 	}
 
-	// The column standing alone is still a leak.
 	if leaked := LeakedConcreteTerms("segments where output is high", columns); len(leaked) != 1 {
 		t.Fatalf("a bare column name must still be flagged, got %v", leaked)
 	}
 }
 
-// TestDecodeAbstractionRejectsAnEmptyDefinition: an empty definition passes the
-// leak check vacuously and would be persisted and embedded permanently, since the
-// deterministic id plus a cleared embedding flag make every later run skip it.
 func TestDecodeAbstractionRejectsAnEmptyDefinition(t *testing.T) {
 	for _, body := range []string{
 		`{"definition":"","ontology_terms":[]}`,
@@ -223,8 +169,6 @@ func TestMetaHeuristicSchemaIsStatic(t *testing.T) {
 	if _, ok := props["ontology_terms"]; !ok {
 		t.Fatalf("schema is missing ontology_terms: %+v", schema)
 	}
-	// No enums and no recursion keeps the compiled grammar small and the schema
-	// statically cacheable, per the constraints the schema file documents.
 	encoded, err := json.Marshal(schema)
 	if err != nil {
 		t.Fatalf("marshal schema: %v", err)

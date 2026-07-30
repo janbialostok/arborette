@@ -116,6 +116,10 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		if termErr != nil {
 			status, reason = store.RunFailed, termErr.Error()
 		}
+		log.Printf("orchestrator: hypothesis loop %q: %s", id, status)
+		if reason != "" {
+			log.Printf("orchestrator: hypothesis loop %q: failure reason: %s", id, reason)
+		}
 		if err := s.runs.SetStatus(writeCtx, runID, status, reason); err != nil {
 			log.Printf("orchestrator: hypothesis loop %q: set run status: %v", id, err)
 		}
@@ -142,6 +146,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
+	log.Printf("orchestrator: hypothesis loop %q: objective: %s %s %s", id, obj.Aggregation, obj.Label, obj.Direction)
 
 	introspect, err := s.sandbox.Introspect(ctx, IntrospectRequest{DataSourceRef: goal.DataSourceRef})
 	if err != nil {
@@ -151,6 +156,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		return
 	}
 	schema := toSandboxSchema(introspect.Schema)
+	log.Printf("orchestrator: hypothesis loop %q: introspected %d columns", id, len(schema.Columns))
 
 	rootCandidates, err := s.proposeValidCandidates(ctx, goal, schema,
 		llm.TreeContext{IsRoot: true, Breadth: defaultBreadth})
@@ -160,6 +166,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
+	log.Printf("orchestrator: hypothesis loop %q: %d root candidates proposed", id, len(rootCandidates))
 
 	// Root baseline: the objective measured with no filters. Deeper baselines
 	// reuse the parent's outcome value (cumulative nesting makes that valid).
@@ -176,6 +183,8 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		s.branchFailure(ctx, id, nil, errNonNumericValue)
 		return
 	}
+	rootRowCount, _ := sandboxclient.RowCount(baseResp)
+	log.Printf("orchestrator: hypothesis loop %q: root baseline: %.4f (row_count: %d)", id, baseline, rootRowCount)
 
 	for _, cand := range rootCandidates {
 		s.processCandidate(ctx, goal, obj, schema, nil, baseline, cand, 1, hist)
@@ -189,16 +198,19 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj objective.Objective, schema llm.SandboxSchema, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, depth int, hist *confidenceHistogram) {
 	id := goal.OptimizationFunctionID
 	effective := concatFilters(parentFilters, cand.Filters)
+	log.Printf("orchestrator: hypothesis loop %q: depth=%d candidate filters=%v", id, depth, renderConstraints(cand.Filters))
 
 	req := objective.ExecuteRequestFor(goal.DataSourceRef, obj, effective)
 	req.IncludeRowCount = true
 	resp, err := s.sandbox.Execute(ctx, req)
 	if err != nil {
+		log.Printf("orchestrator: hypothesis loop %q: depth=%d measurement failed: %v", id, depth, err)
 		s.branchFailure(ctx, id, effective, err)
 		return
 	}
 	value, ok := objective.NumericValue(resp.Value, obj.Label)
 	if !ok {
+		log.Printf("orchestrator: hypothesis loop %q: depth=%d non-numeric value", id, depth)
 		s.branchFailure(ctx, id, effective, errNonNumericValue)
 		return
 	}
@@ -210,6 +222,7 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 	if !counted {
 		log.Printf("orchestrator: hypothesis loop %q: sandbox returned no row count for a counted measurement", id)
 	}
+	log.Printf("orchestrator: hypothesis loop %q: depth=%d measured %.4f (baseline=%.4f effect=%.4f support=%d)", id, depth, value, baseline, value-baseline, support)
 
 	outcomeID, err := s.writeTriplet(ctx, goal, obj, parentFilters, baseline, cand, effective, value, support)
 	if err != nil {
@@ -223,15 +236,19 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 	s.recordConfidence(id, hist, outcomeID, verifiedConfidence)
 
 	if !objective.Improves(baseline, value, obj.Direction) {
+		log.Printf("orchestrator: hypothesis loop %q: depth=%d did not improve, pruning", id, depth)
 		return
 	}
 	if !constraintsSatisfied(goal.EvaluationMatrix.Constraints, objectiveField(obj), value) {
+		log.Printf("orchestrator: hypothesis loop %q: depth=%d violates hard constraint, pruning", id, depth)
 		s.branchFailure(ctx, id, effective, errors.New("candidate violates a hard constraint on the objective field"))
 		return
 	}
 	if depth >= defaultDepth {
+		log.Printf("orchestrator: hypothesis loop %q: depth=%d at depth cap, not expanding", id, depth)
 		return
 	}
+	log.Printf("orchestrator: hypothesis loop %q: depth=%d improved, expanding", id, depth)
 
 	children, err := s.proposeValidCandidates(ctx, goal, schema, llm.TreeContext{
 		Breadth:        defaultBreadth,
@@ -241,9 +258,11 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 		PriorValue:     &value,
 	})
 	if err != nil {
+		log.Printf("orchestrator: hypothesis loop %q: depth=%d child proposal failed: %v", id, depth, err)
 		s.branchFailure(ctx, id, effective, err)
 		return
 	}
+	log.Printf("orchestrator: hypothesis loop %q: depth=%d proposing %d children", id, depth, len(children))
 	for _, c := range children {
 		s.processCandidate(ctx, goal, obj, schema, effective, value, c, depth+1, hist)
 	}
@@ -316,12 +335,15 @@ func (s *Server) runDocumentLoop(ctx context.Context, goal store.Goal, hist *con
 // constraint check.
 func (s *Server) processExtractionCandidate(ctx context.Context, goal store.Goal, field domain.TargetField, pdf []byte, pages []string, method string, parentConfidence float64, depth int, hist *confidenceHistogram) {
 	id := goal.OptimizationFunctionID
+	log.Printf("orchestrator: hypothesis loop %q: extract depth=%d field=%q method=%q", id, depth, field.Name, method)
 
 	value, confidence, err := s.claude.Extract(ctx, pdf, field, method)
 	if err != nil {
+		log.Printf("orchestrator: hypothesis loop %q: extract depth=%d failed: %v", id, depth, err)
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
+	log.Printf("orchestrator: hypothesis loop %q: extract depth=%d value=%q confidence=%.2f", id, depth, value, confidence)
 
 	locator := locateProvenance(pages, value)
 	outcomeID, err := s.writeExtractionTriplet(ctx, goal, field, method, parentConfidence, value, confidence, locator)
@@ -344,9 +366,11 @@ func (s *Server) processExtractionCandidate(ctx context.Context, goal store.Goal
 	}
 
 	if !objective.Improves(parentConfidence, confidence, domain.Maximize) {
+		log.Printf("orchestrator: hypothesis loop %q: extract depth=%d did not improve confidence, pruning", id, depth)
 		return
 	}
 	if depth >= defaultDepth {
+		log.Printf("orchestrator: hypothesis loop %q: extract depth=%d at depth cap, not expanding", id, depth)
 		return
 	}
 	// Refining below an unreviewed extraction is what blocking mode exists to
@@ -368,6 +392,7 @@ func (s *Server) processExtractionCandidate(ctx context.Context, goal store.Goal
 			return
 		}
 	}
+	log.Printf("orchestrator: hypothesis loop %q: extract depth=%d improved, expanding", id, depth)
 	for _, m := range extractionMethods {
 		s.processExtractionCandidate(ctx, goal, field, pdf, pages, m, confidence, depth+1, hist)
 	}
