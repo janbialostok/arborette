@@ -262,7 +262,9 @@ path. Anything else — `.tsv`, `.xlsx`, `.json` — is rejected, so a spreadshe
 converting first. A `.pdf` takes a different intake entirely: instead of fitting an objective it
 asks Claude which fields are extractable from your goal text, so phrase a document goal as the
 values you want pulled out rather than as something to maximize, or it comes back 422 with nothing
-to extract. No sample PDF ships with the repo.
+to extract. A one-page sample ships as `sample-invoice.pdf` on the import mount — an invoice
+carrying a number, dates, and totals — so `import_path=sample-invoice.pdf` with a goal phrased as
+the fields to pull out exercises the document path end to end.
 
 Registration ingests the file into the object store, introspects its schema, fits the Evaluation
 Matrix to the real columns with Claude, **dry-runs the fitted objective against the Sandbox**, and
@@ -532,7 +534,7 @@ the existing search seam.
 - **`web/`** — the Next.js UI, kept as its own deployable with its own image and lockfile so
   front-end iteration does not couple to the Go backend's release cadence.
 - **`local-import/`** — the read-only import mount the Orchestrator ingests on-disk sources from,
-  containing the bundled `orders.csv` sample.
+  containing the bundled `orders.csv` and `sample-invoice.pdf` samples.
 - **`.turbo/`** — specs, plans, shells, and the running improvements log.
 - **`context/`** — the original concept documents, superseded by the specs and kept for provenance.
 
