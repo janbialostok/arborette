@@ -222,3 +222,91 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Where**: `internal/testutil/testutil.go` (`TruncateEmbeddings` and a missing graph counterpart), fixtures in `internal/graph/graph_test.go:87,145`, `internal/graph/sleepcycle_test.go:162`, `internal/heuristics/heuristics_test.go:49`, `internal/mcpserver/tools_integration_test.go:51`, `internal/llm/abstract_test.go:70`
 - **Why**: Integration tests truncate pgvector but never remove the Neo4j nodes they create, so fixtures accumulate against the shared dev graph indefinitely. Measured 2026-07-28: **169 of 194** Meta-Heuristic nodes were test residue — `"abstraction"` ×97, `"reducing the alert threshold restores latency without degrading recall"` ×25, `"reducing threshold restores latency"` ×24, `"[Primary Population Center] raises [System Output]"` ×23 — leaving only 25 real heuristics, and 4 residue nodes had live embeddings so they ranked in every user-facing search. Beyond the noise, this asymmetry (pgvector truncated, graph persisted) is the mechanism that manufactures *both* drift directions tracked above, so fixing it removes the main local source of the reconcile entry's recurrences. Options: a `TruncateGraph` counterpart called alongside `TruncateEmbeddings`, per-test `t.Cleanup` deleting seeded ids, or giving integration tests their own database rather than sharing the dev instance — the last also stops `make test` wiping embeddings out from under a running stack, which is how the 23 vector-less heuristics were produced.
 - **Noted**: 2026-07-28
+
+### Ship a bundled sample dataset large enough to exercise the Sleep Cycle at defaults
+
+- **Type**: plan
+- **Category**: dx
+- **Where**: `local-import/orders.csv` (20 data rows) against `SLEEPCYCLE_SEARCH_MIN_SUPPORT=30` (`.env.example:65`)
+- **Why**: The only dataset shipped with the repo cannot exercise Phase 2 at all. At the default floor, `candidatesFromFindings` (`internal/sleepcycle/publish.go:67`) drops every Phase-1 finding under `MinSupport`, so with 20 total rows the candidate union is empty and the run reports "no candidate cleared publication selection" (`worker.go:281`). Lowering the floor to 5 does not fix it: `S*` is `customer_segment = repeat` (12 rows, avg 136.76), the best conjunction clearing support 5 is `repeat ∧ mobile` (5 rows, 141.25 — a 3.3% lift against the 5% `MIN_LIFT`), and stronger combinations such as `repeat ∧ West` (4 rows) are support-pruned — so `materiallyBetter` (`worker.go:350-365`) passes nothing and the conjunction-lattice search, the headline of Phase 2, writes back zero winners. Any quickstart must therefore tell readers to edit an evidence floor down and then restore it (the edit persists via `env_file` on the `sleepcycle` service) while *still* never exercising write-back. A ~200-row sample carrying a real interaction effect would let both phases run untouched at defaults. Noted while planning the README (`.turbo/plans/add-a-readme-describing-the-product.md`), which works around this rather than fixing it.
+- **Noted**: 2026-07-28
+
+### Ground Phase-1 filter proposals in categorical column values, not just column names
+
+- **Type**: plan
+- **Category**: reliability
+- **Where**: `internal/orchestrator/hypothesis.go` (`proposeValidCandidates`, `splitByColumns`), `internal/llm` (tree-proposal prompt), `internal/sandbox` introspection (would need to return sample/distinct values)
+- **Why**: `domain.UnknownFilterColumns` validates that a proposed filter names a real *column*, and the repair loop re-proposes when it does not — but nothing checks the *values*. Claude therefore invents plausible categories that exist in no row, every segment matches zero rows, `avg` over an empty set returns NULL, and the candidate dies as `sandbox returned a non-numeric objective value`. Measured live 2026-07-28 on the bundled 20-row `orders.csv` (`region`/`customer_segment`/`channel` ∈ Northeast|Midwest|West|South / repeat|new / web|mobile): one run proposed `customer_segment = 'Enterprise'`, `channel IN ('Direct','Partner')`, and `region IN ('North America','Europe')` — **3 of 3 candidates dead, zero triplets, run still reported `completed`**; a second run scored 1 triplet from 6 candidates, and even that one (`region IN {North, West}`) was half-hallucinated. Zero triplets means Phase 2 has no atoms and publishes nothing, so a whole goal produces no knowledge while every status field says success. Distinct from the stale "Harden the hypothesis proposal→execute path" entry above, whose column-grounding fix (`b9f40b9`) shipped and works — this is the value analogue it did not cover. Likely fix: have introspection return distinct values (or a capped sample) for low-cardinality columns and ground the proposal prompt on them, plus a deterministic post-check mirroring `UnknownFilterColumns`; alternatively treat a zero-row segment as a distinct, non-fatal outcome so the loop can retry rather than burning the branch.
+- **Noted**: 2026-07-28
+
+### Make the SSE stream endpoint answer for finished and unknown runs
+
+- **Type**: plan
+- **Category**: dx
+- **Where**: `internal/orchestrator/stream.go` (`handleStream`, `writeEvent`), `internal/orchestrator/hub.go` (`Subscribe`, `Complete`)
+- **Why**: `GET /goals/{id}/stream` for a completed run — or any unknown/typo'd id — returns **no HTTP response head at all** and never closes. `Hub.Complete` deletes the run state and `Hub.run` lazily recreates an empty one, so there is nothing to replay; the handler sets headers but only flushes them inside `writeEvent`, which never fires. Measured 2026-07-28: `curl -sS -N --max-time 15` against a finished goal and against an all-zeros uuid both gave `http_code=000`, `size_download=0`, an empty `-D` header dump, and exit 28 — a client cannot even check a status code before hanging. Cost real debugging time this session (a 10-minute hung curl read as a stuck run). `web/lib/runState.ts` documents the trap and defends against it client-side, so the workaround exists but every non-web consumer re-discovers it. Cheap half: flush the response head on subscribe so the client at least gets 200 + headers. Full fix needs a decision — 404 an id with no live run, close the stream immediately when the run is already settled, or send periodic heartbeats — and interacts with the fact that the hub is keyed by goal, not run.
+- **Noted**: 2026-07-28
+
+### Bound and authenticate the agent chat endpoint
+
+- **Type**: plan
+- **Category**: reliability
+- **Where**: `internal/orchestrator/chat.go` (`handleChat`), `internal/service/httpserver.go` (`RunHTTPServer`)
+- **Why**: `POST /goals/{id}/chat` is effectively an open LLM proxy on the operator's `ANTHROPIC_API_KEY`. It accepts a caller-authored transcript — including forged `assistant` turns — and streams raw model text back, reachable by anyone who can reach :8080 with a goal id from the unauthenticated `GET /goals`. Each request authorizes up to `maxChatResumes+1` generations of `chatMaxTokens` and holds a connection for the whole stream, while `RunHTTPServer` sets only `ReadHeaderTimeout` and no write timeout; the sole limit is the 1 MiB body cap. Deliberately deferred when the chat backend shipped (2026-07-28) because no orchestrator route has auth and the localhost trust model is intentional — see the README roadmap's service-boundary bullet. Wants a per-IP or global concurrency cap on this handler, a per-message content cap, and a write timeout, alongside whatever auth model the orchestrator eventually adopts.
+- **Noted**: 2026-07-28
+
+### Guard handleTriggerLoop against concurrent runs for one goal
+
+- **Type**: direct
+- **Category**: reliability
+- **Where**: `internal/orchestrator/hypothesis.go` (`handleTriggerLoop`), `internal/store/runs.go`
+- **Why**: The trigger creates a run row and launches the loop goroutine unconditionally, so two triggers for one goal (double-click, scripted retry) produce two live runs whose `triplet`/`loop_complete` frames interleave on the shared goal-keyed hub stream, and any goal-keyed in-memory state collides (the arborette-08 plan's histogram registry defends itself with compare-and-delete deregistration, but the underlying collision is pre-existing). Check the runs table for a `running` row and return 409 at the entry point. Surfaced during arborette-08 plan review, deliberately left out of that plan's scope.
+- **Noted**: 2026-07-29
+
+### Migrate the stored provenance property to one wire shape
+
+- **Type**: plan
+- **Category**: dx
+- **Where**: `internal/graph/neo4j.go` (`marshalProvenance`), `internal/domain/domain.go` (`ProvenanceLocator`)
+- **Why**: The SSE half of this is done — the `triplet` frame now publishes through `toProvenanceDTO`, so every wire surface is snake_case. The stored Neo4j `o.provenance` property still holds Go field names (`{"Page":0,"CharStart":42,"CharEnd":55}`) because `marshalProvenance` serializes the tagless `ProvenanceLocator` straight in. Adding json tags to the struct is still unsafe on its own: it rewrites the on-disk keys and breaks reads of every existing Outcome. Needs a migration decision (backfill vs. tolerant reader) rather than a tag change.
+- **Noted**: 2026-07-29
+
+### Close the four seams left by the HITL verification backend
+
+- **Type**: plan
+- **Category**: reliability
+- **Where**: `internal/orchestrator/{server.go,hypothesis.go,verification.go}`, `internal/graph/neo4j.go`, `internal/store/verificationqueue.go`
+- **Why**: Four review findings deliberately deferred as too broad for that commit. (1) `NewServer` now takes 17 positional params including two adjacent strings — a `Deps` struct would make every argument self-labelling and let `verificationPoll`/`keepaliveInterval` be real optional fields rather than post-construction pokes in tests. (2) A blocking-mode goal swaps the *whole run's* deadline to 24h, so sandbox/Claude/graph calls inherit it too — a wedged dependency hangs 24h instead of failing at 30 min; bounding the waits separately needs the run-context handling restructured. (3) `compensateClaim` checks the graph then un-claims as two steps across two stores, so a repairer landing the verdict in between leaves graph=resolved/queue=pending — reads as unreviewed while already search-eligible, and a later different verdict would overwrite it (needs a failed graph write *plus* a concurrent duplicate resolution to reach; the code comment now states the window rather than claiming it closed). (4) Dedups: `GetExtractionOutcome` reimplements `getNode`'s collect/zero-one-many/`ErrNotFound` protocol including its driver-quirk rationale; `store.marshalLocator` duplicates `graph.marshalProvenance`; and the run-confidence histogram sits in `verification.go` though the tabular loop uses it and HITL does not.
+- **Noted**: 2026-07-29
+
+### Cache per-goal document page text for the HITL excerpt/correction endpoints
+
+- **Type**: plan
+- **Category**: performance
+- **Where**: `internal/orchestrator/verification.go` (once arborette-08 lands), `internal/sandboxclient/client.go` (`DocumentText`)
+- **Why**: The sandbox is stateless, so every HITL excerpt view and every correction re-downloads and re-parses the whole PDF in a synchronous cross-service round trip — an analyst paging an N-entry queue pays N full parses of an immutable document. A goal-scoped page-text cache (documents are content-addressed by `data_source_ref` and never change) removes all but the first. Deferred from the arborette-08 plan as "follow-up if queue review feels slow"; pick up after that plan ships and only if latency is felt.
+- **Noted**: 2026-07-29
+
+### Anchor the bare `orchestrator` line in .gitignore
+
+- **Type**: direct
+- **Category**: dx
+- **Where**: `.gitignore` (line 24)
+- **Why**: The entry has no leading slash, so it matches any path component named `orchestrator` at any depth — shadowing `internal/orchestrator/`, `cmd/orchestrator/`, and `web/app/api/orchestrator/`. Tracked files still stage but exit 1 (breaking `&&` chains); **new** files there never appear in `git status` at all, so a feature can be committed with its routes silently missing. It also makes gitignore-respecting search skip those directories, returning wrong answers to recursive greps. Anchor it to `/orchestrator` so it ignores only the built binary it was meant for.
+- **Noted**: 2026-07-30
+
+### Extract the duplicated presentational patterns in web/components
+
+- **Type**: plan
+- **Category**: refactor
+- **Where**: `web/components/{ui.tsx,VerificationQueue.tsx,HeuristicBrowser.tsx,ObjectivesList.tsx,GoalForm.tsx}`
+- **Why**: Five patterns are now copied rather than shared: the segmented control, the text-input class string (five call sites, including the focus-ring tokens), the master/detail list scaffold with its loading/empty/placeholder panels, the fetch-on-mount `cancelled`-guard effect (five instances), and the status badge. The badge is the one with teeth — two components render the same `domain.VerificationStatus` under divergent tone maps, so a `verified` outcome shows neutral on one screen and positive on another. Deferred deliberately from the web UI change as its own refactor, since it reverses an established local-helper convention across files that change did not otherwise touch.
+- **Noted**: 2026-07-30
+
+### Make the sleep-cycle trigger real in local/dev
+
+- **Type**: plan
+- **Category**: dx
+- **Where**: `cmd/sleepcycle/main.go`, `internal/orchestrator/joblauncher.go`, `internal/config/config.go`, `docker-compose.yml`
+- **Why**: `StubLauncher` logs and returns 202 without starting anything, so the UI's "Run Sleep Cycle" button silently does nothing locally and Phase 2 can only be driven by `make sleep-cycle GOAL=<id>` — the local stack is not end-to-end demoable through its own interface. Add a serve mode to the worker (split dependency wiring from the run; `POST /runs {optimization_function_id}` runs one cycle) and an `HTTPLauncher` behind the existing `JobLauncher` interface, selected when `SLEEPCYCLE_URL` is set and falling back to `StubLauncher` as the AWS Batch seam. The one-shot job invocation keeps working by overriding the command. Rejected alternatives: calling `internal/sleepcycle` in-process (the launcher's contract is explicitly an infra-level invocation, and it would duplicate the worker's wiring) and mounting the Docker socket into the orchestrator (privilege escalation for a dev convenience). The UI's "Sleep cycle launched" callout should become accurate once this lands.
+- **Noted**: 2026-07-30
