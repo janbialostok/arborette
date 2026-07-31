@@ -65,7 +65,7 @@ func main() {
 		log.Fatalf("orchestrator: llm client: %v", err)
 	}
 	chat := llm.NewChatClient(cfg.LLM.Anthropic.APIKey, cfg.LLM.Anthropic.ChatModel, cfg.MCP.PublicURL, cfg.MCP.AuthorizationToken)
-	sandbox := sandboxclient.NewClient(cfg.Orchestrator.SandboxURL, nil)
+	sandbox := sandboxclient.NewClient(cfg.Orchestrator.SandboxURL, cfg.Orchestrator.InternalAuthToken, nil)
 
 	// Runs whose loop was abandoned by a prior crash or shutdown never ran their
 	// terminal write; settle them to failed at boot so they don't strand at

@@ -83,6 +83,7 @@ type sandboxExecutor interface {
 
 type goalStore interface {
 	Insert(ctx context.Context, goal store.Goal) error
+	RegisterDataSourceRef(ctx context.Context, ref string) error
 	Get(ctx context.Context, optimizationFunctionID string) (store.Goal, error)
 	List(ctx context.Context) ([]store.Goal, error)
 }

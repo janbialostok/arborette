@@ -104,6 +104,18 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Register the minted ref immediately -- this is the single choke point covering
+	// upload, local-import, and document goals -- and before the intake introspect
+	// and dry-run below, which the Sandbox validates against the registry. Skipping
+	// it would 404 every intake, since those sandbox calls precede goals.Insert. A
+	// row orphaned by a later intake failure is harmless: it names an object the
+	// orchestrator itself staged.
+	if err := s.goals.RegisterDataSourceRef(ctx, ref); err != nil {
+		log.Printf("orchestrator: register data source ref: %v", err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
 	// Introspect first, as a hard precondition: the schema fits the objective to
 	// real columns, and an unreadable/unsupported/missing source is surfaced now
 	// rather than at run time.

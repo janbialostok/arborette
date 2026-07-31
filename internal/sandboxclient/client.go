@@ -136,17 +136,20 @@ func (e *SandboxError) Error() string { return e.Message }
 // Client calls the Sandbox Execution HTTP service. It is built with primitive
 // args (infra-constructor convention).
 type Client struct {
-	baseURL string
-	client  *http.Client
+	baseURL   string
+	client    *http.Client
+	authToken string
 }
 
-// NewClient points a client at the sandbox base URL. A nil httpClient gets one
-// bounded by defaultSandboxTimeout.
-func NewClient(baseURL string, httpClient *http.Client) *Client {
+// NewClient points a client at the sandbox base URL. authToken is the shared secret
+// the sandbox verifies on every route; empty presents no credential (which the
+// sandbox's own empty-token fail-open accepts). A nil httpClient gets one bounded by
+// defaultSandboxTimeout.
+func NewClient(baseURL, authToken string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultSandboxTimeout}
 	}
-	return &Client{baseURL: baseURL, client: httpClient}
+	return &Client{baseURL: baseURL, client: httpClient, authToken: authToken}
 }
 
 // Introspect POSTs an introspection request to /introspect.
@@ -188,6 +191,12 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 		return fmt.Errorf("build sandbox request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// An unconfigured secret sends no header rather than an empty one: the sandbox
+	// fails open on an empty configured token, but a malformed credential would be
+	// rejected outright.
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {

@@ -60,7 +60,7 @@ func main() {
 	}
 	worker, err := sleepcycle.NewWorker(
 		repo,
-		sandboxclient.NewClient(cfg.SleepCycle.SandboxURL, nil),
+		sandboxclient.NewClient(cfg.SleepCycle.SandboxURL, cfg.SleepCycle.InternalAuthToken, nil),
 		claude,
 		provider,
 		store.NewEmbeddingStore(pool),

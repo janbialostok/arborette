@@ -3,6 +3,7 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/arborette/arborette/internal/datasource"
@@ -133,6 +134,125 @@ var numericTypes = map[string]bool{
 	"UHUGEINT":  true,
 	"FLOAT":     true,
 	"DOUBLE":    true,
+}
+
+// staticValidate rejects a request whose aggregation, operators, cast targets, or
+// literals the deterministic compiler will not emit SQL for -- everything checkable
+// without the introspected schema. It lets handleExecute return a 400 before any
+// object-store Get, so a malformed request never pays a staging download. Column
+// name/type checks intrinsically need the schema and stay post-staging in
+// compileQueryCounted; this is deliberately a subset, reusing the same sentinels so
+// the HTTP status mapping needs no new arms.
+func staticValidate(agg string, expr *domain.Expression, filters []domain.Constraint) error {
+	if _, ok := allowedAgg[strings.ToLower(agg)]; !ok {
+		return fmt.Errorf("%w: %q", errUnknownAggregation, agg)
+	}
+	if expr != nil {
+		if err := staticValidateExpr(*expr); err != nil {
+			return err
+		}
+	}
+	for _, f := range filters {
+		if err := staticValidateFilter(f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// staticValidateExpr walks an objective value expression for the schema-independent
+// violations -- unallowed comparison/arithmetic operators, unallowed cast targets,
+// malformed or non-finite literals -- mirroring compileExpr's structure but without
+// resolving columns or checking types (both of which need the schema).
+func staticValidateExpr(e domain.Expression) error {
+	switch e.Kind {
+	case domain.ColumnRefKind:
+		return nil
+	case domain.LiteralKind:
+		return staticValidateLiteral(e.Literal)
+	case domain.CastKind:
+		castType := strings.ToUpper(strings.TrimSpace(e.CastType))
+		if _, ok := allowedCast[castType]; !ok {
+			return fmt.Errorf("%w: %q", errUnknownCast, e.CastType)
+		}
+		return staticValidateExpr(child(e.Operand))
+	case domain.ComparisonKind:
+		if !allowedCompareOp[e.Op] {
+			return fmt.Errorf("%w: %q", errUnknownOperator, e.Op)
+		}
+		if err := staticValidateExpr(child(e.Left)); err != nil {
+			return err
+		}
+		return staticValidateExpr(child(e.Right))
+	case domain.ArithmeticKind:
+		if !allowedArithOp[e.Op] {
+			return fmt.Errorf("%w: %q", errUnknownOperator, e.Op)
+		}
+		if err := staticValidateExpr(child(e.Left)); err != nil {
+			return err
+		}
+		return staticValidateExpr(child(e.Right))
+	case domain.CaseKind:
+		if len(e.Cases) == 0 {
+			return fmt.Errorf("%w: case with no branches", errTypeIncompatible)
+		}
+		for _, br := range e.Cases {
+			if err := staticValidateExpr(child(br.When)); err != nil {
+				return err
+			}
+			if err := staticValidateExpr(child(br.Then)); err != nil {
+				return err
+			}
+		}
+		if e.Else != nil {
+			return staticValidateExpr(child(e.Else))
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown expression kind %q", errTypeIncompatible, e.Kind)
+	}
+}
+
+// staticValidateFilter checks one intervention filter for the schema-independent
+// violations: an unknown operator, an empty membership set, or a non-finite
+// threshold/operand/member literal. The column-vs-operand type coherence check
+// needs the schema and stays in compileFilter.
+func staticValidateFilter(f domain.Constraint) error {
+	switch {
+	case f.IsNumericThresholdOp():
+		if math.IsInf(f.Value, 0) || math.IsNaN(f.Value) {
+			return fmt.Errorf("%w: filter %q threshold %v", errNonFiniteValue, f.Field, f.Value)
+		}
+		return nil
+	case f.IsEqualityOp():
+		return staticValidateLiteral(f.Operand)
+	case f.IsMembershipOp():
+		if len(f.Members) == 0 {
+			return fmt.Errorf("%w: filter %q has an empty %s set", errTypeIncompatible, f.Field, f.Op)
+		}
+		for i := range f.Members {
+			if err := staticValidateLiteral(&f.Members[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", errUnknownOperator, f.Op)
+	}
+}
+
+// staticValidateLiteral rejects a malformed literal (per literalValue's one-field
+// rule) or a non-finite numeric literal, which json.Marshal could not encode and
+// which the non-finite scan guard would otherwise only catch after staging.
+func staticValidateLiteral(l *domain.LiteralValue) error {
+	val, _, err := literalValue(l)
+	if err != nil {
+		return err
+	}
+	if n, ok := val.(float64); ok && (math.IsInf(n, 0) || math.IsNaN(n)) {
+		return fmt.Errorf("%w: literal %v", errNonFiniteValue, n)
+	}
+	return nil
 }
 
 // compileQuery produces a single read-only aggregate SELECT and its bound args.

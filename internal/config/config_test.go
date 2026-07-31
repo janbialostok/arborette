@@ -195,8 +195,53 @@ func TestInternalAuthTokenIsOneSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.Orchestrator.InternalAuthToken != "s3cret" || cfg.SleepCycle.InternalAuthToken != "s3cret" {
-		t.Fatalf("verifier = %q, sender = %q, want both to read INTERNAL_AUTH_TOKEN",
-			cfg.Orchestrator.InternalAuthToken, cfg.SleepCycle.InternalAuthToken)
+	if cfg.Orchestrator.InternalAuthToken != "s3cret" || cfg.SleepCycle.InternalAuthToken != "s3cret" ||
+		cfg.Sandbox.InternalAuthToken != "s3cret" {
+		t.Fatalf("orchestrator = %q, sleepcycle = %q, sandbox = %q, want all three to read INTERNAL_AUTH_TOKEN",
+			cfg.Orchestrator.InternalAuthToken, cfg.SleepCycle.InternalAuthToken, cfg.Sandbox.InternalAuthToken)
+	}
+}
+
+// TestSandboxCacheAndLimitDefaults pins the staging-cache and boundary knobs' env
+// wiring and defaults, so a typo in an env name would fall back invisibly.
+func TestSandboxCacheAndLimitDefaults(t *testing.T) {
+	setPostgresEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Sandbox.StageCacheDir != "" {
+		t.Fatalf("StageCacheDir unset = %q, want empty (boot-time temp dir)", cfg.Sandbox.StageCacheDir)
+	}
+	if cfg.Sandbox.StageCacheMaxBytes != 2<<30 {
+		t.Fatalf("StageCacheMaxBytes = %d, want the 2GiB default", cfg.Sandbox.StageCacheMaxBytes)
+	}
+	if cfg.Sandbox.ExecuteConcurrency != 8 {
+		t.Fatalf("ExecuteConcurrency = %d, want the 8 default", cfg.Sandbox.ExecuteConcurrency)
+	}
+	if cfg.Sandbox.MaxBodyBytes != 1<<20 {
+		t.Fatalf("MaxBodyBytes = %d, want the 1MiB default", cfg.Sandbox.MaxBodyBytes)
+	}
+
+	t.Setenv("SANDBOX_STAGE_CACHE_DIR", "/var/cache/arborette")
+	t.Setenv("SANDBOX_STAGE_CACHE_MAX_BYTES", "0")
+	t.Setenv("SANDBOX_EXECUTE_CONCURRENCY", "4")
+	t.Setenv("SANDBOX_MAX_BODY_BYTES", "2048")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Sandbox.StageCacheDir != "/var/cache/arborette" {
+		t.Fatalf("StageCacheDir override = %q", cfg.Sandbox.StageCacheDir)
+	}
+	if cfg.Sandbox.StageCacheMaxBytes != 0 {
+		t.Fatalf("StageCacheMaxBytes override = %d, want 0 (cache disabled)", cfg.Sandbox.StageCacheMaxBytes)
+	}
+	if cfg.Sandbox.ExecuteConcurrency != 4 {
+		t.Fatalf("ExecuteConcurrency override = %d, want 4", cfg.Sandbox.ExecuteConcurrency)
+	}
+	if cfg.Sandbox.MaxBodyBytes != 2048 {
+		t.Fatalf("MaxBodyBytes override = %d, want 2048", cfg.Sandbox.MaxBodyBytes)
 	}
 }

@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,18 +15,44 @@ import (
 	"github.com/arborette/arborette/internal/service"
 )
 
-// Server is the stateless HTTP surface of the Sandbox Execution service. It holds
-// only the object-store client and the staging limits; every request builds a
-// fresh FileSource for the ref it carries, so the sandbox owns no per-goal state.
+// refValidator reports whether a data source ref is one this system minted at
+// ingest, scoping the sandbox to the registry rather than arbitrary bucket paths.
+// It is a narrow local interface so internal/sandbox does not import internal/store;
+// cmd/sandbox adapts the store method into it. A nil validator is a test seam only
+// -- the wired binary always validates.
+type refValidator interface {
+	Validate(ctx context.Context, ref string) (bool, error)
+}
+
+// Server is the HTTP surface of the Sandbox Execution service. It is stateless in
+// semantics -- every request builds a fresh reader for the ref it carries, so the
+// sandbox owns no per-goal state -- while the optional cache adds a pure performance
+// layer over immutable content-addressed refs. The limiter bounds per-class
+// concurrency, and the ref validator scopes requests to registered data sources.
 type Server struct {
 	objects        *objectstore.Client
+	validator      refValidator
+	cache          *StageCache
+	limiter        *classLimiter
 	maxObjectBytes int64
+	maxBodyBytes   int64
 	maxTempDirSize string
 }
 
-// NewServer wires the handlers to the object store and staging limits.
-func NewServer(objects *objectstore.Client, maxObjectBytes int64, maxTempDirSize string) *Server {
-	return &Server{objects: objects, maxObjectBytes: maxObjectBytes, maxTempDirSize: maxTempDirSize}
+// NewServer wires the handlers to the object store, the ref validator, the staging
+// cache, the concurrency limiter, and the staging limits. It takes primitives and
+// narrow types only (infra-constructor convention). A nil validator and a nil cache
+// are documented test seams; the wired binary passes real ones.
+func NewServer(objects *objectstore.Client, validator refValidator, cache *StageCache, limiter *classLimiter, maxObjectBytes, maxBodyBytes int64, maxTempDirSize string) *Server {
+	return &Server{
+		objects:        objects,
+		validator:      validator,
+		cache:          cache,
+		limiter:        limiter,
+		maxObjectBytes: maxObjectBytes,
+		maxBodyBytes:   maxBodyBytes,
+		maxTempDirSize: maxTempDirSize,
+	}
 }
 
 // Routes returns the mux for the endpoints.
@@ -120,6 +147,13 @@ type ExecuteResponse struct {
 }
 
 func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
+	release, ok := s.acquireSlot(r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	var req IntrospectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
@@ -129,13 +163,16 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
 		return
 	}
+	if !s.validateRef(w, r, req.DataSourceRef) {
+		return
+	}
 
 	// A document source has no columns to describe or bind: report its kind plus a
 	// first-page text sample and let the orchestrator derive extractable fields via
 	// Claude. Kind detection is by extension, mirroring the tabular reader's own
 	// extension dispatch, so the two readers own non-overlapping formats.
 	if isDocumentRef(req.DataSourceRef) {
-		src := NewDocumentSource(s.objects, req.DataSourceRef, s.maxObjectBytes)
+		src := NewDocumentSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes)
 		pages, err := src.Pages(r.Context())
 		if err != nil {
 			writeStageErr(w, err)
@@ -148,7 +185,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	src := NewFileSource(s.objects, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
+	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
 	schema, err := src.Introspect(r.Context())
 	if err != nil {
 		writeStageErr(w, err)
@@ -163,10 +200,49 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	service.WriteJSON(w, http.StatusOK, IntrospectResponse{Schema: toSchemaDTO(schema), TargetBindings: bindings})
 }
 
+// acquireSlot takes a concurrency slot for the default request class, blocking
+// until one frees. A non-nil error means the request context was cancelled while
+// waiting -- the client is gone, so no response is written.
+func (s *Server) acquireSlot(r *http.Request) (func(), bool) {
+	release, err := s.limiter.Acquire(r.Context(), ClassDefault)
+	if err != nil {
+		return nil, false
+	}
+	return release, true
+}
+
+// validateRef scopes a request to a registered data source. Unknown ref -> the same
+// 404 shape an object-store miss produces, so the boundary leaks no
+// registered-vs-missing oracle. A nil validator (test seam) skips the check; the
+// wired binary always validates.
+func (s *Server) validateRef(w http.ResponseWriter, r *http.Request, ref string) bool {
+	if s.validator == nil {
+		return true
+	}
+	ok, err := s.validator.Validate(r.Context(), ref)
+	if err != nil {
+		log.Printf("sandbox: validate data source ref: %v", err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	if !ok {
+		service.WriteErr(w, http.StatusNotFound, "data source not found")
+		return false
+	}
+	return true
+}
+
 // handleDocumentText serves a document's ordered per-page plain text. It mirrors
 // handleIntrospect's stage-and-read shape and is deterministic (no LLM): the
 // orchestrator fetches this once per run as the substrate for provenance search.
 func (s *Server) handleDocumentText(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
+	release, ok := s.acquireSlot(r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	var req DocumentTextRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
@@ -176,8 +252,11 @@ func (s *Server) handleDocumentText(w http.ResponseWriter, r *http.Request) {
 		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
 		return
 	}
+	if !s.validateRef(w, r, req.DataSourceRef) {
+		return
+	}
 
-	src := NewDocumentSource(s.objects, req.DataSourceRef, s.maxObjectBytes)
+	src := NewDocumentSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes)
 	pages, err := src.Pages(r.Context())
 	if err != nil {
 		writeStageErr(w, err)
@@ -194,6 +273,13 @@ func isDocumentRef(ref string) bool {
 }
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
+	release, ok := s.acquireSlot(r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	var req ExecuteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
@@ -203,13 +289,25 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
 		return
 	}
+	if !s.validateRef(w, r, req.DataSourceRef) {
+		return
+	}
 
 	if req.Type != "" && req.Type != domain.InterventionQuery {
 		service.WriteErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported intervention type %q", req.Type))
 		return
 	}
 
-	src := NewFileSource(s.objects, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
+	// Reject a statically-invalid request (bad aggregation/operator/cast/literal)
+	// before constructing the reader, so no object-store Get is paid for a request
+	// the compiler would refuse anyway. Column/type checks need the schema and stay
+	// in the compiler.
+	if err := staticValidate(req.Aggregation, req.ValueExpression, req.Filters); err != nil {
+		writeStageErr(w, err)
+		return
+	}
+
+	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
 	m, err := src.ExecuteCounted(r.Context(), req.Aggregation, req.Target, req.ValueExpression, req.Filters, req.IncludeRowCount)
 	if err != nil {
 		writeStageErr(w, err)

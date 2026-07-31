@@ -223,6 +223,46 @@ func TestGoalRegistryGrants(t *testing.T) {
 	}
 }
 
+// TestDataSourceRegistry round-trips the ref registry the sandbox scopes requests
+// against and pins its grant boundary: the orchestrator writes refs (idempotently),
+// the service role (the sandbox's runtime role) may only read them to validate, and
+// an unknown ref reads false rather than erroring.
+func TestDataSourceRegistry(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+
+	orchestrator := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	orchReg := store.NewGoalRegistry(orchestrator)
+
+	ref := "datasources/" + testutil.NewID(t) + "/orders.csv"
+
+	if exists, err := orchReg.DataSourceRefExists(ctx, ref); err != nil || exists {
+		t.Fatalf("unregistered ref: exists=%v err=%v, want false/nil", exists, err)
+	}
+	if err := orchReg.RegisterDataSourceRef(ctx, ref); err != nil {
+		t.Fatalf("orchestrator register ref: %v", err)
+	}
+	// Re-registering the same ref is a no-op (ON CONFLICT DO NOTHING), which every
+	// run after the first goal registration relies on.
+	if err := orchReg.RegisterDataSourceRef(ctx, ref); err != nil {
+		t.Fatalf("re-register ref must be idempotent: %v", err)
+	}
+	if exists, err := orchReg.DataSourceRefExists(ctx, ref); err != nil || !exists {
+		t.Fatalf("registered ref: exists=%v err=%v, want true/nil", exists, err)
+	}
+
+	// The service role reads the registry to validate, exactly as the wired sandbox
+	// does; it holds SELECT but not INSERT.
+	service := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	svcReg := store.NewGoalRegistry(service)
+	if exists, err := svcReg.DataSourceRefExists(ctx, ref); err != nil || !exists {
+		t.Fatalf("service validate registered ref: exists=%v err=%v, want true/nil", exists, err)
+	}
+	if err := svcReg.RegisterDataSourceRef(ctx, "datasources/"+testutil.NewID(t)+"/x.csv"); err == nil {
+		t.Fatal("expected service INSERT on data_source_registry to be denied")
+	}
+}
+
 func TestGoalRegistryDocumentGoal(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)

@@ -89,7 +89,7 @@ func TestDocumentSample(t *testing.T) {
 
 func TestDocumentSourceUnsupportedExtension(t *testing.T) {
 	// The extension check precedes any download, so this needs no object store.
-	src := NewDocumentSource(nil, "notes.txt", 1<<20)
+	src := NewDocumentSource(nil, nil, "notes.txt", 1<<20)
 	if _, err := src.Pages(context.Background()); !errors.Is(err, errUnsupportedDocument) {
 		t.Fatalf("error = %v, want errUnsupportedDocument", err)
 	}
@@ -102,7 +102,7 @@ func TestDocumentSourceIntegration(t *testing.T) {
 	client := newTestClient(t, ctx)
 	key := putObject(t, ctx, client, ".pdf", minimalPDF(t, "IntegrationMarker"))
 
-	src := NewDocumentSource(client, key, 512<<20)
+	src := NewDocumentSource(client, nil, key, 512<<20)
 	if src.Kind() != datasource.KindDocument {
 		t.Fatalf("kind = %q, want document", src.Kind())
 	}
@@ -116,12 +116,12 @@ func TestDocumentSourceIntegration(t *testing.T) {
 
 	// A tiny object cap rejects the staged PDF before it parses (the over-limit
 	// staging bound), rather than truncating it to wrong text.
-	if _, err := NewDocumentSource(client, key, 10).Pages(ctx); !errors.Is(err, errObjectTooLarge) {
+	if _, err := NewDocumentSource(client, nil, key, 10).Pages(ctx); !errors.Is(err, errObjectTooLarge) {
 		t.Fatalf("over-limit error = %v, want errObjectTooLarge", err)
 	}
 
 	// The /document/text route returns the same per-page text.
-	srv := NewServer(client, 512<<20, "1GiB")
+	srv := NewServer(client, nil, nil, testLimiter(), 512<<20, 1<<20, "1GiB")
 	body, _ := json.Marshal(DocumentTextRequest{DataSourceRef: key})
 	req := httptest.NewRequest(http.MethodPost, "/document/text", bytes.NewReader(body))
 	rec := httptest.NewRecorder()

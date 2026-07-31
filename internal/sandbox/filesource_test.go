@@ -89,7 +89,7 @@ func TestIntrospectAndExecute(t *testing.T) {
 	for _, f := range formats {
 		t.Run(f.name, func(t *testing.T) {
 			ref := putObject(t, ctx, client, f.ext, f.body)
-			src := NewFileSource(client, ref, 1<<20, "1GiB")
+			src := NewFileSource(client, nil, ref, 1<<20, "1GiB")
 
 			schema, err := src.Introspect(ctx)
 			if err != nil {
@@ -140,7 +140,7 @@ func TestServerEndpoints(t *testing.T) {
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(csvFixture))
 
-	ts := httptest.NewServer(NewServer(client, 1<<20, "1GiB").Routes())
+	ts := httptest.NewServer(NewServer(client, nil, nil, testLimiter(), 1<<20, 1<<20, "1GiB").Routes())
 	defer ts.Close()
 
 	post := func(t *testing.T, path, body string) (int, map[string]any) {
@@ -206,7 +206,7 @@ func TestExecuteExpression(t *testing.T) {
 	ctx := context.Background()
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(exprCSV))
-	src := NewFileSource(client, ref, 1<<20, "1GiB")
+	src := NewFileSource(client, nil, ref, 1<<20, "1GiB")
 
 	// avg over a boolean column: (1 + 0 + 1) / 3.
 	v, err := src.Execute(ctx, "avg", domain.Target{}, ptrExpr(col("flag")), nil)
@@ -242,7 +242,7 @@ func TestExecuteLegacyNonFinite(t *testing.T) {
 	ctx := context.Background()
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte("val\n1.0\ninf\n3.0\n"))
-	src := NewFileSource(client, ref, 1<<20, "1GiB")
+	src := NewFileSource(client, nil, ref, 1<<20, "1GiB")
 	if _, err := src.Execute(ctx, "avg", domain.Target{Field: "val"}, nil, nil); !errors.Is(err, errNonFiniteValue) {
 		t.Fatalf("expected errNonFiniteValue for legacy avg over inf column, got %v", err)
 	}
@@ -256,7 +256,7 @@ func TestServerExecuteExpression(t *testing.T) {
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(exprCSV))
 
-	ts := httptest.NewServer(NewServer(client, 1<<20, "1GiB").Routes())
+	ts := httptest.NewServer(NewServer(client, nil, nil, testLimiter(), 1<<20, 1<<20, "1GiB").Routes())
 	defer ts.Close()
 
 	post := func(t *testing.T, body string) (int, map[string]any) {
@@ -297,7 +297,7 @@ func TestOverLimitRejected(t *testing.T) {
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(csvFixture))
 
-	src := NewFileSource(client, ref, 4, "1GiB")
+	src := NewFileSource(client, nil, ref, 4, "1GiB")
 	if _, err := src.Introspect(ctx); !errors.Is(err, errObjectTooLarge) {
 		t.Fatalf("expected errObjectTooLarge, got %v", err)
 	}
@@ -307,7 +307,7 @@ func TestTempDirCleanup(t *testing.T) {
 	ctx := context.Background()
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(csvFixture))
-	src := NewFileSource(client, ref, 1<<20, "1GiB")
+	src := NewFileSource(client, nil, ref, 1<<20, "1GiB")
 
 	before := len(sandboxTempDirs(t))
 

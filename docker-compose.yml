@@ -163,6 +163,9 @@ services:
         condition: service_completed_successfully
       minio:
         condition: service_healthy
+      # The sandbox hard-depends on Postgres for the data-source ref registry.
+      postgres:
+        condition: service_healthy
 
   # One-shot job, not a long-running service: the profile keeps `make up` from
   # starting it. Run it per goal with

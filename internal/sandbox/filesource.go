@@ -36,21 +36,26 @@ var (
 // FileSource reads a single tabular object (CSV or Parquet) out of the object
 // store and answers introspection and aggregate queries over it via a transient,
 // in-memory DuckDB engine. It is constructed with primitive args (per the infra-
-// constructor convention) and holds no state between requests: every call stages
-// a fresh copy of the object under an isolated temp dir and tears it down after.
+// constructor convention). It is stateless in semantics: every call reads a fresh
+// engine over the ref it carries. The optional cache is a pure performance layer
+// keyed on the immutable content-addressed ref -- it changes only whether the
+// download and parse are re-paid, never what a read returns. A nil cache preserves
+// the original per-request staging.
 type FileSource struct {
 	objects        *objectstore.Client
+	cache          *StageCache
 	dataSourceRef  string
 	maxObjectBytes int64
 	maxTempDirSize string
 }
 
-// NewFileSource builds a FileSource for one object-store ref. maxObjectBytes caps
-// the staged copy; maxTempDirSize is a DuckDB size string (with a unit) bounding
-// query spill.
-func NewFileSource(objects *objectstore.Client, dataSourceRef string, maxObjectBytes int64, maxTempDirSize string) *FileSource {
+// NewFileSource builds a FileSource for one object-store ref. cache is optional
+// (nil ⇒ per-request staging). maxObjectBytes caps the staged copy; maxTempDirSize
+// is a DuckDB size string (with a unit) bounding query spill.
+func NewFileSource(objects *objectstore.Client, cache *StageCache, dataSourceRef string, maxObjectBytes int64, maxTempDirSize string) *FileSource {
 	return &FileSource{
 		objects:        objects,
+		cache:          cache,
 		dataSourceRef:  dataSourceRef,
 		maxObjectBytes: maxObjectBytes,
 		maxTempDirSize: maxTempDirSize,
@@ -158,65 +163,169 @@ func (s *FileSource) ExecuteCounted(ctx context.Context, agg string, target doma
 	return measurement, nil
 }
 
-// stage downloads the object into an isolated temp dir and opens a configured
-// in-memory DuckDB over it, returning the engine, the table-function expression
-// both Introspect and Execute build their SQL around, and a cleanup that closes
-// the *sql.DB (an unclosed one leaks native handles under load) and removes the
-// dir (staged object plus any DuckDB spill). cleanup must be deferred on every
-// path, including a failure after sql.Open.
+// stage resolves the source file (from the cache when configured, else a fresh
+// per-request download) and opens a configured in-memory DuckDB over it, returning
+// the engine, the table-function expression both Introspect and Execute build
+// their SQL around, and a cleanup that closes the *sql.DB (an unclosed one leaks
+// native handles under load), releases any cache reference, and removes the temp
+// dir (DuckDB spill; the source file lives in the cache, not here, when cached).
+// cleanup must be deferred on every path, including a failure after sql.Open.
 func (s *FileSource) stage(ctx context.Context) (db *sql.DB, tableFn string, cleanup func(), err error) {
 	dir, err := os.MkdirTemp("", "arborette-sandbox-")
 	if err != nil {
 		return nil, "", nil, fmt.Errorf("create staging dir: %w", err)
 	}
+	var release func()
 	cleanup = func() {
 		if db != nil {
 			db.Close()
 		}
+		if release != nil {
+			release()
+		}
 		os.RemoveAll(dir)
 	}
 
-	fnName, ext, err := tableFunction(s.dataSourceRef)
+	sourcePath, fnName, rel, err := s.stageSource(ctx, dir)
 	if err != nil {
 		cleanup()
 		return nil, "", nil, err
 	}
-
-	stagedPath := filepath.Join(dir, "source"+ext)
-	if err := s.download(ctx, stagedPath); err != nil {
-		cleanup()
-		return nil, "", nil, err
-	}
+	release = rel
 
 	db, err = sql.Open("duckdb", "")
 	if err != nil {
 		cleanup()
 		return nil, "", nil, fmt.Errorf("open duckdb: %w", err)
 	}
-	// Point spill at the controlled, writable temp dir: an in-memory DuckDB
-	// otherwise defaults to ./.tmp under the working dir, which is not writable on
-	// the distroless runtime image, so any spilling query would fail. Both are
-	// GLOBAL-scope settings valid over database/sql. The dir is a server-generated
-	// os.MkdirTemp name, embedded as a single-quote-escaped literal.
-	if _, err := db.ExecContext(ctx, "SET temp_directory='"+escapeLiteral(dir)+"'"); err != nil {
+	// Spill goes to the per-request temp dir (the source file lives in the cache when
+	// cached, so this dir holds only spill).
+	if err := configureSpill(ctx, db, dir, s.maxTempDirSize); err != nil {
 		cleanup()
-		return nil, "", nil, fmt.Errorf("set temp directory: %w", err)
-	}
-	if _, err := db.ExecContext(ctx, "SET max_temp_directory_size='"+escapeLiteral(s.maxTempDirSize)+"'"); err != nil {
-		cleanup()
-		return nil, "", nil, fmt.Errorf("set max temp directory size: %w", err)
+		return nil, "", nil, err
 	}
 
 	// DuckDB resolves the table-function file argument at bind time and rejects a
 	// bound ? there, so the staged path is embedded as a literal. It is safe: the
-	// path is a server-generated name under our temp dir, never request-derived.
-	tableFn = fnName + "('" + escapeLiteral(stagedPath) + "')"
+	// path is a server-generated name (a temp dir or the cache's sha256 artifact),
+	// never request-derived.
+	tableFn = fnName + "('" + escapeLiteral(sourcePath) + "')"
 	return db, tableFn, cleanup, nil
+}
+
+// stageSource resolves the on-disk source file, the DuckDB reader that opens it, and
+// a release the caller's cleanup must call (a no-op for the non-cache paths). The
+// reader dispatch depends on which path staged the file, not on the ref's extension:
+// a cache artifact is Parquet at an extension-less path (CSV is converted once at
+// fill time; Parquet caches as-is), read with read_parquet, so tableFunction's
+// extension keying cannot serve it. A nil cache or an errCacheBypass falls back to a
+// per-request download into dir under the raw extension-keyed reader.
+func (s *FileSource) stageSource(ctx context.Context, dir string) (path, fnName string, release func(), err error) {
+	rawFn, ext, err := tableFunction(s.dataSourceRef)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	// perRequest stages the raw object into the request's own temp dir under the
+	// extension-keyed reader -- the fallback when the cache is disabled or bypasses.
+	perRequest := func() (string, string, func(), error) {
+		staged := filepath.Join(dir, "source"+ext)
+		if err := s.download(ctx, staged); err != nil {
+			return "", "", nil, err
+		}
+		return staged, rawFn, func() {}, nil
+	}
+
+	if s.cache == nil {
+		return perRequest()
+	}
+
+	// A CSV fill transiently needs the raw download plus the Parquet artifact, so it
+	// reserves twice maxObjectBytes; a Parquet fill caches as-is.
+	isCSV := ext == ".csv"
+	reserve := s.maxObjectBytes
+	if isCSV {
+		reserve = 2 * s.maxObjectBytes
+	}
+	cachePath, rel, err := s.cache.Acquire(ctx, s.dataSourceRef, reserve, s.fill(isCSV))
+	if errors.Is(err, errCacheBypass) {
+		return perRequest()
+	}
+	if err != nil {
+		return "", "", nil, err
+	}
+	return cachePath, "read_parquet", rel, nil
+}
+
+// fill returns the cache FillFunc for this ref. A Parquet ref caches the staged
+// bytes unchanged (parse is ~free on read-back); a CSV ref downloads into the
+// fill's scratch dir and converts once to Parquet at dest, so every later read
+// amortizes both the download and the parse.
+func (s *FileSource) fill(isCSV bool) FillFunc {
+	return func(ctx context.Context, scratch, dest string) error {
+		if !isCSV {
+			return s.download(ctx, dest)
+		}
+		raw := filepath.Join(scratch, "source.csv")
+		if err := s.download(ctx, raw); err != nil {
+			return err
+		}
+		return convertCSVToParquet(ctx, raw, dest, s.maxTempDirSize)
+	}
 }
 
 // download streams the object into dest via the shared bounded-staging helper.
 func (s *FileSource) download(ctx context.Context, dest string) error {
 	return stageBoundedObject(ctx, s.objects, s.dataSourceRef, dest, s.maxObjectBytes)
+}
+
+// convertCSVToParquet converts a staged CSV into a Parquet artifact at dest using a
+// throwaway in-memory DuckDB. The COPY must name FORMAT PARQUET explicitly (a bare
+// COPY ... TO defaults to CSV output) and write to exactly dest (the extension-less
+// path the cache stats, serves, and evicts). Conversion spill is pointed at a
+// per-fill temp dir *outside* the cache root -- an in-memory DuckDB otherwise
+// spills to ./.tmp, unwritable on the distroless image, and directing it into the
+// accounted cache root would let a conversion exceed the cache's disk budget by up
+// to the spill bound. Spill is bounded by maxTempDirSize, the same exposure the
+// query path already has.
+func convertCSVToParquet(ctx context.Context, csvPath, dest, maxTempDirSize string) error {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		return fmt.Errorf("open duckdb for conversion: %w", err)
+	}
+	defer db.Close()
+
+	spill, err := os.MkdirTemp("", "arborette-convert-")
+	if err != nil {
+		return fmt.Errorf("create conversion spill dir: %w", err)
+	}
+	defer os.RemoveAll(spill)
+	if err := configureSpill(ctx, db, spill, maxTempDirSize); err != nil {
+		return err
+	}
+
+	copyQuery := "COPY (SELECT * FROM read_csv_auto('" + escapeLiteral(csvPath) + "')) TO '" +
+		escapeLiteral(dest) + "' (FORMAT PARQUET)"
+	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
+		return fmt.Errorf("convert csv to parquet: %w", err)
+	}
+	return nil
+}
+
+// configureSpill points a DuckDB connection's spill at dir and bounds it by
+// maxTempDirSize. An in-memory DuckDB otherwise defaults to ./.tmp under the working
+// dir, which is not writable on the distroless runtime image, so any spilling query
+// would fail. Both are GLOBAL-scope settings valid over database/sql; dir and
+// maxTempDirSize are embedded as single-quote-escaped literals (server-generated
+// names, never request-derived).
+func configureSpill(ctx context.Context, db *sql.DB, dir, maxTempDirSize string) error {
+	if _, err := db.ExecContext(ctx, "SET temp_directory='"+escapeLiteral(dir)+"'"); err != nil {
+		return fmt.Errorf("set temp directory: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "SET max_temp_directory_size='"+escapeLiteral(maxTempDirSize)+"'"); err != nil {
+		return fmt.Errorf("set max temp directory size: %w", err)
+	}
+	return nil
 }
 
 // stageBoundedObject streams an object-store object into dest, bounded so an

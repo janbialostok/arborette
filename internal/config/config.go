@@ -75,15 +75,31 @@ type EmbeddingConfig struct {
 	Dimension int
 }
 
-// SandboxConfig drives the stateless Sandbox Execution HTTP service. MaxObjectBytes
-// caps how much of a data source the sandbox will stage locally before rejecting
-// it, bounding disk use; MaxTempDirSize is a DuckDB size string (e.g. 2GiB, with a
-// unit -- never a bare byte count) passed verbatim into SET max_temp_directory_size
-// to bound query-spill blast radius.
+// SandboxConfig drives the Sandbox Execution HTTP service. MaxObjectBytes caps how
+// much of a data source the sandbox will stage locally before rejecting it,
+// bounding disk use; MaxTempDirSize is a DuckDB size string (e.g. 2GiB, with a unit
+// -- never a bare byte count) passed verbatim into SET max_temp_directory_size to
+// bound query-spill blast radius.
+//
+// The staging cache amortizes the download and parse of a data source across a
+// run's many measurements. StageCacheDir is the cache root (empty ⇒ a boot-time
+// temp dir); StageCacheMaxBytes is its disk budget (0 disables the cache, restoring
+// per-request staging) -- LRU-by-size eviction under that budget is the eviction
+// policy, so there is no separate eviction knob. ExecuteConcurrency is the default
+// request class's concurrent-slot count; MaxBodyBytes caps each request body.
+//
+// InternalAuthToken is the shared secret the sandbox verifies on every route -- the
+// same INTERNAL_AUTH_TOKEN the orchestrator's internal write surfaces verify and
+// the callers present (empty disables the guard).
 type SandboxConfig struct {
-	Port           string
-	MaxObjectBytes int64
-	MaxTempDirSize string
+	Port               string
+	MaxObjectBytes     int64
+	MaxTempDirSize     string
+	StageCacheDir      string
+	StageCacheMaxBytes int64
+	ExecuteConcurrency int
+	MaxBodyBytes       int64
+	InternalAuthToken  string
 }
 
 // OrchestratorConfig drives the REST/API service. SandboxURL is the compose
@@ -236,9 +252,10 @@ func (p PostgresConfig) ServiceDSN() string {
 // local docker-compose. Secrets have no defaults: an unset password/key loads
 // as empty, and the consuming client fails at connect time. Load does not
 // validate them here because it is shared across services with different
-// credential needs (e.g. the sandbox uses no Postgres role), so a required-for-
-// everyone check would reject valid per-service configs; the error return is
-// reserved for future structural validation.
+// credential needs (e.g. only the bootstrap/migrate jobs use the owner password;
+// runtime services never do), so a required-for-everyone check would reject valid
+// per-service configs; the error return is reserved for future structural
+// validation.
 func Load() (Config, error) {
 	cfg := Config{
 		Neo4j: Neo4jConfig{
@@ -274,9 +291,14 @@ func Load() (Config, error) {
 			Dimension: intEnv("EMBEDDING_DIMENSION", 768),
 		},
 		Sandbox: SandboxConfig{
-			Port:           env("SANDBOX_PORT", "8081"),
-			MaxObjectBytes: int64Env("SANDBOX_MAX_OBJECT_BYTES", 512<<20),
-			MaxTempDirSize: env("SANDBOX_MAX_TEMP_DIR_SIZE", "2GiB"),
+			Port:               env("SANDBOX_PORT", "8081"),
+			MaxObjectBytes:     int64Env("SANDBOX_MAX_OBJECT_BYTES", 512<<20),
+			MaxTempDirSize:     env("SANDBOX_MAX_TEMP_DIR_SIZE", "2GiB"),
+			StageCacheDir:      os.Getenv("SANDBOX_STAGE_CACHE_DIR"),
+			StageCacheMaxBytes: int64Env("SANDBOX_STAGE_CACHE_MAX_BYTES", 2<<30),
+			ExecuteConcurrency: intEnv("SANDBOX_EXECUTE_CONCURRENCY", 8),
+			MaxBodyBytes:       int64Env("SANDBOX_MAX_BODY_BYTES", 1<<20),
+			InternalAuthToken:  os.Getenv("INTERNAL_AUTH_TOKEN"),
 		},
 		Orchestrator: OrchestratorConfig{
 			Port:                    env("ORCHESTRATOR_PORT", "8080"),

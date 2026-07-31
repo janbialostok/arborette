@@ -26,12 +26,14 @@ import (
 )
 
 type fakeGoals struct {
-	inserted  *store.Goal
-	get       store.Goal
-	getErr    error
-	insertErr error
-	list      []store.Goal
-	listErr   error
+	inserted      *store.Goal
+	registeredRef string
+	registerErr   error
+	get           store.Goal
+	getErr        error
+	insertErr     error
+	list          []store.Goal
+	listErr       error
 }
 
 func (f *fakeGoals) Insert(_ context.Context, g store.Goal) error {
@@ -39,6 +41,13 @@ func (f *fakeGoals) Insert(_ context.Context, g store.Goal) error {
 		return f.insertErr
 	}
 	f.inserted = &g
+	return nil
+}
+func (f *fakeGoals) RegisterDataSourceRef(_ context.Context, ref string) error {
+	if f.registerErr != nil {
+		return f.registerErr
+	}
+	f.registeredRef = ref
 	return nil
 }
 func (f *fakeGoals) Get(_ context.Context, _ string) (store.Goal, error) {
@@ -483,17 +492,19 @@ func (f *fakeRepo) GetExtractionOutcome(ctx context.Context, outcomeID string) (
 // response/error at the current call index, defaulting to an empty 200 once the
 // script is exhausted.
 type fakeSandbox struct {
-	introspect    IntrospectResponse
-	introspectErr error
-	execResps     []ExecuteResponse
-	execErrs      []error
-	execCalls     int
-	execReqs      []ExecuteRequest
-	docPages      []string
-	docTextErr    error
+	introspect      IntrospectResponse
+	introspectErr   error
+	introspectCalls int
+	execResps       []ExecuteResponse
+	execErrs        []error
+	execCalls       int
+	execReqs        []ExecuteRequest
+	docPages        []string
+	docTextErr      error
 }
 
 func (f *fakeSandbox) Introspect(_ context.Context, _ IntrospectRequest) (IntrospectResponse, error) {
+	f.introspectCalls++
 	return f.introspect, f.introspectErr
 }
 func (f *fakeSandbox) DocumentText(_ context.Context, _ DocumentTextRequest) (DocumentTextResponse, error) {

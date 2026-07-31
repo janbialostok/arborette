@@ -88,6 +88,31 @@ func (g *GoalRegistry) Insert(ctx context.Context, goal Goal) error {
 	return nil
 }
 
+// RegisterDataSourceRef records a minted data source ref so the Sandbox can scope
+// requests to it. It is idempotent (ON CONFLICT DO NOTHING) because the same object
+// underpins one goal registration and every later run against it.
+func (g *GoalRegistry) RegisterDataSourceRef(ctx context.Context, ref string) error {
+	_, err := g.pool.Exec(ctx,
+		"INSERT INTO data_source_registry (ref) VALUES ($1) ON CONFLICT DO NOTHING", ref)
+	if err != nil {
+		return fmt.Errorf("register data source ref: %w", err)
+	}
+	return nil
+}
+
+// DataSourceRefExists reports whether a ref is registered. It uses QueryRow, never a
+// bare Query: pgx defers a permission error past Query, and an unread Rows would
+// deadlock pool.Close, so a boolean existence check reads its single row eagerly.
+func (g *GoalRegistry) DataSourceRefExists(ctx context.Context, ref string) (bool, error) {
+	var exists bool
+	err := g.pool.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM data_source_registry WHERE ref = $1)", ref).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check data source ref %q: %w", ref, err)
+	}
+	return exists, nil
+}
+
 // Get looks up a registered goal by its optimization_function_id. Both jsonb
 // columns are null-guarded: a document goal has a NULL evaluation_matrix and a
 // tabular goal a NULL target_fields, and a NULL scans as a nil []byte that must

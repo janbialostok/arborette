@@ -91,6 +91,44 @@ func TestSubmitGoalDryRunRepairThenSuccess(t *testing.T) {
 	}
 }
 
+// TestSubmitGoalRegistersRefBeforeSandbox proves the minted ref is registered with
+// the same ref the goal persists -- the ordering the sandbox ref-scoping depends on,
+// since the intake introspect/dry-run validate against the registry.
+func TestSubmitGoalRegistersRefBeforeSandbox(t *testing.T) {
+	goals := &fakeGoals{}
+	claude := &fakeClaude{matrix: fittedMatrix()}
+	sandbox := &fakeSandbox{introspect: revenueSchema(), execResps: []ExecuteResponse{{Value: map[string]any{"avg(revenue)": 10.0}}}}
+	srv := newTestServer(goals, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+
+	rec := postGoal(t, srv)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %q)", rec.Code, rec.Body.String())
+	}
+	if goals.inserted == nil || goals.registeredRef == "" || goals.registeredRef != goals.inserted.DataSourceRef {
+		t.Fatalf("ref must be registered with the ref the goal persists: registered=%q goal=%+v", goals.registeredRef, goals.inserted)
+	}
+}
+
+// TestSubmitGoalRegisterRefErrorIsInternalError proves a registry write failure is a
+// masked 500 that never reaches the sandbox and never persists the goal.
+func TestSubmitGoalRegisterRefErrorIsInternalError(t *testing.T) {
+	goals := &fakeGoals{registerErr: errors.New("db down")}
+	claude := &fakeClaude{matrix: fittedMatrix()}
+	sandbox := &fakeSandbox{introspect: revenueSchema()}
+	srv := newTestServer(goals, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+
+	rec := postGoal(t, srv)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body %q)", rec.Code, rec.Body.String())
+	}
+	if sandbox.introspectCalls != 0 {
+		t.Fatalf("sandbox introspected despite a failed ref registration (%d calls)", sandbox.introspectCalls)
+	}
+	if goals.inserted != nil {
+		t.Fatal("goal must not persist when ref registration fails")
+	}
+}
+
 func TestSubmitGoalRepairsExhaustedIsUnprocessable(t *testing.T) {
 	goals := &fakeGoals{}
 	claude := &fakeClaude{matrix: fittedMatrix(), repair: fittedMatrix()}
