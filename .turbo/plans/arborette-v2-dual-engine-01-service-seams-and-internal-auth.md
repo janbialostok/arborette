@@ -1,5 +1,5 @@
 ---
-status: ready
+status: done
 spec: .turbo/specs/arborette-v2-dual-engine.md
 ---
 
