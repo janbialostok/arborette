@@ -77,9 +77,20 @@ func main() {
 		log.Printf("orchestrator: reconciled %d orphaned run(s) to failed", n)
 	}
 
+	// A configured worker URL selects the HTTP launcher (a worker in serve mode);
+	// empty keeps the logging stub, so the AWS Batch seam stays the production path.
+	var launcher orchestrator.JobLauncher
+	if url := cfg.Orchestrator.SleepCycleWorkerURL; url != "" {
+		launcher = orchestrator.NewHTTPLauncher(url, cfg.Orchestrator.InternalAuthToken, nil)
+		log.Printf("orchestrator: wired HTTP sleep-cycle launcher -> %s", url)
+	} else {
+		launcher = orchestrator.StubLauncher{}
+		log.Printf("orchestrator: wired stub sleep-cycle launcher (no worker URL configured)")
+	}
+
 	srv := orchestrator.NewServer(
 		repo, goals, runs, queue, audits, objects, heur, claude, chat, sandbox,
-		orchestrator.NewHub(), orchestrator.StubLauncher{},
+		orchestrator.NewHub(), launcher,
 		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID},
 		cfg.Orchestrator.LocalImportDir, cfg.Orchestrator.SleepCycleJobName,
 		cfg.Orchestrator.InternalAuthToken,

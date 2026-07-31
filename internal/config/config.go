@@ -109,6 +109,14 @@ type SandboxConfig struct {
 // is the read-only mount the on-disk ingestion path resolves relative paths
 // against (a path escaping it is rejected).
 //
+// SleepCycleWorkerURL selects how the Phase-2 trigger dispatches: set to the
+// worker's serve-mode launch endpoint (an HTTPLauncher POSTs the args map to it)
+// and empty to keep the StubLauncher, which logs and returns success while the
+// AWS Batch SubmitJob seam stays the production path. The value is the full
+// endpoint URL including the /runs path -- the launcher POSTs to it verbatim and
+// appends nothing, which is what lets a differently-pathed worker (the Verifier)
+// reuse the same launcher type without redesign.
+//
 // HITLConfidenceThreshold is the service-wide default below which an extracted
 // value is queued for human review; a goal may override it. BlockingLoopTimeout
 // bounds a run whose goal opted into blocking epoch mode -- such a run waits on
@@ -121,6 +129,7 @@ type SandboxConfig struct {
 type OrchestratorConfig struct {
 	Port                    string
 	SandboxURL              string
+	SleepCycleWorkerURL     string
 	AnalystID               string
 	SleepCycleJobName       string
 	LocalImportDir          string
@@ -163,7 +172,11 @@ type MCPConfig struct {
 // mismatch the Orchestrator answers 401 and the worker's audit path logs and
 // swallows every failure, so the run reports success while its whole audit trail
 // (including the terminal record carrying the run's winners) silently vanishes.
+//
+// Port is the serve-mode listen port -- serve mode is the local/long-running
+// alternative to the one-shot Batch job, driven by the Orchestrator's HTTPLauncher.
 type SleepCycleConfig struct {
+	Port              string
 	SandboxURL        string
 	OrchestratorURL   string
 	InternalAuthToken string
@@ -303,6 +316,7 @@ func Load() (Config, error) {
 		Orchestrator: OrchestratorConfig{
 			Port:                    env("ORCHESTRATOR_PORT", "8080"),
 			SandboxURL:              env("SANDBOX_URL", "http://sandbox:8081"),
+			SleepCycleWorkerURL:     os.Getenv("SLEEPCYCLE_WORKER_URL"),
 			AnalystID:               env("ARBORETTE_ANALYST_ID", "analyst-stub"),
 			SleepCycleJobName:       env("SLEEPCYCLE_JOB_NAME", "arborette-sleepcycle"),
 			LocalImportDir:          env("ARBORETTE_LOCAL_IMPORT_DIR", "/import"),
@@ -317,6 +331,7 @@ func Load() (Config, error) {
 			PublicURL:          os.Getenv("MCP_PUBLIC_URL"),
 		},
 		SleepCycle: SleepCycleConfig{
+			Port:              env("SLEEPCYCLE_PORT", "8084"),
 			SandboxURL:        env("SANDBOX_URL", "http://sandbox:8081"),
 			OrchestratorURL:   env("ORCHESTRATOR_URL", "http://orchestrator:8080"),
 			InternalAuthToken: os.Getenv("INTERNAL_AUTH_TOKEN"),
