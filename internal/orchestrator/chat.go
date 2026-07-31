@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/arborette/arborette/internal/llm"
+	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -68,7 +69,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		service.WriteErr(w, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
 
@@ -82,12 +83,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxChatBytes)
 	var req chatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	msgs, err := toChatMessages(req.Messages)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		service.WriteErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -118,10 +119,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("orchestrator: chat stream for goal %q: %v", goal.OptimizationFunctionID, err)
 		writeSSEFrame(w, flusher, chatFrame{Type: chatFrameError, Message: chatFailureMessage})
 	case errors.Is(err, llm.ErrChatDisabled):
-		writeErr(w, http.StatusServiceUnavailable, "agent preview is not configured")
+		service.WriteErr(w, http.StatusServiceUnavailable, "agent preview is not configured")
 	default:
 		log.Printf("orchestrator: chat for goal %q: %v", goal.OptimizationFunctionID, err)
-		writeErr(w, http.StatusBadGateway, chatFailureMessage)
+		service.WriteErr(w, http.StatusBadGateway, chatFailureMessage)
 	}
 }
 

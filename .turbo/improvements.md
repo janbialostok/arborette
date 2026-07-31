@@ -9,6 +9,7 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Where**: `internal/heuristics/service.go` (Query), interface in `internal/graph/repository.go`
 - **Why**: Query calls `repo.GetMetaHeuristic(id)` once per similarity hit, each opening a separate Neo4j session/read tx — k round-trips on the `get_optimized_heuristics` read hot path. Add a batched `GetMetaHeuristics(ctx, ids)` (`MATCH (m:MetaHeuristic) WHERE m.id IN $ids`) and use it in Query. Deferred: no read handlers consume this seam yet and k is small; batch when the MCP/Orchestrator handler shells land.
 - **Update (2026-07-28)**: the deferral rationale has expired — both handlers now consume it (`internal/mcpserver/tools.go:148`, `internal/orchestrator/heuristics.go:69`) at k up to `maxSearchK` = 100, not "small", so this is a live cost rather than a hypothetical one. The seam also moved: it is now `heuristicRepo` in `internal/heuristics/service.go`, not `graph.Repository`. Still deferred only because the round-trips are not yet the bottleneck.
+- **Shipped (verified 2026-07-31)**: done in the V2 service-seams change — `Neo4jRepository.GetMetaHeuristics` (`internal/graph/neo4j.go`) batches the read, `heuristicRepo` declares only the batched form, and `Query` re-keys the result by id so similarity order survives the graph's arbitrary ordering. Pinned by a test asserting exactly one graph call and by a fake that always returns the batch reversed.
 - **Noted**: 2026-07-21
 
 ### Harden the Sandbox Execution service boundary (auth, ref scoping, concurrency, early rejection)
@@ -25,6 +26,7 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Category**: reliability
 - **Where**: `internal/orchestrator/audit.go` (handleAudit), `internal/orchestrator/server.go` (Routes), `internal/config/config.go`
 - **Why**: `POST /internal/audit` is on the public mux (orchestrator port 8080) with no authentication, so any network client can forge audit records stamped with the trusted stub identity — undermining the "sole audit writer" integrity guarantee the design exists to protect. Fix belongs with the deferred auth/SSO work: add a config-driven shared-secret header on the worker→orchestrator contract, or bind `/internal/` routes to an internal-only listener. Deferred because full auth is out of scope for this shell and the only consumer (the Sleep-Cycle Worker) isn't built yet.
+- **Shipped (verified 2026-07-31)**: done in the V2 service-seams change, via the shared-secret option — `service.BearerAuth` wraps the one route in `Routes()`, both sides read `INTERNAL_AUTH_TOKEN` (one variable, so they cannot drift), and the worker presents it through `orchestratorclient.NewClient`. Empty still fails open for the local stack, documented in the README hardening checklist. Analyst-facing routes stay unguarded; analyst auth remains the separate deferred concern.
 - **Noted**: 2026-07-22
 
 ### Extract the shared HTTP JSON-writer helpers into internal/service
@@ -33,6 +35,7 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Category**: refactor
 - **Where**: `internal/service/` (new helper), `internal/sandbox/server.go`, `internal/orchestrator/server.go`
 - **Why**: `writeJSON`/`writeErr`/`errorResponse` are copy-pasted between the sandbox and orchestrator services, differing only in a log prefix. Extract a `service.WriteJSON`/`WriteError` helper into `internal/service` (which already owns `RunHTTPServer`, taking a service name) and update both services so the next HTTP service reuses one seam. Deferred because it reopens already-shipped shell-03 (sandbox) code.
+- **Shipped (verified 2026-07-31)**: done in the V2 service-seams change — `internal/service/json.go` holds `WriteJSON`/`WriteErr`, every call site in both services calls them directly (no local wrappers), and `BearerAuth` answers its 401 through the same envelope. The service name turned out not to be needed: the only difference was a log prefix, now a neutral one.
 - **Noted**: 2026-07-22
 
 ### Cast BOOLEAN columns to 0/1 for numeric aggregation in the Sandbox
@@ -126,6 +129,7 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Category**: refactor
 - **Where**: `internal/objective/`, `internal/sandboxclient/`, `internal/auditclient/`, `internal/orchestrator/sandboxclient.go`, `internal/graph/repository.go`
 - **Why**: Four non-behavioral seams the Sleep-Cycle work created, each left in place deliberately to keep that change's blast radius small. (1) `internal/sandboxclient` ships with no tests — its coverage still lives in `internal/orchestrator`, reaching it through the alias shim, so deleting the shim silently deletes the only coverage (`internal/objective` has since gained its own tests). (2) `internal/auditclient` duplicates `mcpserver.OrchestratorClient`: two hand-maintained HTTP clients for the same service off the same `ORCHESTRATOR_URL`, each with its own typed error, timeout constant, and decode branch — the exact duplication the sandbox-client extraction removed. (3) `var NewSandboxClient = sandboxclient.NewClient` leaves two spellings for building one client (`cmd/orchestrator` vs `cmd/sleepcycle`) and makes a constructor a mutable package var, unique in this codebase. (4) `ListEligibleFindings`/`MarkStaleMetaHeuristics` were added to the shared `graph.Repository` but are consumed only through the worker's own narrow `searchRepo`, so every implementer and fake pays for a Sleep-Cycle-only surface.
+- **Shipped (verified 2026-07-31)**: all four closed in the V2 service-seams change — (1) `internal/sandboxclient/client_test.go` now holds the moved `post` tests, so the package owns its coverage; (2) `auditclient` and `mcpserver.OrchestratorClient` merged into `internal/orchestratorclient`, one typed error and one decode branch; (3) `var NewSandboxClient` deleted, leaving one spelling; (4) `graph.Repository` deleted outright — those two methods, and eight more, now burden no implementer, since every caller declares its own narrow interface.
 - **Noted**: 2026-07-26
 
 ### Reconcile Meta-Heuristic embeddings across Neo4j and pgvector, not just the pending flag
@@ -284,13 +288,13 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Why**: Four review findings deliberately deferred as too broad for that commit. (1) `NewServer` now takes 17 positional params including two adjacent strings — a `Deps` struct would make every argument self-labelling and let `verificationPoll`/`keepaliveInterval` be real optional fields rather than post-construction pokes in tests. (2) A blocking-mode goal swaps the *whole run's* deadline to 24h, so sandbox/Claude/graph calls inherit it too — a wedged dependency hangs 24h instead of failing at 30 min; bounding the waits separately needs the run-context handling restructured. (3) `compensateClaim` checks the graph then un-claims as two steps across two stores, so a repairer landing the verdict in between leaves graph=resolved/queue=pending — reads as unreviewed while already search-eligible, and a later different verdict would overwrite it (needs a failed graph write *plus* a concurrent duplicate resolution to reach; the code comment now states the window rather than claiming it closed). (4) Dedups: `GetExtractionOutcome` reimplements `getNode`'s collect/zero-one-many/`ErrNotFound` protocol including its driver-quirk rationale; `store.marshalLocator` duplicates `graph.marshalProvenance`; and the run-confidence histogram sits in `verification.go` though the tabular loop uses it and HITL does not.
 - **Noted**: 2026-07-29
 
-### Cache per-goal document page text for the HITL excerpt/correction endpoints
+### Bound and cache the document page text behind the HITL excerpt/correction endpoints
 
 - **Type**: plan
 - **Category**: performance
-- **Where**: `internal/orchestrator/verification.go` (once arborette-08 lands), `internal/sandboxclient/client.go` (`DocumentText`)
-- **Why**: The sandbox is stateless, so every HITL excerpt view and every correction re-downloads and re-parses the whole PDF in a synchronous cross-service round trip — an analyst paging an N-entry queue pays N full parses of an immutable document. A goal-scoped page-text cache (documents are content-addressed by `data_source_ref` and never change) removes all but the first. Deferred from the arborette-08 plan as "follow-up if queue review feels slow"; pick up after that plan ships and only if latency is felt.
-- **Noted**: 2026-07-29
+- **Where**: `internal/orchestrator/verification.go:178,392`, `internal/sandbox/documentsource.go` (`pdfPages`), `internal/sandboxclient/client.go` (`DocumentText`), `internal/orchestratorclient/client.go` (`do`)
+- **Why**: The sandbox is stateless, so every HITL excerpt view and every correction re-downloads and re-parses the whole PDF in a synchronous cross-service round trip — an analyst paging an N-entry queue pays N full parses of an immutable document. It is also unbounded in memory, not just slow: `pdfPages` accumulates every page's full text with no cap (`documentSample` bounds only the intake response), the clients' `json.Decode` calls read uncapped (`service.DrainAndClose` bounds only discarded bytes), and source PDFs are allowed up to 512 MiB of Flate-compressed content — so concurrent excerpt GETs can balloon the process holding the audit-writing Postgres role and the Anthropic key. A plain `io.LimitReader` cap was considered and rejected during the V2 seam work: any constant below 512 MiB newly breaks excerpt for documents that register fine today. Fix both at once — a page-range parameter on `/document/text` makes the response bounded by construction, and a goal-scoped page-text cache (documents are content-addressed by `data_source_ref` and never change) removes all but the first parse.
+- **Noted**: 2026-07-29 (updated 2026-07-31)
 
 ### Anchor the bare `orchestrator` line in .gitignore
 
@@ -298,6 +302,7 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Category**: dx
 - **Where**: `.gitignore` (line 24)
 - **Why**: The entry has no leading slash, so it matches any path component named `orchestrator` at any depth — shadowing `internal/orchestrator/`, `cmd/orchestrator/`, and `web/app/api/orchestrator/`. Tracked files still stage but exit 1 (breaking `&&` chains); **new** files there never appear in `git status` at all, so a feature can be committed with its routes silently missing. It also makes gitignore-respecting search skip those directories, returning wrong answers to recursive greps. Anchor it to `/orchestrator` so it ignores only the built binary it was meant for.
+- **Shipped (verified 2026-07-31)**: done in the V2 service-seams change — anchored to `/orchestrator` and moved under the build-output group. `git check-ignore --no-index internal/orchestrator/server.go` now exits 1 where it previously matched, and `git check-ignore --no-index orchestrator` still matches the root binary.
 - **Noted**: 2026-07-30
 
 ### Extract the duplicated presentational patterns in web/components
@@ -314,4 +319,12 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Category**: dx
 - **Where**: `cmd/sleepcycle/main.go`, `internal/orchestrator/joblauncher.go`, `internal/config/config.go`, `docker-compose.yml`
 - **Why**: `StubLauncher` logs and returns 202 without starting anything, so the UI's "Run Sleep Cycle" button silently does nothing locally and Phase 2 can only be driven by `make sleep-cycle GOAL=<id>` — the local stack is not end-to-end demoable through its own interface. Add a serve mode to the worker (split dependency wiring from the run; `POST /runs {optimization_function_id}` runs one cycle) and an `HTTPLauncher` behind the existing `JobLauncher` interface, selected when `SLEEPCYCLE_URL` is set and falling back to `StubLauncher` as the AWS Batch seam. The one-shot job invocation keeps working by overriding the command. Rejected alternatives: calling `internal/sleepcycle` in-process (the launcher's contract is explicitly an infra-level invocation, and it would duplicate the worker's wiring) and mounting the Docker socket into the orchestrator (privilege escalation for a dev convenience). The UI's "Sleep cycle launched" callout should become accurate once this lands.
+- **Noted**: 2026-07-30
+
+### Boot-time internal-auth probe in the Sleep-Cycle worker
+
+- **Type**: direct
+- **Category**: reliability
+- **Where**: `cmd/sleepcycle/main.go`, `internal/sleepcycle/worker.go:416-422`
+- **Why**: `worker.report` intentionally logs-and-swallows audit `Append` failures, so a misconfigured/mismatched `INTERNAL_AUTH_TOKEN` (introduced by the V2 shell-01 plan for `POST /internal/audit`) silently drops the entire audit trail — including `sleepcycle_run_complete`, the only carrier of Phase-2 winners. One authenticated probe call at worker startup would fail loudly at boot instead. Belongs with worker boot/serve wiring (V2 shell 03 territory), deliberately kept out of shell 01.
 - **Noted**: 2026-07-30

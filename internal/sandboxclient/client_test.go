@@ -1,4 +1,4 @@
-package orchestrator
+package sandboxclient
 
 import (
 	"context"
@@ -16,7 +16,7 @@ func TestPostDecodesSandboxErrorBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewSandboxClient(srv.URL, srv.Client())
+	c := NewClient(srv.URL, srv.Client())
 	_, err := c.Execute(context.Background(), ExecuteRequest{})
 
 	var se *SandboxError
@@ -34,7 +34,7 @@ func TestPostFallsBackWhenBodyEmpty(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewSandboxClient(srv.URL, srv.Client())
+	c := NewClient(srv.URL, srv.Client())
 	_, err := c.Introspect(context.Background(), IntrospectRequest{})
 
 	var se *SandboxError

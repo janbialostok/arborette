@@ -169,3 +169,34 @@ func TestMaxPublicationsFallback(t *testing.T) {
 		t.Fatalf("unparseable = %v, want the 20 default", cfg.SleepCycle.MaxPublications)
 	}
 }
+
+// TestInternalAuthTokenIsOneSecret pins that the service verifying the internal
+// shared secret and the job presenting it read the same variable, and that it
+// takes no default. Giving either side a name of its own compiles and passes
+// every other test, and the mismatch it produces is silent — see the field docs
+// in config.go for what silently stops happening.
+func TestInternalAuthTokenIsOneSecret(t *testing.T) {
+	setPostgresEnv(t)
+
+	// Cleared rather than assumed absent: the integration target sources .env,
+	// where an operator who minted a token has one set.
+	t.Setenv("INTERNAL_AUTH_TOKEN", "")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Orchestrator.InternalAuthToken != "" || cfg.SleepCycle.InternalAuthToken != "" {
+		t.Fatalf("unset = %q/%q, want empty on both sides (a secret takes no default)",
+			cfg.Orchestrator.InternalAuthToken, cfg.SleepCycle.InternalAuthToken)
+	}
+
+	t.Setenv("INTERNAL_AUTH_TOKEN", "s3cret")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Orchestrator.InternalAuthToken != "s3cret" || cfg.SleepCycle.InternalAuthToken != "s3cret" {
+		t.Fatalf("verifier = %q, sender = %q, want both to read INTERNAL_AUTH_TOKEN",
+			cfg.Orchestrator.InternalAuthToken, cfg.SleepCycle.InternalAuthToken)
+	}
+}

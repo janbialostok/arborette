@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/store"
@@ -46,6 +45,53 @@ func TestHandleAudit(t *testing.T) {
 	got := audits.records[0]
 	if got.Action != "sleep_cycle_done" || got.EventType != "job" || got.Actor != "analyst-test" {
 		t.Fatalf("record not stamped/populated as expected: %+v", got)
+	}
+}
+
+// TestInternalAuditRequiresTheSharedSecret pins the internal boundary end to end,
+// from the constructor that arms the guard to the status each credential gets.
+// Nothing downstream would report a regression: the endpoint's only caller logs
+// and swallows its failures. TestHandleAudit is the other half -- its server
+// carries no token, and its unauthenticated 201 is the dev-mode fail-open.
+func TestInternalAuditRequiresTheSharedSecret(t *testing.T) {
+	const token = "s3cret"
+	audits := &fakeAudits{}
+	routes := newTestServerAuth(token, audits).Routes()
+
+	post := func(authorization string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/internal/audit",
+			strings.NewReader(`{"action":"sleepcycle_run_complete","event_type":"job","detail":{}}`))
+		req.Header.Set("Content-Type", "application/json")
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
+		}
+		rec := httptest.NewRecorder()
+		routes.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := post(""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no-credential status = %d, want 401", rec.Code)
+	}
+	if rec := post("Bearer wrong"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong-token status = %d, want 401", rec.Code)
+	}
+	if len(audits.records) != 0 {
+		t.Fatalf("a rejected request must not reach the audit table, got %+v", audits.records)
+	}
+
+	if rec := post("Bearer " + token); rec.Code != http.StatusCreated {
+		t.Fatalf("authenticated status = %d, want 201", rec.Code)
+	}
+	if len(audits.records) != 1 {
+		t.Fatalf("expected the authenticated write to land, got %d record(s)", len(audits.records))
+	}
+
+	// The guard stays scoped to the one internal route; see Routes for why.
+	rec := httptest.NewRecorder()
+	routes.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/goals", nil))
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatal("analyst-facing routes must not be behind the internal secret")
 	}
 }
 
@@ -91,8 +137,7 @@ func TestSubmitGoalErrorPaths(t *testing.T) {
 
 	t.Run("on-disk file not found maps to 404", func(t *testing.T) {
 		dir := t.TempDir()
-		srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, newFakeQueue(), &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeChat{}, &fakeSandbox{},
-			NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, dir, "job", testHITLThreshold, time.Minute)
+		srv := newTestServerImport(dir, &fakeObjects{})
 		if _, err := srv.ingestLocal(t.Context(), "missing.csv"); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("error = %v, want os.ErrNotExist", err)
 		}

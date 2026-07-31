@@ -1,3 +1,9 @@
+// Package mcpserver is the read-side interface for downstream AI agents: it
+// exposes the accumulated Meta-Heuristic knowledge (get_optimized_heuristics,
+// trace_causal_chain) and goal registration (submit_analyst_goal) as MCP tools
+// over Streamable HTTP. The read tools sit on the shared heuristics query seam;
+// the server never mutates state directly, proxying goal submission to the
+// Orchestrator's REST surface.
 package mcpserver
 
 import (
@@ -10,6 +16,7 @@ import (
 
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/heuristics"
+	"github.com/arborette/arborette/internal/orchestratorclient"
 )
 
 // The registered tool names, exported because the chat connector's allowlist is
@@ -30,8 +37,8 @@ const (
 
 // The interfaces below are the narrow contracts the tool handlers depend on,
 // defined at the consumer so the handlers are unit-testable with fakes.
-// *heuristics.Service satisfies heuristicsQuerier; *OrchestratorClient satisfies
-// goalSubmitter.
+// *heuristics.Service satisfies heuristicsQuerier; *orchestratorclient.Client
+// satisfies goalSubmitter.
 
 type heuristicsQuerier interface {
 	Query(ctx context.Context, stateString string, k int) ([]heuristics.Match, error)
@@ -181,7 +188,7 @@ func (t *tools) traceCausalChain(ctx context.Context, _ *mcp.CallToolRequest, in
 func (t *tools) submitAnalystGoal(ctx context.Context, _ *mcp.CallToolRequest, in submitAnalystGoalInput) (*mcp.CallToolResult, submitAnalystGoalOutput, error) {
 	optID, err := t.goals.SubmitGoal(ctx, in.Goal, in.ImportPath)
 	if err != nil {
-		var oerr *OrchestratorError
+		var oerr *orchestratorclient.OrchestratorError
 		if errors.As(err, &oerr) {
 			return nil, submitAnalystGoalOutput{}, oerr
 		}

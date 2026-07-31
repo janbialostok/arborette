@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/arborette/arborette/internal/domain"
@@ -152,28 +153,39 @@ func (f *fakeEmbeddings) Delete(ctx context.Context, nodeID string) error {
 	return nil
 }
 
-// fakeRepo resolves only the ids in present, and reports every other id the way
-// the Neo4j repository does -- ErrNotFound wrapped in context, so the caller is
-// forced to unwrap rather than compare against the bare sentinel.
+// fakeRepo resolves only the ids in present, omitting every other id from the
+// result the way the batched Neo4j read does. lookups counts the calls, which is
+// what pins hydration at one graph round trip per query.
+//
+// It always answers in reverse, because Neo4j's own batch order is arbitrary and
+// returning the requested order would be the one arrangement in which a caller
+// that forgot to re-key by id still looks correct. Every test here is therefore
+// also an ordering test.
 type fakeRepo struct {
 	present  map[string]domain.MetaHeuristic
 	failWith error
-	// onLookup runs before each answer, so a test can cancel the request context
-	// partway through the batch the way a disconnecting client would.
+	lookups  int
+	// onLookup runs before the answer, so a test can cancel the request context
+	// the way a disconnecting client would.
 	onLookup func()
 }
 
-func (f *fakeRepo) GetMetaHeuristic(_ context.Context, id string) (domain.MetaHeuristic, error) {
+func (f *fakeRepo) GetMetaHeuristics(_ context.Context, ids []string) ([]domain.MetaHeuristic, error) {
+	f.lookups++
 	if f.onLookup != nil {
 		f.onLookup()
 	}
 	if f.failWith != nil {
-		return domain.MetaHeuristic{}, fmt.Errorf("get MetaHeuristic %q: %w", id, f.failWith)
+		return nil, fmt.Errorf("get %d MetaHeuristics: %w", len(ids), f.failWith)
 	}
-	if mh, ok := f.present[id]; ok {
-		return mh, nil
+	out := make([]domain.MetaHeuristic, 0, len(ids))
+	for _, id := range ids {
+		if mh, ok := f.present[id]; ok {
+			out = append(out, mh)
+		}
 	}
-	return domain.MetaHeuristic{}, fmt.Errorf("get MetaHeuristic %q: %w", id, graph.ErrNotFound)
+	slices.Reverse(out)
+	return out, nil
 }
 
 func (f *fakeRepo) TraceCausalChain(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
@@ -200,6 +212,33 @@ func TestQuerySkipsAndRetiresOrphanedEmbedding(t *testing.T) {
 	}
 	if len(embeddings.deleted) != 1 || embeddings.deleted[0] != "orphan" {
 		t.Fatalf("expected only the orphan retired, got %v", embeddings.deleted)
+	}
+}
+
+// TestQueryHydratesTheBatchInRankOrder catches the two ways the batched read can
+// go wrong: reverting to a per-id fetch, and re-assembling from the batch result
+// instead of the ranked ids, which hands back a ranking that is not one.
+func TestQueryHydratesTheBatchInRankOrder(t *testing.T) {
+	embeddings := &fakeEmbeddings{hits: []string{"nearest", "middle", "farthest"}}
+	repo := &fakeRepo{present: map[string]domain.MetaHeuristic{
+		"nearest": {ID: "nearest"}, "middle": {ID: "middle"}, "farthest": {ID: "farthest"},
+	}}
+	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
+
+	matches, err := svc.Query(context.Background(), "any state", 3)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	got := make([]string, 0, len(matches))
+	for _, m := range matches {
+		got = append(got, m.MetaHeuristic.ID)
+	}
+	want := []string{"nearest", "middle", "farthest"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("match order = %v, want the similarity order %v", got, want)
+	}
+	if repo.lookups != 1 {
+		t.Fatalf("graph lookups = %d, want exactly 1 for the whole batch", repo.lookups)
 	}
 }
 

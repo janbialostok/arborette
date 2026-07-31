@@ -11,11 +11,11 @@ import (
 	"log"
 	"os"
 
-	"github.com/arborette/arborette/internal/auditclient"
 	"github.com/arborette/arborette/internal/config"
 	"github.com/arborette/arborette/internal/embedding"
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/llm"
+	"github.com/arborette/arborette/internal/orchestratorclient"
 	"github.com/arborette/arborette/internal/sandboxclient"
 	"github.com/arborette/arborette/internal/sleepcycle"
 	"github.com/arborette/arborette/internal/store"
@@ -65,7 +65,8 @@ func main() {
 		provider,
 		store.NewEmbeddingStore(pool),
 		store.NewGoalRegistry(pool),
-		auditclient.NewClient(cfg.SleepCycle.OrchestratorURL, nil),
+		orchestratorclient.NewClient(cfg.SleepCycle.OrchestratorURL,
+			cfg.SleepCycle.InternalAuthToken, nil),
 		sleepcycle.Config{
 			MaxMeasurements: cfg.SleepCycle.MaxMeasurements,
 			BeamWidth:       cfg.SleepCycle.BeamWidth,

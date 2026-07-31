@@ -350,7 +350,7 @@ type valueCall struct {
 	provenance *domain.ProvenanceLocator
 }
 
-// fakeRepo is a no-op graph.Repository that records the nodes writeTriplet
+// fakeRepo is a no-op graphRepo that records the nodes writeTriplet
 // persists, so a loop test can assert the objective-label keying end to end.
 // The extraction-outcome fields additionally back the verification handlers:
 // extraction is returned by both outcome reads, and the update hooks record what
@@ -397,29 +397,10 @@ func (f *fakeRepo) CreateOutcome(_ context.Context, o domain.Outcome) error {
 	f.statuses[o.ID] = o.VerificationStatus
 	return nil
 }
-func (f *fakeRepo) GetState(_ context.Context, _ string) (domain.State, error) {
-	return domain.State{}, nil
-}
-func (f *fakeRepo) GetIntervention(_ context.Context, _ string) (domain.Intervention, error) {
-	return domain.Intervention{}, nil
-}
-func (f *fakeRepo) GetOutcome(_ context.Context, _ string) (domain.Outcome, error) {
-	return domain.Outcome{}, nil
-}
-func (f *fakeRepo) GetMetaHeuristic(_ context.Context, _ string) (domain.MetaHeuristic, error) {
-	return domain.MetaHeuristic{}, nil
-}
 func (f *fakeRepo) CreatePreConditionFor(_ context.Context, _, _ string) error { return nil }
 func (f *fakeRepo) CreateProduced(_ context.Context, _, _ string, edge domain.ProducedEdge) error {
 	f.produced = append(f.produced, edge)
 	return nil
-}
-func (f *fakeRepo) CreateMetaHeuristic(_ context.Context, _ domain.MetaHeuristic, _ []string) error {
-	return nil
-}
-func (f *fakeRepo) ClearEmbeddingPending(_ context.Context, _ string) error { return nil }
-func (f *fakeRepo) ListEmbeddingPending(_ context.Context) ([]domain.MetaHeuristic, error) {
-	return nil, nil
 }
 func (f *fakeRepo) UpdateOutcomeVerification(_ context.Context, outcomeID string, status domain.VerificationStatus, confidence float64) error {
 	f.mu.Lock()
@@ -496,15 +477,6 @@ func (f *fakeRepo) GetExtractionOutcome(ctx context.Context, outcomeID string) (
 	}
 	return f.extraction, nil
 }
-func (f *fakeRepo) TraceCausalChain(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
-	return nil, nil
-}
-func (f *fakeRepo) ListEligibleFindings(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
-	return nil, nil
-}
-func (f *fakeRepo) MarkStaleMetaHeuristics(_ context.Context, _ string) (int, error) {
-	return 0, nil
-}
 
 // fakeSandbox scripts per-call Execute results so the intake dry-run and the loop
 // can be driven through their success and failure branches. Execute returns the
@@ -577,27 +549,85 @@ func (f *fakeChat) Chat(ctx context.Context, system string, msgs []llm.ChatMessa
 // here so a test states confidences relative to a known bar.
 const testHITLThreshold = 0.8
 
-func newTestServer(goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
-	return newTestServerRepo(nil, goals, audits, objects, heur, claude, sandbox)
+// testServer is the one place in the package that spells NewServer's argument
+// list. Every helper below fills in the fields it varies and leaves the rest at
+// their zero value, so a new constructor parameter is a single edit here rather
+// than one per construction site -- and no test can silently pass a positional
+// argument into the wrong slot of a long positional call.
+type testServer struct {
+	repo              graphRepo
+	queue             verificationQueue
+	goals             goalStore
+	audits            auditStore
+	objects           objectStore
+	heur              heuristicsService
+	claude            claudeClient
+	sandbox           sandboxExecutor
+	localImportDir    string
+	internalAuthToken string
 }
 
-// newTestServerRepo is newTestServer with an explicit graph.Repository, for loop
-// tests that assert the nodes writeTriplet persists.
-func newTestServerRepo(repo graph.Repository, goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
-	return newTestServerQueue(repo, newFakeQueue(), goals, audits, objects, heur, claude, sandbox)
-}
-
-// newTestServerQueue is newTestServerRepo with an explicit verification queue,
-// for the review handlers and the loop's routing and blocking-gate paths.
-func newTestServerQueue(repo graph.Repository, queue verificationQueue, goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
-	srv := NewServer(repo, goals, &fakeRuns{}, queue, audits, objects, heur, claude, &fakeChat{}, sandbox,
-		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, "", "arborette-sleepcycle",
-		testHITLThreshold, time.Minute)
+// build wires the server, defaulting every collaborator the caller left unset and
+// pacing the human-scale timers down. Callers that want the production pacing
+// override the two fields afterward.
+func (ts testServer) build() *Server {
+	orElse := func(set, fallback any) any {
+		if set == nil {
+			return fallback
+		}
+		return set
+	}
+	srv := NewServer(
+		ts.repo,
+		orElse(ts.goals, &fakeGoals{}).(goalStore),
+		&fakeRuns{},
+		orElse(ts.queue, newFakeQueue()).(verificationQueue),
+		orElse(ts.audits, &fakeAudits{}).(auditStore),
+		orElse(ts.objects, &fakeObjects{}).(objectStore),
+		orElse(ts.heur, &fakeHeur{}).(heuristicsService),
+		orElse(ts.claude, &fakeClaude{}).(claudeClient),
+		&fakeChat{},
+		orElse(ts.sandbox, &fakeSandbox{}).(sandboxExecutor),
+		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"},
+		ts.localImportDir, "arborette-sleepcycle", ts.internalAuthToken,
+		testHITLThreshold, time.Minute,
+	)
 	// The blocking gate and the stream keepalive are both paced for humans; a
 	// test asserting that they fire at all should not pay for that.
 	srv.verificationPoll = time.Millisecond
 	srv.keepaliveInterval = time.Millisecond
 	return srv
+}
+
+func newTestServer(goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
+	return newTestServerRepo(nil, goals, audits, objects, heur, claude, sandbox)
+}
+
+// newTestServerRepo is newTestServer with an explicit graphRepo, for loop
+// tests that assert the nodes writeTriplet persists.
+func newTestServerRepo(repo graphRepo, goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
+	return newTestServerQueue(repo, newFakeQueue(), goals, audits, objects, heur, claude, sandbox)
+}
+
+// newTestServerQueue is newTestServerRepo with an explicit verification queue,
+// for the review handlers and the loop's routing and blocking-gate paths.
+func newTestServerQueue(repo graphRepo, queue verificationQueue, goals goalStore, audits auditStore, objects objectStore, heur heuristicsService, claude claudeClient, sandbox sandboxExecutor) *Server {
+	return testServer{
+		repo: repo, queue: queue, goals: goals, audits: audits,
+		objects: objects, heur: heur, claude: claude, sandbox: sandbox,
+	}.build()
+}
+
+// newTestServerAuth carries the token through NewServer rather than assigning it
+// onto the struct: the constructor is what arms the guard, and a token dropped
+// there leaves Routes wiring BearerAuth(""), which serves the handler unwrapped.
+func newTestServerAuth(internalAuthToken string, audits auditStore) *Server {
+	return testServer{audits: audits, internalAuthToken: internalAuthToken}.build()
+}
+
+// newTestServerImport varies the read-only import mount, for the ingestion paths.
+func newTestServerImport(localImportDir string, objects objectStore) *Server {
+	return testServer{localImportDir: localImportDir, objects: objects}.build()
 }
 
 // multipartBody builds a multipart/form-data body with the given fields and an
@@ -838,8 +868,7 @@ func TestIngestLocalReadsWithinMount(t *testing.T) {
 		t.Fatalf("write file: %v", err)
 	}
 	objects := &fakeObjects{}
-	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, newFakeQueue(), &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeChat{}, &fakeSandbox{},
-		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, dir, "job", testHITLThreshold, time.Minute)
+	srv := newTestServerImport(dir, objects)
 
 	ref, err := srv.ingestLocal(context.Background(), "data.csv")
 	if err != nil {
@@ -861,8 +890,7 @@ func TestIngestLocalRejectsSymlinkEscape(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 	objects := &fakeObjects{}
-	srv := NewServer(nil, &fakeGoals{}, &fakeRuns{}, newFakeQueue(), &fakeAudits{}, objects, &fakeHeur{}, &fakeClaude{}, &fakeChat{}, &fakeSandbox{},
-		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"}, mount, "job", testHITLThreshold, time.Minute)
+	srv := newTestServerImport(mount, objects)
 
 	if _, err := srv.ingestLocal(context.Background(), "link.csv"); !errors.Is(err, errPathEscape) {
 		t.Fatalf("error = %v, want errPathEscape", err)

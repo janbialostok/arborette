@@ -8,7 +8,6 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -22,6 +21,7 @@ import (
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/heuristics"
 	"github.com/arborette/arborette/internal/llm"
+	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -38,9 +38,6 @@ const (
 
 // The interfaces below are the narrow contracts the Server depends on, defined
 // at the consumer so the handler layer is unit-testable with fakes and no infra.
-// cmd/orchestrator passes the concrete *llm.Client, *SandboxClient,
-// *store.GoalRegistry, *store.AuditLog, *objectstore.Client, and
-// *heuristics.Service, which satisfy them.
 
 // claudeClient is the structured-output Claude calls the loop needs, named for
 // the collaborator (the `claude` field) rather than any single method. The two
@@ -61,6 +58,21 @@ type claudeClient interface {
 // because a handler streaming to the browser needs no structured-output calls.
 type chatStreamer interface {
 	Chat(ctx context.Context, system string, msgs []llm.ChatMessage, emit func(llm.ChatEvent) error) error
+}
+
+// graphRepo is the graph surface the handlers and the loop need: the triplet
+// writes the loop persists, plus the extraction reads and resolution writes the
+// review surface drives.
+type graphRepo interface {
+	CreateState(ctx context.Context, s domain.State) error
+	CreateIntervention(ctx context.Context, i domain.Intervention) error
+	CreateOutcome(ctx context.Context, o domain.Outcome) error
+	CreatePreConditionFor(ctx context.Context, stateID, interventionID string) error
+	CreateProduced(ctx context.Context, interventionID, outcomeID string, edge domain.ProducedEdge) error
+	ListExtractionOutcomes(ctx context.Context, goalID string) ([]graph.ExtractionOutcome, error)
+	GetExtractionOutcome(ctx context.Context, outcomeID string) (graph.ExtractionOutcome, error)
+	UpdateOutcomeVerification(ctx context.Context, outcomeID string, status domain.VerificationStatus, confidence float64) error
+	CorrectOutcome(ctx context.Context, outcomeID string, value map[string]any, provenance *domain.ProvenanceLocator, status domain.VerificationStatus, confidence float64) error
 }
 
 type sandboxExecutor interface {
@@ -119,7 +131,7 @@ type heuristicsService interface {
 // goal like the hub; see registerHistogram for why that state is in-memory and
 // how its lifetime is serialized against the hub's.
 type Server struct {
-	repo                graph.Repository
+	repo                graphRepo
 	goals               goalStore
 	runs                runStore
 	queue               verificationQueue
@@ -134,6 +146,7 @@ type Server struct {
 	identity            Identity
 	localImportDir      string
 	sleepCycleJobName   string
+	internalAuthToken   string
 	hitlThreshold       float64
 	blockingLoopTimeout time.Duration
 	verificationPoll    time.Duration
@@ -146,7 +159,7 @@ type Server struct {
 // NewServer wires the server from its collaborators (infra-constructor
 // convention).
 func NewServer(
-	repo graph.Repository,
+	repo graphRepo,
 	goals goalStore,
 	runs runStore,
 	queue verificationQueue,
@@ -159,7 +172,7 @@ func NewServer(
 	hub *Hub,
 	jobs JobLauncher,
 	identity Identity,
-	localImportDir, sleepCycleJobName string,
+	localImportDir, sleepCycleJobName, internalAuthToken string,
 	hitlThreshold float64,
 	blockingLoopTimeout time.Duration,
 ) *Server {
@@ -179,6 +192,7 @@ func NewServer(
 		identity:            identity,
 		localImportDir:      localImportDir,
 		sleepCycleJobName:   sleepCycleJobName,
+		internalAuthToken:   internalAuthToken,
 		hitlThreshold:       hitlThreshold,
 		blockingLoopTimeout: blockingLoopTimeout,
 		verificationPoll:    defaultVerificationPoll,
@@ -187,7 +201,10 @@ func NewServer(
 	}
 }
 
-// Routes returns the mux with method-prefixed patterns.
+// Routes returns the mux with method-prefixed patterns. The internal audit write
+// is the one guarded route: it is service-to-service, so it can carry a shared
+// secret no analyst has to hold. The analyst-facing routes stay open -- analyst
+// authentication is a separate concern from this internal boundary.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /goals", s.handleSubmitGoal)
@@ -202,7 +219,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /goals/{id}/outcomes/{outcomeID}/excerpt", s.handleOutcomeExcerpt)
 	mux.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
 	mux.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)
-	mux.HandleFunc("POST /internal/audit", s.handleAudit)
+	mux.Handle("POST /internal/audit", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleAudit)))
 	return mux
 }
 
@@ -212,28 +229,12 @@ func (s *Server) lookupGoal(ctx context.Context, w http.ResponseWriter, id strin
 	goal, err := s.goals.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			writeErr(w, http.StatusNotFound, "goal not found")
+			service.WriteErr(w, http.StatusNotFound, "goal not found")
 			return store.Goal{}, false
 		}
 		log.Printf("orchestrator: get goal %q: %v", id, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return store.Goal{}, false
 	}
 	return goal, true
-}
-
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("orchestrator: encode response: %v", err)
-	}
-}
-
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, errorResponse{Error: msg})
 }

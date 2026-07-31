@@ -62,6 +62,11 @@
   embeddings whose fixture node was seeded by an earlier run. When judging drift,
   filter fixture definitions out first; when verifying against the live stack,
   expect to restore the corpus after every gate run.
+- `make test` sources `.env`, so a test that asserts a config default by leaving
+  the variable unset passes under a bare `go test` and fails the moment an operator
+  sets it. Clear the variable explicitly (`t.Setenv(key, "")`) rather than assuming
+  absence. The existing knob tests survive only because the `.env` values happen to
+  equal the defaults they assert — do not read that as the pattern to copy.
 - Audit records carry their detail as `map[string]any`, so a nil slice or a typed
   nil pointer stored in one is never `== nil`. Assert on content (length, a
   specific id) rather than `detail["k"] != nil`, which passes even when the value

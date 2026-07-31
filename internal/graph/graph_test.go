@@ -110,6 +110,51 @@ func TestCreateMetaHeuristicPendingLifecycle(t *testing.T) {
 	}
 }
 
+// TestGetMetaHeuristicsBatch pins the hydration read behind a similarity search:
+// ids with no node come back absent rather than erroring, and no ids is an empty
+// answer rather than a failure. (Whether no ids also skips the round trip is not
+// observable from here — both variants return the same empty result.)
+func TestGetMetaHeuristicsBatch(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, ctx)
+	_, interventionID, _ := seedTriplet(t, ctx, repo)
+
+	presentIDs := []string{testutil.NewID(t), testutil.NewID(t)}
+	for _, id := range presentIDs {
+		if err := repo.CreateMetaHeuristic(ctx,
+			domain.MetaHeuristic{ID: id, Definition: "definition " + id},
+			[]string{interventionID},
+		); err != nil {
+			t.Fatalf("create meta-heuristic: %v", err)
+		}
+	}
+	absentID := testutil.NewID(t)
+
+	got, err := repo.GetMetaHeuristics(ctx, append(append([]string{}, presentIDs...), absentID))
+	if err != nil {
+		t.Fatalf("get meta-heuristics: %v", err)
+	}
+	if len(got) != len(presentIDs) {
+		t.Fatalf("fetched %d meta-heuristic(s), want only the %d seeded: %+v", len(got), len(presentIDs), got)
+	}
+	for _, id := range presentIDs {
+		if !containsID(got, id) {
+			t.Fatalf("expected %s in the batch result, got %+v", id, got)
+		}
+	}
+	if containsID(got, absentID) {
+		t.Fatalf("an id with no node must be absent, not fabricated: %+v", got)
+	}
+
+	empty, err := repo.GetMetaHeuristics(ctx, nil)
+	if err != nil {
+		t.Fatalf("get meta-heuristics for no ids: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("expected an empty result for no ids, got %+v", empty)
+	}
+}
+
 func TestCreateMetaHeuristicRejectsBadReferences(t *testing.T) {
 	ctx := context.Background()
 	repo := newRepo(t, ctx)

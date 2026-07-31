@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -11,6 +12,7 @@ import (
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/heuristics"
+	"github.com/arborette/arborette/internal/orchestratorclient"
 )
 
 type fakeQuerier struct {
@@ -262,7 +264,10 @@ func TestSubmitAnalystGoalReturnsID(t *testing.T) {
 }
 
 func TestSubmitAnalystGoalSurfacesOrchestratorMessage(t *testing.T) {
-	goals := &fakeSubmitter{err: &OrchestratorError{Message: "import_path escapes the import directory"}}
+	goals := &fakeSubmitter{err: &orchestratorclient.OrchestratorError{
+		Status:  http.StatusBadRequest,
+		Message: "import_path escapes the import directory",
+	}}
 	cs := connectTools(t, &fakeQuerier{}, goals)
 
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{

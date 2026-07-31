@@ -1,6 +1,7 @@
 package service_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -51,9 +52,27 @@ func TestBearerAuth(t *testing.T) {
 			if reached != tc.wantReach {
 				t.Fatalf("next handler reached = %v, want %v", reached, tc.wantReach)
 			}
-			challenge := rec.Header().Get("WWW-Authenticate")
-			if tc.wantStatus == http.StatusUnauthorized && challenge != "Bearer" {
+			if tc.wantStatus != http.StatusUnauthorized {
+				return
+			}
+			// Read off Result(), not the recorder's live header map: the map keeps
+			// accepting writes after the response is committed, so a challenge set
+			// too late still shows up there while never reaching the client.
+			resp := rec.Result()
+			if challenge := resp.Header.Get("WWW-Authenticate"); challenge != "Bearer" {
 				t.Fatalf("WWW-Authenticate = %q, want %q", challenge, "Bearer")
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+				t.Fatalf("Content-Type = %q, want application/json", ct)
+			}
+			// The rejection answers in the shared error envelope (see
+			// TestWriteErrEnvelope), not a bare status line.
+			var body map[string]string
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("decode 401 body: %v", err)
+			}
+			if len(body) != 1 || body["error"] != "unauthorized" {
+				t.Fatalf(`401 body = %v, want {"error": "unauthorized"}`, body)
 			}
 		})
 	}

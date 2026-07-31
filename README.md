@@ -207,11 +207,13 @@ which Docker binds to all interfaces rather than to loopback. Two different expo
 datastores carry the placeholder credentials you just declined to replace, so anyone on the subnet
 can open a Bolt session against Neo4j on `:7687`, reach Postgres on `:5432` as superuser, or browse
 every staged dataset through MinIO on `:9001`, each with a password published in this repository.
-The application and embedding ports carry no credentials at all — they authenticate nobody — so for
-those the loopback binding is the only control there is.
+The application and embedding ports authenticate almost nobody: only the MCP server's listener and
+the Orchestrator's `POST /internal/audit` check a token, and both fail open until you set one, so for
+the rest the loopback binding is the only control there is.
 
 Hardening it is therefore not just a password change: bind the published ports to `127.0.0.1` by
-editing `docker-compose.yml` (no variable controls this), replace every `change-me-*` value, move
+editing `docker-compose.yml` (no variable controls this), replace every `change-me-*` value, mint an
+`INTERNAL_AUTH_TOKEN` (and an `MCP_AUTHORIZATION_TOKEN` if you expose that listener), move
 `POSTGRES_SSLMODE` off `disable`, and run `make web-dev` as `next dev -H 127.0.0.1` if you use it.
 
 **Rotate the credentials before the first `make up`, not after.** Neo4j and Postgres read their
@@ -413,7 +415,7 @@ The Orchestrator's thirteen routes:
 | `GET /goals/{id}/outcomes/{outcomeID}/excerpt` | The source text behind an extracted value — the located span, or the whole document when the value cannot be pinpointed in it. |
 | `GET /heuristics/search` | Semantic search over published Meta-Heuristics (`q` required; `k` defaults 10, clamped at 100). |
 | `GET /heuristics/{id}/trace` | Trace a Meta-Heuristic back to its supporting triplets. |
-| `POST /internal/audit` | The internal audit-write API other services record through. |
+| `POST /internal/audit` | The internal audit-write API other services record through — the one route that checks a bearer token, when `INTERNAL_AUTH_TOKEN` is set. |
 
 The Sandbox exposes three routes, all called by other services rather than by an analyst:
 `POST /introspect`, `POST /execute`, and `POST /document/text`.
@@ -450,6 +452,7 @@ under [Prerequisites](#prerequisites). Three LLM providers are supported (set vi
 | `OLLAMA_LLM_MODEL` | Ollama model (default `llama3`). |
 | `MCP_PUBLIC_URL` | Where Anthropic's infrastructure dials the MCP server for the agent chat. It connects inbound, so the in-network `http://mcpserver:8082` cannot serve — locally this is a tunnel to port 8082. Unset, a goal's Preview agent tab answers "agent preview is not configured". |
 | `MCP_AUTHORIZATION_TOKEN` | Bearer token the MCP server checks when set; empty disables auth, leaning on the same trusted-network assumption every other published port makes. Setting `MCP_PUBLIC_URL` without a token makes the MCP server refuse to start. |
+| `INTERNAL_AUTH_TOKEN` | Shared secret for service-to-service writes — today the audit-append API the sleep-cycle job records through. The Orchestrator verifies it and the job presents it, both from this one variable, so the two cannot drift apart; empty disables the guard. A wrong value is quiet rather than loud: the Orchestrator answers 401 and the job logs and swallows the failure, so runs keep reporting success while their audit records stop being written. |
 | `NEO4J_USER` / `_PASSWORD` | Graph credentials. Compose pins the user to `neo4j`, so only the password is really free. |
 | `POSTGRES_OWNER_USER` / `_PASSWORD` | Superuser: provisions the runtime roles and owns the migrated tables. |
 | `POSTGRES_ORCHESTRATOR_USER` / `_PASSWORD` | The Orchestrator's runtime role — the only one with audit-table privileges. |
@@ -502,12 +505,12 @@ Open themes, each with the reason it is open:
   shared transaction, so the two can drift — a node whose embedding vanished still reports itself
   complete while being invisible to the search that actually serves consumers.
 - **Performance.** Every Sleep-Cycle measurement re-stages the dataset from the object store and
-  re-parses it, so a 200-measurement run pays that cost ~200 times over an identical file. The
-  Meta-Heuristic read path also fetches nodes one per similarity hit.
-- **Service-boundary and auth hardening.** Only the MCP server authenticates, and only because the
-  agent preview requires dialing it from outside the network; every other boundary, the
-  Orchestrator's own API included, carries no authentication and no rate limiting. This needs a
-  deliberate pass before anything is exposed beyond a laptop.
+  re-parses it, so a 200-measurement run pays that cost ~200 times over an identical file.
+- **Service-boundary and auth hardening.** Two listeners authenticate: the MCP server, because the
+  agent preview requires dialing it from outside the network, and the Orchestrator's
+  `POST /internal/audit` on the shared `INTERNAL_AUTH_TOKEN` — and both fail open when no token is
+  set. Every analyst-facing route, the Sandbox's whole surface, and rate limiting everywhere remain
+  open. This needs a deliberate pass before anything is exposed beyond a laptop.
 
 ### V2 — the dual-engine architecture
 
@@ -538,7 +541,7 @@ the existing search seam.
     behind an interface: `store` (Postgres and migrations), `graph` (Neo4j), `objectstore`
     (S3/MinIO), `datasource`, `embedding`.
   - *Service packages*: `orchestrator`, `sandbox`, `mcpserver`, `sleepcycle`.
-  - *Clients*: `sandboxclient` and `auditclient`.
+  - *Clients*: `sandboxclient` and `orchestratorclient`, one per service other services call.
   - *Shared query seams*: `objective`, which pins a matrix to one measurement, and `heuristics`,
     which both the REST handler and the MCP tool call so the two cannot diverge.
   - *Plumbing*: `domain`, `config`, `service`, `llm`, `testutil`.

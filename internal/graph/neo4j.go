@@ -30,7 +30,8 @@ const (
 // eligible-finding query MATCHes on them, and the Neptune-portable Cypher subset
 // this package is restricted to cannot filter inside a JSON string property.
 
-// Neo4jRepository is the Cypher-backed Repository implementation.
+// Neo4jRepository is the driver-holding, Cypher-backed implementation of this
+// package's graph access.
 type Neo4jRepository struct {
 	driver neo4j.DriverWithContext
 }
@@ -160,12 +161,51 @@ func (r *Neo4jRepository) GetOutcome(ctx context.Context, id string) (domain.Out
 	return outcomeFromNode(id, node)
 }
 
+// GetMetaHeuristic fetches one Meta-Heuristic, yielding ErrNotFound for an
+// unknown id. Hydrating a set of ids is GetMetaHeuristics, which is one round trip.
 func (r *Neo4jRepository) GetMetaHeuristic(ctx context.Context, id string) (domain.MetaHeuristic, error) {
 	node, err := r.getNode(ctx, labelMetaHeuristic, id)
 	if err != nil {
 		return domain.MetaHeuristic{}, err
 	}
 	return metaHeuristicFromNode(node), nil
+}
+
+// GetMetaHeuristics fetches a batch of Meta-Heuristics in one round trip, the
+// hydration step behind a similarity search. Ids with no node are simply absent
+// from the result rather than an error -- a search whose neighbourhood touches a
+// retired node must still answer -- and the result carries Neo4j's own ordering,
+// so a caller that needs the ids' order re-keys by id.
+func (r *Neo4jRepository) GetMetaHeuristics(ctx context.Context, ids []string) ([]domain.MetaHeuristic, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (n:"+labelMetaHeuristic+") WHERE n.id IN $ids RETURN n",
+			map[string]any{"ids": ids},
+		)
+		if err != nil {
+			return nil, err
+		}
+		recs, err := result.Collect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]domain.MetaHeuristic, 0, len(recs))
+		for _, rec := range recs {
+			node, err := recordNode(rec, "n")
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, metaHeuristicFromNode(node))
+		}
+		return out, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get %d MetaHeuristics: %w", len(ids), err)
+	}
+	return res.([]domain.MetaHeuristic), nil
 }
 
 // getNode fetches one node by label and application-assigned id, wrapping a miss
@@ -244,13 +284,15 @@ func (r *Neo4jRepository) CreateProduced(ctx context.Context, interventionID, ou
 	})
 }
 
+// CreateMetaHeuristic writes the node, its ABSTRACTED_FROM edges, and
+// embedding_pending:true within one transaction. It first validates that every
+// abstractedFrom id resolves to exactly one existing node, erroring (and
+// committing nothing) on any missing or duplicate reference, so a Meta-Heuristic
+// is never abstracted from incomplete evidence.
 func (r *Neo4jRepository) CreateMetaHeuristic(ctx context.Context, mh domain.MetaHeuristic, abstractedFrom []string) error {
 	return r.writeOp(ctx, "create meta-heuristic "+mh.ID, func(tx neo4j.ManagedTransaction) (any, error) {
-		// Validate first: every referenced id must resolve to exactly one node.
-		// A bare `WHERE n.id IN $ids` would silently drop nonexistent ids, so we
-		// count matches per requested id and reject anything that is not exactly
-		// one. On any failure we return an error, rolling back the whole tx so
-		// neither the node nor a partial ABSTRACTED_FROM edge is left behind.
+		// A bare `WHERE n.id IN $ids` would silently drop nonexistent ids, so
+		// match counts are checked per requested id.
 		if len(abstractedFrom) > 0 {
 			check, err := tx.Run(ctx,
 				"UNWIND $ids AS wantId "+
@@ -294,6 +336,8 @@ func (r *Neo4jRepository) CreateMetaHeuristic(ctx context.Context, mh domain.Met
 	})
 }
 
+// ClearEmbeddingPending marks a Meta-Heuristic's embedding as written to
+// pgvector.
 func (r *Neo4jRepository) ClearEmbeddingPending(ctx context.Context, id string) error {
 	return r.writeOp(ctx, "clear embedding_pending "+id, func(tx neo4j.ManagedTransaction) (any, error) {
 		return tx.Run(ctx,
@@ -303,6 +347,9 @@ func (r *Neo4jRepository) ClearEmbeddingPending(ctx context.Context, id string) 
 	})
 }
 
+// ListEmbeddingPending surfaces Meta-Heuristics still awaiting their pgvector
+// write, including any left flagged by a mid-write crash, so a later run retries
+// them.
 func (r *Neo4jRepository) ListEmbeddingPending(ctx context.Context) ([]domain.MetaHeuristic, error) {
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,
@@ -332,6 +379,10 @@ func (r *Neo4jRepository) ListEmbeddingPending(ctx context.Context) ([]domain.Me
 	return res.([]domain.MetaHeuristic), nil
 }
 
+// ListEligibleFindings returns the Sleep-Cycle search's input set for one goal:
+// complete State→Intervention→Outcome paths that are not sleep-derived (a prior
+// run's macro-segments are search outputs, not atomic inputs) and whose outcome
+// status is search-eligible (domain.SearchEligibleStatuses).
 func (r *Neo4jRepository) ListEligibleFindings(ctx context.Context, goalID string) ([]CausalTriplet, error) {
 	statuses := make([]string, 0, len(domain.SearchEligibleStatuses))
 	for _, s := range domain.SearchEligibleStatuses {
@@ -369,6 +420,11 @@ func (r *Neo4jRepository) ListEligibleFindings(ctx context.Context, goalID strin
 	return res.([]CausalTriplet), nil
 }
 
+// MarkStaleMetaHeuristics flags every Meta-Heuristic for a goal whose
+// ABSTRACTED_FROM components include a rejected Outcome, returning how many were
+// marked. It triggers on rejected only -- deliberately not corrected, which
+// domain.SearchEligibleStatuses admits, so a corrected-triggering sweep would
+// flag the worker's own fresh output on the very next run.
 func (r *Neo4jRepository) MarkStaleMetaHeuristics(ctx context.Context, goalID string) (int, error) {
 	res, err := r.write(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		// Recompute the flag rather than only ever setting it, so the sweep is
@@ -400,6 +456,8 @@ func (r *Neo4jRepository) MarkStaleMetaHeuristics(ctx context.Context, goalID st
 	return res.(int), nil
 }
 
+// UpdateOutcomeVerification applies an HITL resolution to an Outcome and its
+// inbound PRODUCED-edge confidence. CorrectOutcome is its correction counterpart.
 func (r *Neo4jRepository) UpdateOutcomeVerification(ctx context.Context, outcomeID string, status domain.VerificationStatus, confidence float64) error {
 	return r.writeOp(ctx, "update outcome verification "+outcomeID, func(tx neo4j.ManagedTransaction) (any, error) {
 		return tx.Run(ctx,
@@ -412,7 +470,8 @@ func (r *Neo4jRepository) UpdateOutcomeVerification(ctx context.Context, outcome
 
 // CorrectOutcome applies an analyst's correction in one statement: the
 // replacement value, the locator recomputed against it, the resolution status,
-// and the inbound edge's confidence. See Repository for why they move together.
+// and the inbound edge's confidence. All four move together so a failure cannot
+// leave a corrected value sitting under an unreviewed status.
 func (r *Neo4jRepository) CorrectOutcome(ctx context.Context, outcomeID string, value map[string]any, provenance *domain.ProvenanceLocator, status domain.VerificationStatus, confidence float64) error {
 	marshalled, err := marshalProps(value)
 	if err != nil {
@@ -437,6 +496,8 @@ func (r *Neo4jRepository) CorrectOutcome(ctx context.Context, outcomeID string, 
 	})
 }
 
+// ListExtractionOutcomes returns every extract-type outcome for a goal, each
+// joined to its producing intervention and PRODUCED edge.
 func (r *Neo4jRepository) ListExtractionOutcomes(ctx context.Context, goalID string) ([]ExtractionOutcome, error) {
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,
@@ -467,6 +528,10 @@ func (r *Neo4jRepository) ListExtractionOutcomes(ctx context.Context, goalID str
 	return res.([]ExtractionOutcome), nil
 }
 
+// GetExtractionOutcome returns one extract-type outcome by id, joined to its
+// producing intervention and PRODUCED edge. It yields ErrNotFound both for an
+// unknown id and for a query-type outcome, which is verified by construction and
+// so is never human-resolvable.
 func (r *Neo4jRepository) GetExtractionOutcome(ctx context.Context, outcomeID string) (ExtractionOutcome, error) {
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,
@@ -535,6 +600,8 @@ func extractionOutcomeFromRecord(rec *neo4j.Record) (ExtractionOutcome, error) {
 	}, nil
 }
 
+// TraceCausalChain walks ABSTRACTED_FROM from a Meta-Heuristic back to the
+// State/Intervention/Outcome triplet(s) that support it.
 func (r *Neo4jRepository) TraceCausalChain(ctx context.Context, metaHeuristicID string) ([]CausalTriplet, error) {
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,

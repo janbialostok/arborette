@@ -7,6 +7,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -15,9 +16,16 @@ import (
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/heuristics"
 	"github.com/arborette/arborette/internal/mcpserver"
+	"github.com/arborette/arborette/internal/orchestratorclient"
 	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
+
+// goalSubmitTimeout bounds a single goal-submission proxy call so an MCP tool
+// invocation cannot block forever on a stalled Orchestrator. It is far longer
+// than the client's own default because registration fits an Evaluation Matrix
+// to the data source through Claude before it answers.
+const goalSubmitTimeout = 2 * time.Minute
 
 func main() {
 	ctx := context.Background()
@@ -48,7 +56,9 @@ func main() {
 	queries := heuristics.NewService(provider, store.NewEmbeddingStore(pool), repo)
 	log.Printf("mcpserver: wired neo4j, postgres, heuristics query service (dim=%d), serving HTTP on :%s", provider.Dimensions(), cfg.MCP.Port)
 
-	orchClient := mcpserver.NewOrchestratorClient(cfg.MCP.OrchestratorURL, nil)
+	// No internal secret: this server reaches only the analyst-facing /goals route.
+	orchClient := orchestratorclient.NewClient(cfg.MCP.OrchestratorURL, "",
+		&http.Client{Timeout: goalSubmitTimeout})
 	srv := mcp.NewServer(&mcp.Implementation{Name: "arborette-mcp", Version: "0.1.0"}, nil)
 	mcpserver.RegisterTools(srv, queries, orchClient)
 

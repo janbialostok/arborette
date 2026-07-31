@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -44,16 +45,16 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxAuditBytes)
 	var req auditRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.Action == "" || req.EventType == "" {
-		writeErr(w, http.StatusBadRequest, "action and event_type are required")
+		service.WriteErr(w, http.StatusBadRequest, "action and event_type are required")
 		return
 	}
 	if err := s.recordAudit(r.Context(), req.Action, req.EventType, req.Detail); err != nil {
 		log.Printf("orchestrator: append audit: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	w.WriteHeader(http.StatusCreated)

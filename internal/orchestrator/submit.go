@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/arborette/arborette/internal/datasource"
+	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -83,17 +84,17 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(maxUploadMemory); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid or oversized multipart form")
+		service.WriteErr(w, http.StatusBadRequest, "invalid or oversized multipart form")
 		return
 	}
 	goal := strings.TrimSpace(r.FormValue("goal"))
 	if goal == "" {
-		writeErr(w, http.StatusBadRequest, "goal is required")
+		service.WriteErr(w, http.StatusBadRequest, "goal is required")
 		return
 	}
 	review, err := parseReviewSettings(r)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		service.WriteErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -124,7 +125,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	matrix, err := s.claude.GenerateEvaluationMatrix(ctx, goal, schema)
 	if err != nil {
 		log.Printf("orchestrator: generate evaluation matrix: %v", err)
-		writeErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
+		service.WriteErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
 		return
 	}
 
@@ -136,14 +137,14 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		repaired, rerr := s.claude.RepairEvaluationMatrix(ctx, goal, schema, matrix, verr.Error())
 		if rerr != nil {
 			log.Printf("orchestrator: repair evaluation matrix: %v", rerr)
-			writeErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
+			service.WriteErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
 			return
 		}
 		matrix = repaired
 		verr = s.dryRunObjective(ctx, ref, matrix)
 	}
 	if isObjectiveValidationFailure(verr) {
-		writeErr(w, http.StatusUnprocessableEntity, "could not fit the goal to the data source: "+verr.Error())
+		service.WriteErr(w, http.StatusUnprocessableEntity, "could not fit the goal to the data source: "+verr.Error())
 		return
 	}
 	if verr != nil {
@@ -161,7 +162,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		EpochMode:              review.epochMode,
 	}); err != nil {
 		log.Printf("orchestrator: insert goal: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -172,7 +173,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		log.Printf("orchestrator: append audit: %v", err)
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+	service.WriteJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
 }
 
 // submitDocumentGoal completes registration for a document source: it derives the
@@ -186,11 +187,11 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 	fields, err := s.claude.IntrospectDocumentFields(ctx, goal, sample)
 	if err != nil {
 		log.Printf("orchestrator: introspect document fields: %v", err)
-		writeErr(w, http.StatusBadGateway, "document field introspection failed")
+		service.WriteErr(w, http.StatusBadGateway, "document field introspection failed")
 		return
 	}
 	if len(fields) == 0 {
-		writeErr(w, http.StatusUnprocessableEntity, "could not identify any extractable fields for the goal in this document")
+		service.WriteErr(w, http.StatusUnprocessableEntity, "could not identify any extractable fields for the goal in this document")
 		return
 	}
 
@@ -204,7 +205,7 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 		EpochMode:              review.epochMode,
 	}); err != nil {
 		log.Printf("orchestrator: insert goal: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -215,7 +216,7 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 		log.Printf("orchestrator: append audit: %v", err)
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+	service.WriteJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
 }
 
 // goalListItemDTO is the web-UI projection of a goal plus its latest run status
@@ -236,7 +237,7 @@ func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
 	goals, err := s.goals.List(ctx)
 	if err != nil {
 		log.Printf("orchestrator: list goals: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -247,7 +248,7 @@ func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
 	latest, err := s.runs.LatestByGoal(ctx, ids)
 	if err != nil {
 		log.Printf("orchestrator: latest runs by goal: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -267,7 +268,7 @@ func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, item)
 	}
-	writeJSON(w, http.StatusOK, out)
+	service.WriteJSON(w, http.StatusOK, out)
 }
 
 // ingest resolves the request's data source to an object-store ref via one of
@@ -358,7 +359,7 @@ func (s *Server) writeIntakeErr(w http.ResponseWriter, err error) {
 		return
 	}
 	log.Printf("orchestrator: intake sandbox call: %v", err)
-	writeErr(w, http.StatusBadGateway, "sandbox unavailable")
+	service.WriteErr(w, http.StatusBadGateway, "sandbox unavailable")
 }
 
 // writeSandboxStatus maps a sandbox fault to a status for whichever phase hit
@@ -368,12 +369,12 @@ func (s *Server) writeIntakeErr(w http.ResponseWriter, err error) {
 func writeSandboxStatus(w http.ResponseWriter, se *SandboxError, phase string) {
 	switch se.Status {
 	case http.StatusBadRequest:
-		writeErr(w, http.StatusBadRequest, se.Message)
+		service.WriteErr(w, http.StatusBadRequest, se.Message)
 	case http.StatusNotFound:
-		writeErr(w, http.StatusNotFound, se.Message)
+		service.WriteErr(w, http.StatusNotFound, se.Message)
 	default:
 		log.Printf("orchestrator: sandbox fault during %s: %v", phase, se)
-		writeErr(w, http.StatusBadGateway, "sandbox unavailable")
+		service.WriteErr(w, http.StatusBadGateway, "sandbox unavailable")
 	}
 }
 
@@ -383,11 +384,11 @@ func (s *Server) writeIngestErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errNoSource), errors.Is(err, errBothSources),
 		errors.Is(err, errPathEscape), errors.Is(err, errNoImportDir):
-		writeErr(w, http.StatusBadRequest, err.Error())
+		service.WriteErr(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, os.ErrNotExist):
-		writeErr(w, http.StatusNotFound, "data source not found")
+		service.WriteErr(w, http.StatusNotFound, "data source not found")
 	default:
 		log.Printf("orchestrator: ingest data source: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 	}
 }

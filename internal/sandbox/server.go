@@ -11,6 +11,7 @@ import (
 	"github.com/arborette/arborette/internal/datasource"
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/objectstore"
+	"github.com/arborette/arborette/internal/service"
 )
 
 // Server is the stateless HTTP surface of the Sandbox Execution service. It holds
@@ -121,11 +122,11 @@ type ExecuteResponse struct {
 func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	var req IntrospectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.DataSourceRef == "" {
-		writeErr(w, http.StatusBadRequest, "data_source_ref is required")
+		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
 		return
 	}
 
@@ -140,7 +141,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 			writeStageErr(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, IntrospectResponse{
+		service.WriteJSON(w, http.StatusOK, IntrospectResponse{
 			Schema: schemaDTO{Kind: string(datasource.KindDocument)},
 			Sample: documentSample(pages),
 		})
@@ -156,10 +157,10 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 
 	bindings, err := bindTargets(req.Targets, schema.Columns)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		service.WriteErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, IntrospectResponse{Schema: toSchemaDTO(schema), TargetBindings: bindings})
+	service.WriteJSON(w, http.StatusOK, IntrospectResponse{Schema: toSchemaDTO(schema), TargetBindings: bindings})
 }
 
 // handleDocumentText serves a document's ordered per-page plain text. It mirrors
@@ -168,11 +169,11 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDocumentText(w http.ResponseWriter, r *http.Request) {
 	var req DocumentTextRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.DataSourceRef == "" {
-		writeErr(w, http.StatusBadRequest, "data_source_ref is required")
+		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
 		return
 	}
 
@@ -182,7 +183,7 @@ func (s *Server) handleDocumentText(w http.ResponseWriter, r *http.Request) {
 		writeStageErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, DocumentTextResponse{Pages: pages})
+	service.WriteJSON(w, http.StatusOK, DocumentTextResponse{Pages: pages})
 }
 
 // isDocumentRef reports whether a ref is a document this service reads (a PDF
@@ -195,16 +196,16 @@ func isDocumentRef(ref string) bool {
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	var req ExecuteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.DataSourceRef == "" {
-		writeErr(w, http.StatusBadRequest, "data_source_ref is required")
+		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
 		return
 	}
 
 	if req.Type != "" && req.Type != domain.InterventionQuery {
-		writeErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported intervention type %q", req.Type))
+		service.WriteErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported intervention type %q", req.Type))
 		return
 	}
 
@@ -230,7 +231,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	if m.Counted {
 		value[rowCountKey] = m.RowCount
 	}
-	writeJSON(w, http.StatusOK, ExecuteResponse{Value: value})
+	service.WriteJSON(w, http.StatusOK, ExecuteResponse{Value: value})
 }
 
 // bindTargets binds each target to a column using the shared case-insensitive
@@ -267,7 +268,7 @@ func toSchemaDTO(schema *datasource.Schema) schemaDTO {
 func writeStageErr(w http.ResponseWriter, err error) {
 	switch {
 	case objectstore.IsNotFound(err):
-		writeErr(w, http.StatusNotFound, "data source not found")
+		service.WriteErr(w, http.StatusNotFound, "data source not found")
 	case errors.Is(err, errUnknownField),
 		errors.Is(err, errAmbiguousField),
 		errors.Is(err, errNonNumeric),
@@ -279,27 +280,11 @@ func writeStageErr(w http.ResponseWriter, err error) {
 		errors.Is(err, errUnsupportedFormat),
 		errors.Is(err, errUnsupportedDocument),
 		errors.Is(err, errObjectTooLarge):
-		writeErr(w, http.StatusBadRequest, err.Error())
+		service.WriteErr(w, http.StatusBadRequest, err.Error())
 	default:
 		// The detail is masked from the client but logged so a 500-class defect
 		// leaves a diagnostic trail.
 		log.Printf("sandbox: internal error: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 	}
-}
-
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("sandbox: encode response: %v", err)
-	}
-}
-
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, errorResponse{Error: msg})
 }

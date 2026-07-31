@@ -15,6 +15,7 @@ import (
 	"github.com/arborette/arborette/internal/llm"
 	"github.com/arborette/arborette/internal/objectstore"
 	"github.com/arborette/arborette/internal/orchestrator"
+	"github.com/arborette/arborette/internal/sandboxclient"
 	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
@@ -64,7 +65,7 @@ func main() {
 		log.Fatalf("orchestrator: llm client: %v", err)
 	}
 	chat := llm.NewChatClient(cfg.LLM.Anthropic.APIKey, cfg.LLM.Anthropic.ChatModel, cfg.MCP.PublicURL, cfg.MCP.AuthorizationToken)
-	sandbox := orchestrator.NewSandboxClient(cfg.Orchestrator.SandboxURL, nil)
+	sandbox := sandboxclient.NewClient(cfg.Orchestrator.SandboxURL, nil)
 
 	// Runs whose loop was abandoned by a prior crash or shutdown never ran their
 	// terminal write; settle them to failed at boot so they don't strand at
@@ -81,6 +82,7 @@ func main() {
 		orchestrator.NewHub(), orchestrator.StubLauncher{},
 		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID},
 		cfg.Orchestrator.LocalImportDir, cfg.Orchestrator.SleepCycleJobName,
+		cfg.Orchestrator.InternalAuthToken,
 		cfg.Orchestrator.HITLConfidenceThreshold, cfg.Orchestrator.BlockingLoopTimeout,
 	)
 

@@ -16,6 +16,7 @@ import (
 
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/graph"
+	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -105,21 +106,21 @@ func (s *Server) handleListVerifications(w http.ResponseWriter, r *http.Request)
 	}
 	status := store.QueueStatus(r.URL.Query().Get("status"))
 	if status != "" && status != store.QueuePending && status != store.QueueResolved {
-		writeErr(w, http.StatusBadRequest, `status must be "pending" or "resolved"`)
+		service.WriteErr(w, http.StatusBadRequest, `status must be "pending" or "resolved"`)
 		return
 	}
 
 	entries, err := s.queue.ListForGoal(ctx, goal.OptimizationFunctionID, status)
 	if err != nil {
 		log.Printf("orchestrator: list verifications for %q: %v", goal.OptimizationFunctionID, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	out := make([]verificationEntryDTO, 0, len(entries))
 	for _, e := range entries {
 		out = append(out, toVerificationEntryDTO(e))
 	}
-	writeJSON(w, http.StatusOK, verificationListDTO{
+	service.WriteJSON(w, http.StatusOK, verificationListDTO{
 		EffectiveThreshold: s.effectiveThreshold(goal),
 		EpochMode:          string(epochModeOf(goal)),
 		Entries:            out,
@@ -138,7 +139,7 @@ func (s *Server) handleListOutcomes(w http.ResponseWriter, r *http.Request) {
 	outcomes, err := s.repo.ListExtractionOutcomes(ctx, goal.OptimizationFunctionID)
 	if err != nil {
 		log.Printf("orchestrator: list extraction outcomes for %q: %v", goal.OptimizationFunctionID, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	out := make([]extractionOutcomeDTO, 0, len(outcomes))
@@ -153,7 +154,7 @@ func (s *Server) handleListOutcomes(w http.ResponseWriter, r *http.Request) {
 			Confidence:         o.Confidence,
 		})
 	}
-	writeJSON(w, http.StatusOK, out)
+	service.WriteJSON(w, http.StatusOK, out)
 }
 
 // handleOutcomeExcerpt returns the source text an extracted value came from, so
@@ -179,7 +180,7 @@ func (s *Server) handleOutcomeExcerpt(w http.ResponseWriter, r *http.Request) {
 		s.writeSandboxErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, excerptFor(text.Pages, outcome.Provenance))
+	service.WriteJSON(w, http.StatusOK, excerptFor(text.Pages, outcome.Provenance))
 }
 
 // handleResolveVerification applies an analyst's verdict to an extraction. It
@@ -201,17 +202,17 @@ func (s *Server) handleResolveVerification(w http.ResponseWriter, r *http.Reques
 	r.Body = http.MaxBytesReader(w, r.Body, maxVerificationBytes)
 	var req resolveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	resolution, ok := parseResolution(req.Action)
 	if !ok {
-		writeErr(w, http.StatusUnprocessableEntity, `action must be one of "confirm", "correct", "reject"`)
+		service.WriteErr(w, http.StatusUnprocessableEntity, `action must be one of "confirm", "correct", "reject"`)
 		return
 	}
 	corrected := strings.TrimSpace(req.CorrectedValue)
 	if resolution == store.ResolutionCorrected && corrected == "" {
-		writeErr(w, http.StatusUnprocessableEntity, "corrected_value is required to correct an extraction")
+		service.WriteErr(w, http.StatusUnprocessableEntity, "corrected_value is required to correct an extraction")
 		return
 	}
 
@@ -259,16 +260,16 @@ func (s *Server) handleResolveVerification(w http.ResponseWriter, r *http.Reques
 	defer cancelAudit()
 	if err := s.recordAudit(auditCtx, "hitl_verification_resolution", "verification", detail); err != nil {
 		log.Printf("orchestrator: append audit: %v", err)
-		writeErr(w, http.StatusInternalServerError, "the resolution was applied but its audit record could not be written")
+		service.WriteErr(w, http.StatusInternalServerError, "the resolution was applied but its audit record could not be written")
 		return
 	}
 
 	if claim.conflict {
-		writeErr(w, http.StatusConflict, "this outcome was already resolved as "+string(claim.resolution)+
+		service.WriteErr(w, http.StatusConflict, "this outcome was already resolved as "+string(claim.resolution)+
 			resolvedAsSuffix(claim.corrected)+"; that resolution was completed and the requested action was not applied")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	service.WriteJSON(w, http.StatusOK, map[string]any{
 		"outcome_id":          outcome.OutcomeID,
 		"resolution":          string(claim.resolution),
 		"verification_status": string(verificationStatusFor(claim.resolution)),
@@ -306,13 +307,13 @@ func (s *Server) claimResolution(ctx context.Context, w http.ResponseWriter, goa
 		newEntry, buildErr := verificationEntryFor(goal, outcome)
 		if buildErr != nil {
 			log.Printf("orchestrator: build verification entry: %v", buildErr)
-			writeErr(w, http.StatusInternalServerError, "internal error")
+			service.WriteErr(w, http.StatusInternalServerError, "internal error")
 			return resolutionClaim{}, false
 		}
 		err = s.queue.EnqueueResolved(ctx, newEntry, want.resolution, want.corrected)
 	case err != nil:
 		log.Printf("orchestrator: get verification for outcome %q: %v", outcome.OutcomeID, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return resolutionClaim{}, false
 	case entry.Status == store.QueuePending:
 		err = s.queue.Resolve(ctx, outcome.OutcomeID, want.resolution, want.corrected)
@@ -325,7 +326,7 @@ func (s *Server) claimResolution(ctx context.Context, w http.ResponseWriter, goa
 	}
 	if !errors.Is(err, store.ErrAlreadyResolved) {
 		log.Printf("orchestrator: claim verification for outcome %q: %v", outcome.OutcomeID, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return resolutionClaim{}, false
 	}
 	return s.repairClaim(ctx, w, outcome.OutcomeID, want)
@@ -340,17 +341,17 @@ func (s *Server) repairClaim(ctx context.Context, w http.ResponseWriter, outcome
 	entry, err := s.queue.GetByOutcome(ctx, outcomeID)
 	if err != nil {
 		log.Printf("orchestrator: re-read verification for outcome %q: %v", outcomeID, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return resolutionClaim{}, false
 	}
 	if entry.Status == store.QueuePending {
 		if err := s.queue.Resolve(ctx, outcomeID, want.resolution, want.corrected); err != nil {
 			if errors.Is(err, store.ErrAlreadyResolved) {
-				writeErr(w, http.StatusConflict, "this outcome has already been resolved")
+				service.WriteErr(w, http.StatusConflict, "this outcome has already been resolved")
 				return resolutionClaim{}, false
 			}
 			log.Printf("orchestrator: claim verification for outcome %q: %v", outcomeID, err)
-			writeErr(w, http.StatusInternalServerError, "internal error")
+			service.WriteErr(w, http.StatusInternalServerError, "internal error")
 			return resolutionClaim{}, false
 		}
 		return want, true
@@ -361,11 +362,11 @@ func (s *Server) repairClaim(ctx context.Context, w http.ResponseWriter, outcome
 	outcome, err := s.repo.GetExtractionOutcome(ctx, outcomeID)
 	if err != nil {
 		log.Printf("orchestrator: re-read outcome %q: %v", outcomeID, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return resolutionClaim{}, false
 	}
 	if outcome.VerificationStatus != domain.VerificationUnverified {
-		writeErr(w, http.StatusConflict, "this outcome has already been resolved")
+		service.WriteErr(w, http.StatusConflict, "this outcome has already been resolved")
 		return resolutionClaim{}, false
 	}
 	return resolutionClaim{
@@ -423,7 +424,7 @@ func (s *Server) writeSandboxErr(w http.ResponseWriter, err error) {
 		writeSandboxStatus(w, se, "review")
 		return
 	}
-	writeErr(w, http.StatusInternalServerError, "internal error")
+	service.WriteErr(w, http.StatusInternalServerError, "internal error")
 }
 
 // compensateClaim returns a failed resolution's row to pending so the analyst
@@ -462,15 +463,15 @@ func (s *Server) lookupExtractionOutcome(ctx context.Context, w http.ResponseWri
 	outcome, err := s.repo.GetExtractionOutcome(ctx, outcomeID)
 	if err != nil {
 		if errors.Is(err, graph.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "outcome not found")
+			service.WriteErr(w, http.StatusNotFound, "outcome not found")
 			return graph.ExtractionOutcome{}, false
 		}
 		log.Printf("orchestrator: get extraction outcome %q: %v", outcomeID, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return graph.ExtractionOutcome{}, false
 	}
 	if outcome.GoalID != goal.OptimizationFunctionID {
-		writeErr(w, http.StatusNotFound, "outcome not found")
+		service.WriteErr(w, http.StatusNotFound, "outcome not found")
 		return graph.ExtractionOutcome{}, false
 	}
 	return outcome, true

@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"log"
 	"net/http"
+
+	"github.com/arborette/arborette/internal/service"
 )
 
 // handleTriggerSleepCycle triggers the Phase-2 Sleep Cycle for a goal: it
@@ -19,7 +21,7 @@ func (s *Server) handleTriggerSleepCycle(w http.ResponseWriter, r *http.Request)
 		"optimization_function_id": goal.OptimizationFunctionID,
 	}); err != nil {
 		log.Printf("orchestrator: launch sleep-cycle job: %v", err)
-		writeErr(w, http.StatusInternalServerError, "failed to launch sleep cycle")
+		service.WriteErr(w, http.StatusInternalServerError, "failed to launch sleep cycle")
 		return
 	}
 
@@ -30,5 +32,5 @@ func (s *Server) handleTriggerSleepCycle(w http.ResponseWriter, r *http.Request)
 		log.Printf("orchestrator: append audit: %v", err)
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]any{"optimization_function_id": goal.OptimizationFunctionID})
+	service.WriteJSON(w, http.StatusAccepted, map[string]any{"optimization_function_id": goal.OptimizationFunctionID})
 }

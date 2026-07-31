@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/arborette/arborette/internal/graph"
+	"github.com/arborette/arborette/internal/service"
 )
 
 // defaultSearchK is the similarity-search result count used when the request
@@ -53,7 +54,7 @@ type tripletDTO struct {
 func (s *Server) handleHeuristicSearch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	if q == "" {
-		writeErr(w, http.StatusBadRequest, "q is required")
+		service.WriteErr(w, http.StatusBadRequest, "q is required")
 		return
 	}
 	k := defaultSearchK
@@ -69,14 +70,14 @@ func (s *Server) handleHeuristicSearch(w http.ResponseWriter, r *http.Request) {
 	matches, err := s.heur.Query(r.Context(), q, k)
 	if err != nil {
 		log.Printf("orchestrator: heuristic search: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	out := make([]heuristicMatchDTO, 0, len(matches))
 	for _, m := range matches {
 		out = append(out, heuristicMatchDTO{ID: m.MetaHeuristic.ID, Definition: m.MetaHeuristic.Definition})
 	}
-	writeJSON(w, http.StatusOK, out)
+	service.WriteJSON(w, http.StatusOK, out)
 }
 
 // handleHeuristicTrace backs the trace view: it walks the causal chain behind a
@@ -85,14 +86,14 @@ func (s *Server) handleHeuristicTrace(w http.ResponseWriter, r *http.Request) {
 	triplets, err := s.heur.Trace(r.Context(), r.PathValue("id"))
 	if err != nil {
 		log.Printf("orchestrator: heuristic trace: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	out := make([]tripletDTO, 0, len(triplets))
 	for _, t := range triplets {
 		out = append(out, toTripletDTO(t))
 	}
-	writeJSON(w, http.StatusOK, out)
+	service.WriteJSON(w, http.StatusOK, out)
 }
 
 func toTripletDTO(t graph.CausalTriplet) tripletDTO {

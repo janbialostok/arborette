@@ -98,12 +98,17 @@ type SandboxConfig struct {
 // bounds a run whose goal opted into blocking epoch mode -- such a run waits on
 // human review at each queued node, so it needs a human-scale deadline rather
 // than the loop's own machine-scale one.
+//
+// InternalAuthToken is the shared secret guarding the internal write surfaces
+// this service exposes to the other services (a secret with no default; empty
+// disables the guard). SleepCycleConfig documents why both sides read one variable.
 type OrchestratorConfig struct {
 	Port                    string
 	SandboxURL              string
 	AnalystID               string
 	SleepCycleJobName       string
 	LocalImportDir          string
+	InternalAuthToken       string
 	HITLConfidenceThreshold float64
 	BlockingLoopTimeout     time.Duration
 }
@@ -135,15 +140,23 @@ type MCPConfig struct {
 // caps how many segments one run abstracts into Meta-Heuristics — it tunes the
 // publication stage rather than the search, which is why its env name carries no
 // SEARCH segment.
+//
+// InternalAuthToken is the shared secret this worker presents on its audit
+// writes, and it must be the same value the Orchestrator verifies -- which is why
+// both sides read one variable rather than two that have to be kept in step. On a
+// mismatch the Orchestrator answers 401 and the worker's audit path logs and
+// swallows every failure, so the run reports success while its whole audit trail
+// (including the terminal record carrying the run's winners) silently vanishes.
 type SleepCycleConfig struct {
-	SandboxURL      string
-	OrchestratorURL string
-	MaxMeasurements int
-	BeamWidth       int
-	MaxOrder        int
-	MinSupport      int
-	MinLift         float64
-	MaxPublications int
+	SandboxURL        string
+	OrchestratorURL   string
+	InternalAuthToken string
+	MaxMeasurements   int
+	BeamWidth         int
+	MaxOrder          int
+	MinSupport        int
+	MinLift           float64
+	MaxPublications   int
 }
 
 // LLMConfig selects the LLM provider and holds each provider's credentials.
@@ -271,6 +284,7 @@ func Load() (Config, error) {
 			AnalystID:               env("ARBORETTE_ANALYST_ID", "analyst-stub"),
 			SleepCycleJobName:       env("SLEEPCYCLE_JOB_NAME", "arborette-sleepcycle"),
 			LocalImportDir:          env("ARBORETTE_LOCAL_IMPORT_DIR", "/import"),
+			InternalAuthToken:       os.Getenv("INTERNAL_AUTH_TOKEN"),
 			HITLConfidenceThreshold: floatEnv("HITL_CONFIDENCE_THRESHOLD", 0.8),
 			BlockingLoopTimeout:     time.Duration(intEnv("HITL_BLOCKING_LOOP_TIMEOUT_MINUTES", 1440)) * time.Minute,
 		},
@@ -281,14 +295,15 @@ func Load() (Config, error) {
 			PublicURL:          os.Getenv("MCP_PUBLIC_URL"),
 		},
 		SleepCycle: SleepCycleConfig{
-			SandboxURL:      env("SANDBOX_URL", "http://sandbox:8081"),
-			OrchestratorURL: env("ORCHESTRATOR_URL", "http://orchestrator:8080"),
-			MaxMeasurements: intEnv("SLEEPCYCLE_SEARCH_MAX_MEASUREMENTS", 200),
-			BeamWidth:       intEnv("SLEEPCYCLE_SEARCH_BEAM_WIDTH", 10),
-			MaxOrder:        intEnv("SLEEPCYCLE_SEARCH_MAX_ORDER", 3),
-			MinSupport:      intEnv("SLEEPCYCLE_SEARCH_MIN_SUPPORT", 30),
-			MinLift:         floatEnv("SLEEPCYCLE_SEARCH_MIN_LIFT", 0.05),
-			MaxPublications: intEnv("SLEEPCYCLE_MAX_PUBLICATIONS", 20),
+			SandboxURL:        env("SANDBOX_URL", "http://sandbox:8081"),
+			OrchestratorURL:   env("ORCHESTRATOR_URL", "http://orchestrator:8080"),
+			InternalAuthToken: os.Getenv("INTERNAL_AUTH_TOKEN"),
+			MaxMeasurements:   intEnv("SLEEPCYCLE_SEARCH_MAX_MEASUREMENTS", 200),
+			BeamWidth:         intEnv("SLEEPCYCLE_SEARCH_BEAM_WIDTH", 10),
+			MaxOrder:          intEnv("SLEEPCYCLE_SEARCH_MAX_ORDER", 3),
+			MinSupport:        intEnv("SLEEPCYCLE_SEARCH_MIN_SUPPORT", 30),
+			MinLift:           floatEnv("SLEEPCYCLE_SEARCH_MIN_LIFT", 0.05),
+			MaxPublications:   intEnv("SLEEPCYCLE_MAX_PUBLICATIONS", 20),
 		},
 		LLM: LLMConfig{
 			Provider: env("LLM_PROVIDER", "anthropic"),

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/arborette/arborette/internal/domain"
+	"github.com/arborette/arborette/internal/service"
 )
 
 // defaultSandboxTimeout bounds a single sandbox call so a background caller
@@ -192,7 +193,7 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 	if err != nil {
 		return fmt.Errorf("call sandbox %s: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer service.DrainAndClose(resp)
 	if resp.StatusCode != http.StatusOK {
 		message := fmt.Sprintf("sandbox %s returned status %d", path, resp.StatusCode)
 		var body struct {

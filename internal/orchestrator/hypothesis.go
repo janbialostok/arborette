@@ -17,6 +17,7 @@ import (
 	"github.com/arborette/arborette/internal/llm"
 	"github.com/arborette/arborette/internal/objective"
 	"github.com/arborette/arborette/internal/sandboxclient"
+	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -64,7 +65,7 @@ func (s *Server) handleTriggerLoop(w http.ResponseWriter, r *http.Request) {
 	runID := uuid.NewString()
 	if err := s.runs.Create(r.Context(), runID, goal.OptimizationFunctionID); err != nil {
 		log.Printf("orchestrator: create run for %q: %v", goal.OptimizationFunctionID, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	timeout := s.loopTimeoutFor(goal)
@@ -73,7 +74,7 @@ func (s *Server) handleTriggerLoop(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		s.runLoop(ctx, goal, runID)
 	}()
-	writeJSON(w, http.StatusAccepted, map[string]any{"optimization_function_id": goal.OptimizationFunctionID})
+	service.WriteJSON(w, http.StatusAccepted, map[string]any{"optimization_function_id": goal.OptimizationFunctionID})
 }
 
 // loopTimeoutFor bounds a run. A blocking-mode run waits on human review at

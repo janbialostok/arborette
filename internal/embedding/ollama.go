@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+
+	"github.com/arborette/arborette/internal/service"
 )
 
 // nomic-embed-text task-instruction prefixes. Ollama does not apply them
@@ -72,7 +74,7 @@ func (p *OllamaProvider) embed(ctx context.Context, prompt string) ([]float32, e
 	if err != nil {
 		return nil, fmt.Errorf("call ollama: %w", err)
 	}
-	defer resp.Body.Close()
+	defer service.DrainAndClose(resp)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("ollama returned status %d", resp.StatusCode)
 	}
