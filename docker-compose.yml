@@ -38,7 +38,10 @@ services:
       start_period: 30s
 
   postgres:
-    image: pgvector/pgvector:pg16
+    # Pinned to a >= 0.8.0 tag: goal-scoped retrieval sets hnsw.iterative_scan,
+    # which pgvector added in 0.8.0. ValidateVectorExtensionVersion fails startup
+    # against an older extension.
+    image: pgvector/pgvector:0.8.1-pg16
     environment:
       POSTGRES_USER: ${POSTGRES_OWNER_USER}
       POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD}

@@ -44,6 +44,12 @@ func main() {
 	if err := store.ValidateEmbeddingDimension(ctx, pool, cfg.Embedding.Dimension); err != nil {
 		log.Fatalf("orchestrator: %v", err)
 	}
+	if err := store.ValidateDistanceFloor(cfg.Embedding.DistanceFloor); err != nil {
+		log.Fatalf("orchestrator: %v", err)
+	}
+	if err := store.ValidateVectorExtensionVersion(ctx, pool); err != nil {
+		log.Fatalf("orchestrator: %v", err)
+	}
 
 	objects, err := objectstore.NewClient(ctx, cfg.S3.Endpoint, cfg.S3.Region, cfg.S3.Bucket, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.PathStyle)
 	if err != nil {
@@ -58,7 +64,7 @@ func main() {
 	runs := store.NewRuns(pool)
 	queue := store.NewVerificationQueue(pool)
 	audits := store.NewAuditLog(pool)
-	embeddings := store.NewEmbeddingStore(pool)
+	embeddings := store.NewEmbeddingStore(pool, cfg.Embedding.DistanceFloor)
 	heur := heuristics.NewService(provider, embeddings, repo)
 	claude, err := llm.NewClient(cfg.LLM)
 	if err != nil {

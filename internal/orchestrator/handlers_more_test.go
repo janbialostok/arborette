@@ -241,6 +241,29 @@ func TestHeuristicSearchKClamping(t *testing.T) {
 	}
 }
 
+func TestHeuristicSearchScope(t *testing.T) {
+	t.Run("cross-goal when goal_id absent", func(t *testing.T) {
+		heur := &fakeHeur{}
+		srv := newTestServer(&fakeGoals{}, &fakeAudits{}, &fakeObjects{}, heur, &fakeClaude{}, &fakeSandbox{})
+		if rec := serve(srv, http.MethodGet, "/heuristics/search?q=x", "", ""); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if !heur.gotScope.CrossGoal || heur.gotScope.GoalID != "" {
+			t.Fatalf("scope = %+v, want cross-goal when goal_id is omitted", heur.gotScope)
+		}
+	})
+	t.Run("goal-scoped when goal_id present", func(t *testing.T) {
+		heur := &fakeHeur{}
+		srv := newTestServer(&fakeGoals{}, &fakeAudits{}, &fakeObjects{}, heur, &fakeClaude{}, &fakeSandbox{})
+		if rec := serve(srv, http.MethodGet, "/heuristics/search?q=x&goal_id=goal-7", "", ""); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if heur.gotScope.CrossGoal || heur.gotScope.GoalID != "goal-7" {
+			t.Fatalf("scope = %+v, want goal-scoped to goal-7", heur.gotScope)
+		}
+	})
+}
+
 func TestHeuristicHandlersErrorPaths(t *testing.T) {
 	searchErr := &fakeHeur{queryErr: errors.New("vector store down")}
 	srv := newTestServer(&fakeGoals{}, &fakeAudits{}, &fakeObjects{}, searchErr, &fakeClaude{}, &fakeSandbox{})

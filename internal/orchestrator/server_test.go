@@ -271,10 +271,12 @@ type fakeHeur struct {
 	queryErr error
 	traceErr error
 	gotK     int
+	gotScope store.SearchScope
 }
 
-func (f *fakeHeur) Query(_ context.Context, _ string, k int) ([]heuristics.Match, error) {
+func (f *fakeHeur) Query(_ context.Context, _ string, k int, scope store.SearchScope) ([]heuristics.Match, error) {
 	f.gotK = k
+	f.gotScope = scope
 	return f.matches, f.queryErr
 }
 func (f *fakeHeur) Trace(_ context.Context, _ string) ([]graph.CausalTriplet, error) {

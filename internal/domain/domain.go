@@ -127,10 +127,14 @@ type Outcome struct {
 // MetaHeuristic is a semantic abstraction produced during the Sleep Cycle. Its
 // embedding lives in pgvector keyed by ID; EmbeddingPending is true from node
 // creation until the pgvector write succeeds. Stale marks a heuristic whose
-// supporting evidence was since rejected by an analyst.
+// supporting evidence was since rejected by an analyst. GoalID is the
+// optimization function whose abstraction run wrote it, scoping the node's
+// embedding to that goal; a legacy node created before goal scoping carries an
+// empty GoalID until a later run relinks it.
 type MetaHeuristic struct {
 	ID               string
 	Definition       string
+	GoalID           string
 	EmbeddingPending bool
 	Stale            bool
 }

@@ -67,7 +67,7 @@ func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objec
 		// CreateMetaHeuristic MERGEs the node and each edge and leaves
 		// embedding_pending alone, so re-issuing it adds what is missing without
 		// disturbing a finished abstraction.
-		relinkErr := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: mhID, Definition: existing.Definition}, cand.abstractedFrom)
+		relinkErr := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: mhID, Definition: existing.Definition, GoalID: target.goalID}, cand.abstractedFrom)
 		if !existing.EmbeddingPending {
 			// The heuristic is written and embedded, so it is reachable to a consumer
 			// whether or not this run managed to widen its evidence. Reporting it as
@@ -102,7 +102,7 @@ func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objec
 		return err
 	}
 
-	if err := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: mhID, Definition: abstraction.Definition}, cand.abstractedFrom); err != nil {
+	if err := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: mhID, Definition: abstraction.Definition, GoalID: target.goalID}, cand.abstractedFrom); err != nil {
 		return fmt.Errorf("create meta-heuristic %q: %w", mhID, err)
 	}
 	return w.embed(ctx, target.goalID, mhID, abstraction.Definition, cand.abstractedFrom)
@@ -162,16 +162,16 @@ func (w *Worker) embed(ctx context.Context, goalID, mhID, definition string, abs
 	if err != nil {
 		return fmt.Errorf("embed meta-heuristic %q: %w", mhID, err)
 	}
-	if err := w.embeddings.Upsert(ctx, mhID, vec); err != nil {
+	if err := w.embeddings.Upsert(ctx, mhID, goalID, vec); err != nil {
 		return fmt.Errorf("upsert embedding %q: %w", mhID, err)
 	}
 	if err := w.repo.ClearEmbeddingPending(ctx, mhID); err != nil {
 		return fmt.Errorf("clear embedding_pending %q: %w", mhID, err)
 	}
-	// The resume pass settles nodes from any goal, so it has no goal to name here.
-	// Record that as nil rather than "": an empty string is a valid-looking id, and
-	// a consumer grouping injections by goal would file resumed ones under a
-	// phantom goal instead of skipping them.
+	// A goal-less caller (a reconcile re-embed of a legacy node the graph never
+	// scoped) names no goal here. Record that as nil rather than "": an empty
+	// string is a valid-looking id, and a consumer grouping injections by goal
+	// would file such a node under a phantom goal instead of skipping it.
 	detail := map[string]any{
 		"optimization_function_id": nil,
 		"meta_heuristic_id":        mhID,
@@ -184,35 +184,76 @@ func (w *Worker) embed(ctx context.Context, goalID, mhID, definition string, abs
 	return nil
 }
 
-// resumeEmbeddings re-runs the embed tail for every Meta-Heuristic still flagged
-// pending, so a node left behind by a mid-write crash is finished rather than
-// silently unsearchable.
+// reconcileEmbeddings settles the graph and pgvector back into agreement, so a
+// node left behind by a mid-write crash is finished and a legacy row that lost
+// its goal scope is repaired, rather than either staying silently unsearchable
+// or invisible to goal-scoped retrieval.
 //
-// The listing is global by design, not goal-scoped: any crashed run should be
-// settled by the next run whichever goal triggered it. That makes this pass
+// It diffs every Meta-Heuristic node against every embedding row and walks the
+// graph refs with three arms per node: re-embed when the row is missing or the
+// node is still flagged pending (the crash case), passing the node's goal so the
+// healed row is goal-visible; goal-repair via SetGoalID when the row exists but
+// lost the goal the graph node now carries; nothing otherwise.
+//
+// The pass is global by design, not goal-scoped: any crashed or legacy node
+// should be settled by the next run whichever goal triggered it. That makes it
 // non-terminal — a wedged embedding provider here must not abort a run for a goal
 // it has nothing to do with — and means the audits it emits can reference a
 // different goal than the run's own.
-func (w *Worker) resumeEmbeddings(ctx context.Context) {
-	pending, err := w.repo.ListEmbeddingPending(ctx)
+func (w *Worker) reconcileEmbeddings(ctx context.Context) {
+	nodes, err := w.repo.ListMetaHeuristics(ctx)
 	if err != nil {
-		w.resumeFailure(ctx, "", err)
+		w.reconcileFailure(ctx, "", err)
 		return
 	}
-	for _, mh := range pending {
-		if err := w.embed(ctx, "", mh.ID, mh.Definition, nil); err != nil {
-			w.resumeFailure(ctx, mh.ID, err)
+	refs, err := w.embeddings.ListNodeRefs(ctx)
+	if err != nil {
+		w.reconcileFailure(ctx, "", err)
+		return
+	}
+	rowGoal := make(map[string]string, len(refs))
+	for _, ref := range refs {
+		rowGoal[ref.NodeID] = ref.GoalID
+	}
+
+	var reembedded, repaired []string
+	for _, mh := range nodes {
+		goalID, hasRow := rowGoal[mh.ID]
+		switch {
+		case !hasRow || mh.EmbeddingPending:
+			if err := w.embed(ctx, mh.GoalID, mh.ID, mh.Definition, nil); err != nil {
+				w.reconcileFailure(ctx, mh.ID, err)
+				continue
+			}
+			reembedded = append(reembedded, mh.ID)
+		case mh.GoalID != "" && goalID == "":
+			if err := w.embeddings.SetGoalID(ctx, mh.ID, mh.GoalID); err != nil {
+				w.reconcileFailure(ctx, mh.ID, err)
+				continue
+			}
+			repaired = append(repaired, mh.ID)
 		}
+	}
+
+	// One summary event when the pass actually changed something: the embedding
+	// drift this pass exists to close (rows re-embedded, legacy rows made
+	// goal-visible) is exactly what an operator needs recorded.
+	if len(reembedded) > 0 || len(repaired) > 0 {
+		w.report(ctx, "sleepcycle_reconcile", "job", map[string]any{
+			"optimization_function_id": nil,
+			"reembedded":               reembedded,
+			"goal_repaired":            repaired,
+		})
 	}
 }
 
-func (w *Worker) resumeFailure(ctx context.Context, mhID string, err error) {
-	log.Printf("sleepcycle: resume embedding %q: %v", mhID, err)
+func (w *Worker) reconcileFailure(ctx context.Context, mhID string, err error) {
+	log.Printf("sleepcycle: reconcile embedding %q: %v", mhID, err)
 	// Both ids are nil rather than "": an empty string is a valid-looking id, the
-	// resume pass names no goal, and a failure listing the set names no node.
+	// reconcile pass names no goal, and a failure listing the set names no node.
 	detail := map[string]any{"optimization_function_id": nil, "meta_heuristic_id": nil, "error": err.Error()}
 	if mhID != "" {
 		detail["meta_heuristic_id"] = mhID
 	}
-	w.report(ctx, "sleepcycle_resume_failure", "failure", detail)
+	w.report(ctx, "sleepcycle_reconcile_failure", "failure", detail)
 }

@@ -317,15 +317,23 @@ func (r *Neo4jRepository) CreateMetaHeuristic(ctx context.Context, mh domain.Met
 		// node rather than fail the uniqueness constraint. ON MATCH deliberately
 		// leaves embedding_pending alone -- resurrecting a cleared flag would make a
 		// finished abstraction look unprocessed and re-embed it forever.
+		//
+		// goal_id is set on create unconditionally, but the match-side heal is a
+		// standalone FOREACH rather than an ON MATCH SET item: FOREACH cannot be
+		// embedded in ON MATCH SET (which takes only set-items), and it must run once
+		// before the per-edge UNWIND, not per edge. Guarding it on a non-empty goalID
+		// is what lets a legacy node heal on re-abstraction while a goal-less caller
+		// can never re-blank a node that already carries a goal.
 		result, err := tx.Run(ctx,
 			"MERGE (m:"+labelMetaHeuristic+" {id: $id}) "+
-				"ON CREATE SET m.definition = $definition, m.embedding_pending = true "+
+				"ON CREATE SET m.definition = $definition, m.embedding_pending = true, m.goal_id = $goalID "+
 				"ON MATCH SET m.definition = $definition "+
+				"FOREACH (_ IN CASE WHEN $goalID <> '' THEN [1] ELSE [] END | SET m.goal_id = $goalID) "+
 				"WITH m UNWIND $ids AS targetId "+
 				"MATCH (t {id: targetId}) "+
 				"MERGE (m)-[:"+domain.AbstractedFrom+"]->(t) "+
 				"RETURN count(*) AS edges",
-			map[string]any{"id": mh.ID, "definition": mh.Definition, "ids": abstractedFrom},
+			map[string]any{"id": mh.ID, "definition": mh.Definition, "goalID": mh.GoalID, "ids": abstractedFrom},
 		)
 		if err != nil {
 			return nil, err
@@ -347,13 +355,16 @@ func (r *Neo4jRepository) ClearEmbeddingPending(ctx context.Context, id string) 
 	})
 }
 
-// ListEmbeddingPending surfaces Meta-Heuristics still awaiting their pgvector
-// write, including any left flagged by a mid-write crash, so a later run retries
-// them.
-func (r *Neo4jRepository) ListEmbeddingPending(ctx context.Context) ([]domain.MetaHeuristic, error) {
+// ListMetaHeuristics returns every Meta-Heuristic node, the graph side of the
+// reconcile diff. It does not filter on the embedding-pending flag: reconcile
+// needs the whole set so it can find both nodes whose embedding row is entirely
+// missing and nodes whose row exists but lost its goal scope. Each node carries
+// its EmbeddingPending flag, so a caller wanting only the crash-left-behind
+// subset filters the result itself.
+func (r *Neo4jRepository) ListMetaHeuristics(ctx context.Context) ([]domain.MetaHeuristic, error) {
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,
-			"MATCH (m:"+labelMetaHeuristic+" {embedding_pending: true}) RETURN m",
+			"MATCH (m:"+labelMetaHeuristic+") RETURN m",
 			nil,
 		)
 		if err != nil {
@@ -374,7 +385,7 @@ func (r *Neo4jRepository) ListEmbeddingPending(ctx context.Context) ([]domain.Me
 		return out, nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list embedding-pending meta-heuristics: %w", err)
+		return nil, fmt.Errorf("list meta-heuristics: %w", err)
 	}
 	return res.([]domain.MetaHeuristic), nil
 }
@@ -693,6 +704,7 @@ func metaHeuristicFromNode(node neo4j.Node) domain.MetaHeuristic {
 	return domain.MetaHeuristic{
 		ID:               stringProp(node.Props["id"]),
 		Definition:       def,
+		GoalID:           stringProp(node.Props["goal_id"]),
 		EmbeddingPending: pending,
 		Stale:            stale,
 	}

@@ -3,19 +3,38 @@ package store
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/pgvector/pgvector-go"
 )
 
 // EmbeddingStore upserts and searches Meta-Heuristic embeddings keyed by the
 // application-assigned node UUID (the same id the graph keys on).
 type EmbeddingStore struct {
-	pool *Pool
+	pool          *Pool
+	distanceFloor float64
 }
 
-// NewEmbeddingStore wires the store to a pool.
-func NewEmbeddingStore(pool *Pool) *EmbeddingStore {
-	return &EmbeddingStore{pool: pool}
+// NewEmbeddingStore wires the store to a pool. distanceFloor is the cosine
+// distance beyond which a similarity hit is dropped rather than returned; a
+// query far from the whole corpus returns empty instead of the corpus ranked by
+// how distant it is. Validate it at startup with ValidateDistanceFloor so a bad
+// env value fails once at boot rather than on every search.
+func NewEmbeddingStore(pool *Pool, distanceFloor float64) *EmbeddingStore {
+	return &EmbeddingStore{pool: pool, distanceFloor: distanceFloor}
+}
+
+// ValidateDistanceFloor rejects a floor outside the cosine-distance range
+// (0, 2]. It is a standalone check called from each cmd startup beside
+// ValidateEmbeddingDimension rather than an error return on the constructor, so
+// the constructor signature stays mechanical.
+func ValidateDistanceFloor(floor float64) error {
+	if floor <= 0 || floor > 2 {
+		return fmt.Errorf("embedding distance floor must be in (0, 2] (cosine distance), got %v", floor)
+	}
+	return nil
 }
 
 // ValidateEmbeddingDimension fails fast at startup when the configured embedding
@@ -42,17 +61,95 @@ func ValidateEmbeddingDimension(ctx context.Context, pool *Pool, expected int) e
 	return nil
 }
 
-// Upsert writes (or replaces) the embedding for a node.
-func (e *EmbeddingStore) Upsert(ctx context.Context, nodeID string, embedding []float32) error {
+// minVectorMajor and minVectorMinor are the lowest pgvector version whose
+// hnsw.iterative_scan the goal-scoped search relies on to keep scanning past
+// filtered-out candidates. It landed in 0.8.0.
+const (
+	minVectorMajor = 0
+	minVectorMinor = 8
+)
+
+// ValidateVectorExtensionVersion fails fast at startup when the installed
+// pgvector is older than the version whose hnsw.iterative_scan the goal/floor
+// post-filters depend on, so a stale image surfaces as one clear boot error
+// instead of every scoped search silently under-returning at runtime.
+//
+// The compare is on major.minor parsed as integers, never lexical: "0.10.0"
+// sorts before "0.9.0" as strings, which would reject a version that in fact
+// satisfies the floor.
+func ValidateVectorExtensionVersion(ctx context.Context, pool *Pool) error {
+	var version string
+	err := pool.QueryRow(ctx,
+		"SELECT extversion FROM pg_extension WHERE extname = 'vector'",
+	).Scan(&version)
+	if err != nil {
+		return fmt.Errorf("read pgvector extension version: %w", err)
+	}
+	return checkVectorVersion(version)
+}
+
+// checkVectorVersion is the pure comparison behind ValidateVectorExtensionVersion,
+// split out so the integer major.minor logic is unit-testable without a database.
+func checkVectorVersion(version string) error {
+	major, minor, err := parseMajorMinor(version)
+	if err != nil {
+		return fmt.Errorf("parse pgvector extension version %q: %w", version, err)
+	}
+	if major < minVectorMajor || (major == minVectorMajor && minor < minVectorMinor) {
+		return fmt.Errorf(
+			"pgvector %s is too old: goal-scoped retrieval needs hnsw.iterative_scan, added in %d.%d.0; "+
+				"pin the image to a %d.%d.0-or-newer tag",
+			version, minVectorMajor, minVectorMinor, minVectorMajor, minVectorMinor,
+		)
+	}
+	return nil
+}
+
+// parseMajorMinor splits a "major.minor[.patch]" version into its integer major
+// and minor components. It ignores any patch/suffix beyond the minor.
+func parseMajorMinor(version string) (int, int, error) {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, fmt.Errorf("expected major.minor, got %q", version)
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("major: %w", err)
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("minor: %w", err)
+	}
+	return major, minor, nil
+}
+
+// Upsert writes (or replaces) the embedding for a node under a goal. An empty
+// goalID writes SQL NULL, mirroring the graph's nil-vs-"" discipline: a
+// goal-less caller (the reconcile/resume of a legacy node) records no goal
+// rather than a phantom one. The ON CONFLICT clause COALESCEs the incoming
+// goal_id over the stored one, so a re-embed under a known goal repairs a NULL
+// row while a goal-less re-embed can never re-blank a populated one.
+func (e *EmbeddingStore) Upsert(ctx context.Context, nodeID, goalID string, embedding []float32) error {
 	_, err := e.pool.Exec(ctx,
-		"INSERT INTO meta_heuristic_embeddings (node_id, embedding, updated_at) VALUES ($1, $2, now()) "+
-			"ON CONFLICT (node_id) DO UPDATE SET embedding = EXCLUDED.embedding, updated_at = now()",
-		nodeID, pgvector.NewVector(embedding),
+		"INSERT INTO meta_heuristic_embeddings (node_id, goal_id, embedding, updated_at) VALUES ($1, $2, $3, now()) "+
+			"ON CONFLICT (node_id) DO UPDATE SET embedding = EXCLUDED.embedding, "+
+			"goal_id = COALESCE(EXCLUDED.goal_id, meta_heuristic_embeddings.goal_id), updated_at = now()",
+		nodeID, nullableUUID(goalID), pgvector.NewVector(embedding),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert embedding for %q: %w", nodeID, err)
 	}
 	return nil
+}
+
+// nullableUUID converts an empty id to a nil parameter so pgx writes SQL NULL:
+// binding a Go "" against a uuid column fails at bind time, so an empty id must
+// never reach the driver as a string.
+func nullableUUID(id string) any {
+	if id == "" {
+		return nil
+	}
+	return id
 }
 
 // Delete removes the embedding for a node. Deleting a node_id that is not
@@ -66,13 +163,88 @@ func (e *EmbeddingStore) Delete(ctx context.Context, nodeID string) error {
 	return nil
 }
 
-// SimilaritySearch returns the k nearest node_ids to the query vector by cosine
-// distance (the <=> operator, matching the hnsw vector_cosine_ops index).
-func (e *EmbeddingStore) SimilaritySearch(ctx context.Context, query []float32, k int) ([]string, error) {
-	rows, err := e.pool.Query(ctx,
-		"SELECT node_id FROM meta_heuristic_embeddings ORDER BY embedding <=> $1 LIMIT $2",
-		pgvector.NewVector(query), k,
-	)
+// SearchScope selects a SimilaritySearch's visibility. Exactly one mode is set:
+// a goal-scoped search (GoalID non-empty) returns only that goal's rows; a
+// cross-goal search (CrossGoal true) returns every row including the NULL-goal
+// legacy corpus. Setting both or neither is a caller error, not a silent default
+// -- the browsing surface picks cross-goal deliberately, and grounding picks a
+// goal deliberately, so neither should fall through to the other.
+type SearchScope struct {
+	GoalID    string
+	CrossGoal bool
+}
+
+// ScopeFromGoalID is the boundary translation an external caller uses: a
+// non-empty goal narrows the search to that goal, an empty one browses the whole
+// corpus cross-goal. It is the single place the "absent goal means cross-goal"
+// policy lives, so the orchestrator and MCP surfaces cannot drift on it -- which
+// is why it also trims here: a whitespace-only goal_id from either surface must
+// map to cross-goal identically, not to a whitespace goal that fails the uuid
+// bind on one surface and browses on the other.
+func ScopeFromGoalID(goalID string) SearchScope {
+	if strings.TrimSpace(goalID) == "" {
+		return SearchScope{CrossGoal: true}
+	}
+	return SearchScope{GoalID: strings.TrimSpace(goalID)}
+}
+
+func (s SearchScope) validate() error {
+	switch {
+	case s.CrossGoal && s.GoalID != "":
+		return fmt.Errorf("search scope has both a goal and cross-goal set; exactly one mode is allowed")
+	case !s.CrossGoal && s.GoalID == "":
+		return fmt.Errorf("search scope has neither a goal nor cross-goal set; exactly one mode is required")
+	}
+	return nil
+}
+
+// SimilaritySearch returns up to the k nearest node_ids to the query vector by
+// cosine distance (the <=> operator, matching the hnsw vector_cosine_ops index),
+// filtered by the scope and the store's distance floor.
+//
+// The scope's goal predicate and the floor are applied as post-filters over the
+// hnsw candidate neighbourhood, so a goal-scoped query over a corpus dominated
+// by other goals could return fewer than k rows unless the scan continues past
+// filtered-out candidates. The search therefore runs inside a transaction that
+// first sets hnsw.iterative_scan = relaxed_order (added in pgvector 0.8.0, which
+// ValidateVectorExtensionVersion pins at startup). The result is min(k, all rows
+// of that scope within the floor) up to hnsw.max_scan_tuples (default 20000
+// tuples scanned) -- exhaustive at expected corpus scale; revisit that GUC with
+// the floor calibration if the corpus ever approaches the bound.
+func (e *EmbeddingStore) SimilaritySearch(ctx context.Context, query []float32, k int, scope SearchScope) ([]string, error) {
+	if err := scope.validate(); err != nil {
+		return nil, err
+	}
+
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("similarity search: begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SET LOCAL hnsw.iterative_scan = relaxed_order"); err != nil {
+		return nil, fmt.Errorf("similarity search: enable iterative scan: %w", err)
+	}
+
+	vec := pgvector.NewVector(query)
+	var rows pgx.Rows
+	// The goal_id column is uuid, so a goal-scoped mode binds the id and adds the
+	// predicate while cross-goal mode omits it entirely: binding a Go "" against a
+	// uuid parameter fails at bind time regardless of a runtime OR short-circuit,
+	// so the two modes cannot share one OR-ed clause.
+	if scope.CrossGoal {
+		rows, err = tx.Query(ctx,
+			"SELECT node_id FROM meta_heuristic_embeddings WHERE (embedding <=> $1) <= $2 "+
+				"ORDER BY embedding <=> $1 LIMIT $3",
+			vec, e.distanceFloor, k,
+		)
+	} else {
+		rows, err = tx.Query(ctx,
+			"SELECT node_id FROM meta_heuristic_embeddings WHERE (embedding <=> $1) <= $2 AND goal_id = $3 "+
+				"ORDER BY embedding <=> $1 LIMIT $4",
+			vec, e.distanceFloor, scope.GoalID, k,
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("similarity search: %w", err)
 	}
@@ -89,5 +261,58 @@ func (e *EmbeddingStore) SimilaritySearch(ctx context.Context, query []float32, 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate similarity rows: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("similarity search: commit: %w", err)
+	}
 	return ids, nil
+}
+
+// NodeRef is one embedding row's identity and goal scope, the reconcile pass's
+// view of the pgvector side.
+type NodeRef struct {
+	NodeID string
+	GoalID string
+}
+
+// ListNodeRefs returns every embedding row's node_id and goal_id, so the
+// reconcile pass can diff the pgvector side against the graph. The COALESCE is
+// load-bearing: pgx errors scanning a SQL NULL into a plain string, and one
+// legacy NULL-goal row -- exactly the population the goal-repair arm exists to
+// heal -- would otherwise abort the whole scan.
+func (e *EmbeddingStore) ListNodeRefs(ctx context.Context) ([]NodeRef, error) {
+	rows, err := e.pool.Query(ctx,
+		"SELECT node_id, COALESCE(goal_id::text, '') FROM meta_heuristic_embeddings",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list node refs: %w", err)
+	}
+	defer rows.Close()
+
+	var refs []NodeRef
+	for rows.Next() {
+		var ref NodeRef
+		if err := rows.Scan(&ref.NodeID, &ref.GoalID); err != nil {
+			return nil, fmt.Errorf("scan node ref: %w", err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate node refs: %w", err)
+	}
+	return refs, nil
+}
+
+// SetGoalID repairs a NULL-goal row's scope without re-embedding: the vector is
+// unchanged, only the provenance the earlier write could not recover. It touches
+// only a row whose goal_id is still NULL, so a populated scope is never
+// overwritten.
+func (e *EmbeddingStore) SetGoalID(ctx context.Context, nodeID, goalID string) error {
+	_, err := e.pool.Exec(ctx,
+		"UPDATE meta_heuristic_embeddings SET goal_id = $2 WHERE node_id = $1 AND goal_id IS NULL",
+		nodeID, nullableUUID(goalID),
+	)
+	if err != nil {
+		return fmt.Errorf("set goal_id for %q: %w", nodeID, err)
+	}
+	return nil
 }

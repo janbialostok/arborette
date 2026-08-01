@@ -107,6 +107,16 @@ func wireWorker(ctx context.Context, cfg config.Config) (*sleepcycle.Worker, fun
 		repo.Close(ctx)
 		return nil, nil, err
 	}
+	if err := store.ValidateDistanceFloor(cfg.Embedding.DistanceFloor); err != nil {
+		pool.Close()
+		repo.Close(ctx)
+		return nil, nil, err
+	}
+	if err := store.ValidateVectorExtensionVersion(ctx, pool); err != nil {
+		pool.Close()
+		repo.Close(ctx)
+		return nil, nil, err
+	}
 	cleanup := func() {
 		pool.Close()
 		repo.Close(ctx)
@@ -123,7 +133,7 @@ func wireWorker(ctx context.Context, cfg config.Config) (*sleepcycle.Worker, fun
 		sandboxclient.NewClient(cfg.SleepCycle.SandboxURL, cfg.SleepCycle.InternalAuthToken, nil),
 		claude,
 		provider,
-		store.NewEmbeddingStore(pool),
+		store.NewEmbeddingStore(pool, cfg.Embedding.DistanceFloor),
 		store.NewGoalRegistry(pool),
 		orchestratorclient.NewClient(cfg.SleepCycle.OrchestratorURL,
 			cfg.SleepCycle.InternalAuthToken, nil),

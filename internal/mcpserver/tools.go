@@ -17,6 +17,7 @@ import (
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/heuristics"
 	"github.com/arborette/arborette/internal/orchestratorclient"
+	"github.com/arborette/arborette/internal/store"
 )
 
 // The registered tool names, exported because the chat connector's allowlist is
@@ -41,7 +42,7 @@ const (
 // satisfies goalSubmitter.
 
 type heuristicsQuerier interface {
-	Query(ctx context.Context, stateString string, k int) ([]heuristics.Match, error)
+	Query(ctx context.Context, stateString string, k int, scope store.SearchScope) ([]heuristics.Match, error)
 	Trace(ctx context.Context, metaHeuristicID string) ([]graph.CausalTriplet, error)
 }
 
@@ -90,6 +91,7 @@ type tripletDTO struct {
 type getOptimizedHeuristicsInput struct {
 	OperationalState string `json:"operational_state" jsonschema:"the operational-state description to find optimized heuristics for"`
 	K                int    `json:"k,omitempty" jsonschema:"maximum number of heuristics to return (clamped to a server maximum)"`
+	GoalID           string `json:"goal_id,omitempty" jsonschema:"optional optimization function id to scope the search to one goal's heuristics; omit to search all accumulated heuristics"`
 }
 
 type getOptimizedHeuristicsOutput struct {
@@ -160,7 +162,13 @@ func (t *tools) getOptimizedHeuristics(ctx context.Context, _ *mcp.CallToolReque
 		k = maxSearchK
 	}
 
-	matches, err := t.heur.Query(ctx, state, k)
+	// Absent goal_id searches the whole accumulated corpus (including NULL-goal
+	// legacy rows); a present one scopes to that goal's heuristics. ScopeFromGoalID
+	// trims, so a whitespace-only id maps to cross-goal identically here and at the
+	// orchestrator surface.
+	scope := store.ScopeFromGoalID(in.GoalID)
+
+	matches, err := t.heur.Query(ctx, state, k, scope)
 	if err != nil {
 		log.Printf("mcpserver: get_optimized_heuristics: %v", err)
 		return nil, getOptimizedHeuristicsOutput{}, errors.New("internal error")

@@ -183,23 +183,23 @@ func TestDocumentGoalIsRejected(t *testing.T) {
 	}
 }
 
-// TestSweepAndResumeFailuresAreNonTerminal: neither is a prerequisite for
-// producing valid macro-segments, and the resume pass may concern another goal
+// TestSweepAndReconcileFailuresAreNonTerminal: neither is a prerequisite for
+// producing valid macro-segments, and the reconcile pass may concern another goal
 // entirely, so a fault in either must not sink the run.
-func TestSweepAndResumeFailuresAreNonTerminal(t *testing.T) {
+func TestSweepAndReconcileFailuresAreNonTerminal(t *testing.T) {
 	h := newHarness(t, testConfig())
 	h.repo.findings = findingsFor("a", "b")
 	h.repo.staleErr = errors.New("neo4j hiccup")
-	h.repo.pendingErr = errors.New("neo4j hiccup")
+	h.repo.metaHeuristicsErr = errors.New("neo4j hiccup")
 	h.sandbox.defaultValue = 1.0
 
 	if err := h.run(t); err != nil {
-		t.Fatalf("sweep and resume failures must be non-terminal, got %v", err)
+		t.Fatalf("sweep and reconcile failures must be non-terminal, got %v", err)
 	}
 	if _, ok := h.audits.find("sleepcycle_staleness_sweep_failure"); !ok {
 		t.Fatalf("expected a staleness-sweep failure audit: %+v", h.audits.records)
 	}
-	if _, ok := h.audits.find("sleepcycle_resume_failure"); !ok {
-		t.Fatalf("expected a resume failure audit: %+v", h.audits.records)
+	if _, ok := h.audits.find("sleepcycle_reconcile_failure"); !ok {
+		t.Fatalf("expected a reconcile failure audit: %+v", h.audits.records)
 	}
 }

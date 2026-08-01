@@ -35,7 +35,7 @@ func TestQueryAndTrace(t *testing.T) {
 		t.Fatalf("open pool: %v", err)
 	}
 	t.Cleanup(p.Close)
-	embeddings := store.NewEmbeddingStore(p)
+	embeddings := store.NewEmbeddingStore(p, cfg.Embedding.DistanceFloor)
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
 
 	// Seed a full triplet and a Meta-Heuristic abstracted from the intervention.
@@ -55,7 +55,7 @@ func TestQueryAndTrace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("embed document: %v", err)
 	}
-	if err := embeddings.Upsert(ctx, mhID, docVec); err != nil {
+	if err := embeddings.Upsert(ctx, mhID, "", docVec); err != nil {
 		t.Fatalf("upsert embedding: %v", err)
 	}
 	if err := repo.ClearEmbeddingPending(ctx, mhID); err != nil {
@@ -64,7 +64,7 @@ func TestQueryAndTrace(t *testing.T) {
 
 	svc := heuristics.NewService(provider, embeddings, repo)
 
-	matches, err := svc.Query(ctx, "latency climbing above the threshold", 1)
+	matches, err := svc.Query(ctx, "latency climbing above the threshold", 1, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -128,7 +128,7 @@ type fakeEmbeddings struct {
 	deleteErrFor map[string]error
 }
 
-func (f *fakeEmbeddings) SimilaritySearch(ctx context.Context, _ []float32, _ int) ([]string, error) {
+func (f *fakeEmbeddings) SimilaritySearch(ctx context.Context, _ []float32, _ int, _ store.SearchScope) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -203,7 +203,7 @@ func TestQuerySkipsAndRetiresOrphanedEmbedding(t *testing.T) {
 	}}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	matches, err := svc.Query(context.Background(), "any state", 3)
+	matches, err := svc.Query(context.Background(), "any state", 3, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestQueryHydratesTheBatchInRankOrder(t *testing.T) {
 	}}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	matches, err := svc.Query(context.Background(), "any state", 3)
+	matches, err := svc.Query(context.Background(), "any state", 3, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestQueryKeepsOrphansWhenNothingResolves(t *testing.T) {
 	embeddings := &fakeEmbeddings{hits: []string{"orphan-a", "orphan-b"}}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, &fakeRepo{})
 
-	matches, err := svc.Query(context.Background(), "any state", 2)
+	matches, err := svc.Query(context.Background(), "any state", 2, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestQueryPropagatesGraphFailure(t *testing.T) {
 	repo := &fakeRepo{failWith: errors.New("connection refused")}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	if _, err := svc.Query(context.Background(), "any state", 1); err == nil {
+	if _, err := svc.Query(context.Background(), "any state", 1, store.SearchScope{CrossGoal: true}); err == nil {
 		t.Fatal("expected a transport failure to propagate")
 	}
 	if len(embeddings.deleted) != 0 {
@@ -287,7 +287,7 @@ func TestQuerySurvivesRetireFailure(t *testing.T) {
 	repo := &fakeRepo{present: map[string]domain.MetaHeuristic{"live-a": {ID: "live-a"}}}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	matches, err := svc.Query(context.Background(), "any state", 2)
+	matches, err := svc.Query(context.Background(), "any state", 2, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("expected the search to survive a failed retire, got %v", err)
 	}
@@ -311,7 +311,7 @@ func TestQueryRetiresRestOfBatchAfterOneFailure(t *testing.T) {
 	repo := &fakeRepo{present: map[string]domain.MetaHeuristic{"live-a": {ID: "live-a"}}}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	matches, err := svc.Query(context.Background(), "any state", 3)
+	matches, err := svc.Query(context.Background(), "any state", 3, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -340,7 +340,7 @@ func TestQueryRetiresAfterRequestCancelled(t *testing.T) {
 	}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	if _, err := svc.Query(ctx, "any state", 2); err != nil {
+	if _, err := svc.Query(ctx, "any state", 2, store.SearchScope{CrossGoal: true}); err != nil {
 		t.Fatalf("query: %v", err)
 	}
 	if len(embeddings.deleted) != 1 || embeddings.deleted[0] != "orphan" {
@@ -354,7 +354,7 @@ func TestQueryEmptyCorpus(t *testing.T) {
 	embeddings := &fakeEmbeddings{}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, &fakeRepo{})
 
-	matches, err := svc.Query(context.Background(), "any state", 10)
+	matches, err := svc.Query(context.Background(), "any state", 10, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -372,7 +372,7 @@ func TestQueryPropagatesPreSearchFailures(t *testing.T) {
 	t.Run("embed", func(t *testing.T) {
 		embeddings := &fakeEmbeddings{hits: []string{"live-a"}}
 		svc := heuristics.NewService(fakeProvider{embedErr: errors.New("ollama down")}, embeddings, &fakeRepo{})
-		if _, err := svc.Query(context.Background(), "any state", 1); err == nil {
+		if _, err := svc.Query(context.Background(), "any state", 1, store.SearchScope{CrossGoal: true}); err == nil {
 			t.Fatal("expected an embed failure to propagate")
 		}
 		if len(embeddings.attempted) != 0 {
@@ -382,7 +382,7 @@ func TestQueryPropagatesPreSearchFailures(t *testing.T) {
 	t.Run("similarity search", func(t *testing.T) {
 		embeddings := &fakeEmbeddings{searchErr: errors.New("pgvector down")}
 		svc := heuristics.NewService(fakeProvider{}, embeddings, &fakeRepo{})
-		if _, err := svc.Query(context.Background(), "any state", 1); err == nil {
+		if _, err := svc.Query(context.Background(), "any state", 1, store.SearchScope{CrossGoal: true}); err == nil {
 			t.Fatal("expected a similarity-search failure to propagate")
 		}
 		if len(embeddings.attempted) != 0 {

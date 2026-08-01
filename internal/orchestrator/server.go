@@ -123,7 +123,7 @@ type objectStore interface {
 }
 
 type heuristicsService interface {
-	Query(ctx context.Context, stateString string, k int) ([]heuristics.Match, error)
+	Query(ctx context.Context, stateString string, k int, scope store.SearchScope) ([]heuristics.Match, error)
 	Trace(ctx context.Context, metaHeuristicID string) ([]graph.CausalTriplet, error)
 }
 

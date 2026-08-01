@@ -1,7 +1,6 @@
 package orchestrator
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -182,7 +181,8 @@ func toChatFrame(ev llm.ChatEvent) (chatFrame, bool) {
 // document goal in its target fields -- so the summary follows whichever the goal
 // has, or a document goal's preview would degrade to goal text alone.
 func chatSystemPrompt(goal store.Goal) string {
-	open, close := chatContextMarkers()
+	fence := llm.NewFence("RUN-CONTEXT")
+	open, close := fence.Open(), fence.Close()
 
 	var b strings.Builder
 	fmt.Fprintf(&b, chatSystemPreamble, open, close)
@@ -198,19 +198,6 @@ func chatSystemPrompt(goal store.Goal) string {
 	}
 	fmt.Fprintf(&b, "%s\n", close)
 	return b.String()
-}
-
-// chatContextMarkers mints the delimiters that bound the run description in the
-// system prompt.
-//
-// Everything inside them is untrusted -- goal text is free-form analyst input,
-// and target fields are derived by Claude from the content of an uploaded
-// document -- so the delimiter has to be one that text cannot produce. Minting
-// the pair per request from fresh entropy achieves that: naming the closing
-// marker requires guessing it.
-func chatContextMarkers() (open, close string) {
-	nonce := rand.Text()
-	return "<<<RUN-CONTEXT-" + nonce + ">>>", "<<<END-RUN-CONTEXT-" + nonce + ">>>"
 }
 
 const chatSystemPreamble = "You are an analyst's assistant for a causal-segment optimization run. Everything you " +

@@ -68,11 +68,15 @@ type OllamaConfig struct {
 	Model string
 }
 
-// EmbeddingConfig fixes the vector dimension. It is load-bearing: it must match
-// both the pgvector column and the model's output width. Swapping providers is
-// a migration + full re-embed, not a runtime toggle.
+// EmbeddingConfig fixes the vector dimension and the retrieval distance floor.
+// Dimension is load-bearing: it must match both the pgvector column and the
+// model's output width. Swapping providers is a migration + full re-embed, not a
+// runtime toggle. DistanceFloor is the cosine distance beyond which a similarity
+// hit is dropped, so a query far from the whole corpus returns empty instead of
+// the corpus ranked by how distant it is; it is env-tunable pending calibration.
 type EmbeddingConfig struct {
-	Dimension int
+	Dimension     int
+	DistanceFloor float64
 }
 
 // SandboxConfig drives the Sandbox Execution HTTP service. MaxObjectBytes caps how
@@ -301,7 +305,8 @@ func Load() (Config, error) {
 			Model: env("OLLAMA_MODEL", "nomic-embed-text"),
 		},
 		Embedding: EmbeddingConfig{
-			Dimension: intEnv("EMBEDDING_DIMENSION", 768),
+			Dimension:     intEnv("EMBEDDING_DIMENSION", 768),
+			DistanceFloor: floatEnv("EMBEDDING_DISTANCE_FLOOR", 0.5),
 		},
 		Sandbox: SandboxConfig{
 			Port:               env("SANDBOX_PORT", "8081"),

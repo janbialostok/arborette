@@ -93,8 +93,9 @@ type client struct {
 }
 
 func (c *client) GenerateEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema) (domain.EvaluationMatrix, error) {
-	user := "Analyst goal:\n" + goalText + "\n\nAvailable columns:\n" + columnSummary(schema)
-	body, err := c.backend.complete(ctx, evaluationMatrixSystem, user, evaluationMatrixSchema(schema))
+	fence := NewFence("GOAL-CONTEXT")
+	user := "Analyst goal:\n" + fence.Wrap(goalText) + "\n\nAvailable columns:\n" + fence.Wrap(columnSummary(schema))
+	body, err := c.backend.complete(ctx, evaluationMatrixSystem+fence.Directive(), user, evaluationMatrixSchema(schema))
 	if err != nil {
 		return domain.EvaluationMatrix{}, err
 	}
@@ -106,11 +107,12 @@ func (c *client) RepairEvaluationMatrix(ctx context.Context, goalText string, sc
 	if err != nil {
 		return domain.EvaluationMatrix{}, fmt.Errorf("encode prior matrix: %w", err)
 	}
-	user := "Analyst goal:\n" + goalText + "\n\nAvailable columns:\n" + columnSummary(schema) +
-		"\nThis fitted objective failed to compile against the data source:\n" + string(priorJSON) +
-		"\n\nThe sandbox rejected it with:\n" + validationErr +
+	fence := NewFence("GOAL-CONTEXT")
+	user := "Analyst goal:\n" + fence.Wrap(goalText) + "\n\nAvailable columns:\n" + fence.Wrap(columnSummary(schema)) +
+		"\nThis fitted objective failed to compile against the data source:\n" + fence.Wrap(string(priorJSON)) +
+		"\n\nThe sandbox rejected it with:\n" + fence.Wrap(validationErr) +
 		"\n\nReturn a corrected Evaluation Matrix whose objective compiles and measures."
-	body, err := c.backend.complete(ctx, evaluationMatrixRepairSystem, user, evaluationMatrixSchema(schema))
+	body, err := c.backend.complete(ctx, evaluationMatrixRepairSystem+fence.Directive(), user, evaluationMatrixSchema(schema))
 	if err != nil {
 		return domain.EvaluationMatrix{}, err
 	}
@@ -118,8 +120,9 @@ func (c *client) RepairEvaluationMatrix(ctx context.Context, goalText string, sc
 }
 
 func (c *client) ProposeInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) (Proposal, error) {
-	body, err := c.backend.complete(ctx, interventionTreeSystem,
-		treePrompt(goalText, matrix, schema, node), interventionTreeSchema(schema))
+	fence := NewFence("GOAL-CONTEXT")
+	body, err := c.backend.complete(ctx, interventionTreeSystem+fence.Directive(),
+		treePrompt(fence, goalText, matrix, schema, node), interventionTreeSchema(schema))
 	if err != nil {
 		return Proposal{}, err
 	}
@@ -127,11 +130,12 @@ func (c *client) ProposeInterventionTree(ctx context.Context, goalText string, m
 }
 
 func (c *client) RepairInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext, prior Proposal, validationErr string) (Proposal, error) {
-	user := treePrompt(goalText, matrix, schema, node) +
-		"\nThese proposed candidates referenced columns absent from the schema:\n" + renderCandidates(prior.Candidates) +
-		"\n\nThe rejection:\n" + validationErr +
+	fence := NewFence("GOAL-CONTEXT")
+	user := treePrompt(fence, goalText, matrix, schema, node) +
+		"\nThese proposed candidates referenced columns absent from the schema:\n" + fence.Wrap(renderCandidates(prior.Candidates)) +
+		"\n\nThe rejection:\n" + fence.Wrap(validationErr) +
 		"\n\nRe-propose the candidates using only the listed columns, with their exact names."
-	body, err := c.backend.complete(ctx, interventionTreeRepairSystem, user, interventionTreeSchema(schema))
+	body, err := c.backend.complete(ctx, interventionTreeRepairSystem+fence.Directive(), user, interventionTreeSchema(schema))
 	if err != nil {
 		return Proposal{}, err
 	}
@@ -139,8 +143,9 @@ func (c *client) RepairInterventionTree(ctx context.Context, goalText string, ma
 }
 
 func (c *client) IntrospectDocumentFields(ctx context.Context, goalText, sample string) ([]domain.TargetField, error) {
-	user := "Analyst goal:\n" + goalText + "\n\nDocument sample (first page):\n" + sample
-	body, err := c.backend.complete(ctx, documentFieldsSystem, user, documentFieldsSchema())
+	fence := NewFence("DOC-CONTEXT")
+	user := "Analyst goal:\n" + fence.Wrap(goalText) + "\n\nDocument sample (first page):\n" + fence.Wrap(sample)
+	body, err := c.backend.complete(ctx, documentFieldsSystem+fence.Directive(), user, documentFieldsSchema())
 	if err != nil {
 		return nil, err
 	}
@@ -148,8 +153,9 @@ func (c *client) IntrospectDocumentFields(ctx context.Context, goalText, sample 
 }
 
 func (c *client) Extract(ctx context.Context, pdf []byte, field domain.TargetField, method string) (string, float64, error) {
-	body, err := c.backend.completeWithPDF(ctx, extractionSystem, pdf,
-		extractionInstruction(field, method), extractionSchema())
+	fence := NewFence("FIELD-CONTEXT")
+	body, err := c.backend.completeWithPDF(ctx, extractionSystem+fence.Directive(), pdf,
+		extractionInstruction(fence, field, method), extractionSchema())
 	if err != nil {
 		return "", 0, err
 	}
@@ -157,8 +163,9 @@ func (c *client) Extract(ctx context.Context, pdf []byte, field domain.TargetFie
 }
 
 func (c *client) AbstractMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment) (Abstraction, error) {
-	body, err := c.backend.complete(ctx, metaHeuristicSystem,
-		macroSegmentPrompt(goalText, seg), metaHeuristicSchema())
+	fence := NewFence("SEGMENT-CONTEXT")
+	body, err := c.backend.complete(ctx, metaHeuristicSystem+fence.Directive(),
+		macroSegmentPrompt(fence, goalText, seg), metaHeuristicSchema())
 	if err != nil {
 		return Abstraction{}, err
 	}
@@ -166,11 +173,12 @@ func (c *client) AbstractMetaHeuristic(ctx context.Context, goalText string, seg
 }
 
 func (c *client) RepairMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment, prior Abstraction, validationErr string) (Abstraction, error) {
-	user := macroSegmentPrompt(goalText, seg) +
-		"\nThis definition still referenced concrete, dataset-bound terms:\n" + prior.Definition +
-		"\n\nThe rejection:\n" + validationErr +
+	fence := NewFence("SEGMENT-CONTEXT")
+	user := macroSegmentPrompt(fence, goalText, seg) +
+		"\nThis definition still referenced concrete, dataset-bound terms:\n" + fence.Wrap(prior.Definition) +
+		"\n\nThe rejection:\n" + fence.Wrap(validationErr) +
 		"\n\nRewrite the definition so every variable is a bracketed ontology term and no raw column name survives."
-	body, err := c.backend.complete(ctx, metaHeuristicRepairSystem, user, metaHeuristicSchema())
+	body, err := c.backend.complete(ctx, metaHeuristicRepairSystem+fence.Directive(), user, metaHeuristicSchema())
 	if err != nil {
 		return Abstraction{}, err
 	}
@@ -211,9 +219,11 @@ func decodeExtraction(body string) (string, float64, error) {
 	return wire.Value, wire.Confidence, nil
 }
 
-func extractionInstruction(field domain.TargetField, method string) string {
+func extractionInstruction(fence Fence, field domain.TargetField, method string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Extract this field from the attached document:\n- %s: %s\n", field.Name, field.Description)
+	b.WriteString("Extract this field from the attached document:\n")
+	b.WriteString(fence.Wrap(fmt.Sprintf("- %s: %s", field.Name, field.Description)))
+	b.WriteString("\n")
 	if method != "" {
 		fmt.Fprintf(&b, "\nApproach: %s\n", method)
 	}
@@ -420,19 +430,19 @@ const interventionTreeRepairSystem = "You propose candidate interventions for an
 
 const filterShapeGuide = ` Each filter is {"field":<column>,"op":<operator>,"value":<value>}. Choose the operator and value by the column's type: a numeric column uses "lt"/"lte"/"gt"/"gte" with a number (e.g. {"field":"Age","op":"lte","value":18}); a boolean column uses "eq"/"neq" with true or false (e.g. {"field":"CryoSleep","op":"eq","value":true}); a categorical/string column uses "eq"/"neq" with a string, or "in"/"not_in" with an array of strings (e.g. {"field":"HomePlanet","op":"in","value":["Europa","Mars"]}). The value is a bare JSON scalar for eq/neq and the threshold ops, and a JSON array for in/not_in — never a quoted-JSON string. Use only an operator and value type that match the column's type.`
 
-func treePrompt(goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) string {
+func treePrompt(fence Fence, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Analyst goal:\n%s\n\n", goalText)
-	fmt.Fprintf(&b, "Evaluation Matrix:\n%s\n\n", MatrixSummary(matrix))
-	fmt.Fprintf(&b, "Available columns:\n%s\n\n", columnSummary(schema))
+	fmt.Fprintf(&b, "Analyst goal:\n%s\n\n", fence.Wrap(goalText))
+	fmt.Fprintf(&b, "Evaluation Matrix:\n%s\n\n", fence.Wrap(MatrixSummary(matrix)))
+	fmt.Fprintf(&b, "Available columns:\n%s\n\n", fence.Wrap(columnSummary(schema)))
 	if node.IsRoot {
 		fmt.Fprintf(&b, "This is the root node. Propose up to %d candidate interventions (filters only) that "+
 			"segment the data toward the objective.\n", node.Breadth)
 		return b.String()
 	}
-	fmt.Fprintf(&b, "Fixed objective: %s, to %s.\n", node.ObjectiveLabel, node.Direction)
+	fmt.Fprintf(&b, "Fixed objective (to %s):\n%s\n", node.Direction, fence.Wrap(node.ObjectiveLabel))
 	fmt.Fprintf(&b, "Parent's effective filters (your proposals nest cumulatively on top of these):\n%s\n",
-		filterSummary(node.ParentFilters))
+		fence.Wrap(filterSummary(node.ParentFilters)))
 	if node.PriorValue != nil {
 		fmt.Fprintf(&b, "Parent's measured objective value (the baseline to improve on): %v\n", *node.PriorValue)
 	}

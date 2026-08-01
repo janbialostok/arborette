@@ -91,7 +91,7 @@ type searchRepo interface {
 	GetMetaHeuristic(ctx context.Context, id string) (domain.MetaHeuristic, error)
 	CreateMetaHeuristic(ctx context.Context, mh domain.MetaHeuristic, abstractedFrom []string) error
 	ClearEmbeddingPending(ctx context.Context, id string) error
-	ListEmbeddingPending(ctx context.Context) ([]domain.MetaHeuristic, error)
+	ListMetaHeuristics(ctx context.Context) ([]domain.MetaHeuristic, error)
 }
 
 type sandboxExecutor interface {
@@ -105,7 +105,9 @@ type claudeClient interface {
 }
 
 type embeddingStore interface {
-	Upsert(ctx context.Context, nodeID string, embedding []float32) error
+	Upsert(ctx context.Context, nodeID, goalID string, embedding []float32) error
+	ListNodeRefs(ctx context.Context) ([]store.NodeRef, error)
+	SetGoalID(ctx context.Context, nodeID, goalID string) error
 }
 
 type goalStore interface {
@@ -163,7 +165,7 @@ type searchTarget struct {
 }
 
 // Run executes one Sleep Cycle for a goal, in order: settle any prior run's
-// leftovers (staleness sweep, embedding resume), then introspect, pin the
+// leftovers (staleness sweep, embedding reconcile), then introspect, pin the
 // objective and measure the global baseline, load the eligible findings, search
 // the lattice, write back the winners, select what to publish, and abstract each
 // selection.
@@ -173,8 +175,8 @@ type searchTarget struct {
 // materiallyBetter for why the two gates must stay separate.
 //
 // Failure disposition is deliberate and differs by stage. The sweep and the
-// resume pass are non-terminal: neither is a prerequisite for producing valid
-// macro-segments, and the resume pass may not even concern this goal. Loading the
+// reconcile pass are non-terminal: neither is a prerequisite for producing valid
+// macro-segments, and the reconcile pass may not even concern this goal. Loading the
 // goal, introspection, pinning, the baseline, and the eligible-finding read are
 // terminal — each is a hard input with nothing meaningful to degrade to. Per
 // candidate, per macro-segment, and per publication, failures are isolated and
@@ -228,7 +230,7 @@ func (w *Worker) Run(ctx context.Context, goalID string) (err error) {
 	}
 
 	w.sweepStale(ctx, goalID)
-	w.resumeEmbeddings(ctx)
+	w.reconcileEmbeddings(ctx)
 
 	introspect, err := w.sandbox.Introspect(ctx, sandboxclient.IntrospectRequest{DataSourceRef: goal.DataSourceRef})
 	if err != nil {

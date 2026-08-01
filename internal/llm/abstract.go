@@ -131,7 +131,17 @@ func isWordRune(r rune) bool {
 	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
-var errEmptyDefinition = errors.New("meta-heuristic definition is empty")
+// maxDefinitionLen bounds a returned definition. A one-paragraph ontology
+// definition is well under this; the cap is generous for legitimate output yet
+// tight enough to stop a definition being used to smuggle a payload back through
+// the corpus, which the free-string output schema does not otherwise bound.
+const maxDefinitionLen = 2000
+
+var (
+	errEmptyDefinition   = errors.New("meta-heuristic definition is empty")
+	errDefinitionTooLong = fmt.Errorf("meta-heuristic definition exceeds %d bytes", maxDefinitionLen)
+	errDefinitionShape   = errors.New("meta-heuristic definition is not a single paragraph of plain text")
+)
 
 // metaHeuristicWire mirrors the abstraction structured-output body.
 type metaHeuristicWire struct {
@@ -149,7 +159,10 @@ type metaHeuristicWire struct {
 // it: the schema sets no minimum length, and the leak check passes vacuously on
 // an empty string. It would be persisted, embedded, and served — permanently, as
 // the node id is deterministic and the completed embedding makes every later run
-// skip the segment before it reaches Claude again.
+// skip the segment before it reaches Claude again. The length and single-
+// paragraph shape checks are the same kind of guard against a free-string output
+// the schema does not bound: a definition is a short paragraph of plain prose, so
+// an overlong or control-character-laden one is not a heuristic but a payload.
 func decodeAbstraction(body string) (Abstraction, error) {
 	var wire metaHeuristicWire
 	if err := json.Unmarshal([]byte(body), &wire); err != nil {
@@ -158,6 +171,12 @@ func decodeAbstraction(body string) (Abstraction, error) {
 	if strings.TrimSpace(wire.Definition) == "" {
 		return Abstraction{}, errEmptyDefinition
 	}
+	if len(wire.Definition) > maxDefinitionLen {
+		return Abstraction{}, errDefinitionTooLong
+	}
+	if hasControlChars(wire.Definition) {
+		return Abstraction{}, errDefinitionShape
+	}
 	terms := make([]OntologyTerm, 0, len(wire.OntologyTerms))
 	for _, t := range wire.OntologyTerms {
 		terms = append(terms, OntologyTerm{Concrete: t.Concrete, Ontological: t.Ontological})
@@ -165,16 +184,30 @@ func decodeAbstraction(body string) (Abstraction, error) {
 	return Abstraction{Definition: wire.Definition, OntologyTerms: terms}, nil
 }
 
+// hasControlChars reports whether s carries any control character. A single-
+// paragraph definition needs none: line breaks, tabs, and NULs are the shape a
+// smuggled payload uses to structure itself, and a plain space (not a control
+// character) is the only whitespace a one-paragraph definition needs.
+func hasControlChars(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
+}
+
 // macroSegmentPrompt renders the measured macro-segment for abstraction. Filters
 // are rendered with domain.RenderConstraint so the prompt and the graph describe
-// the same segment in the same spelling.
-func macroSegmentPrompt(goalText string, seg MacroSegment) string {
+// the same segment in the same spelling. The untrusted goal text and the
+// data-derived predicate rendering are fenced as data.
+func macroSegmentPrompt(fence Fence, goalText string, seg MacroSegment) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Analyst goal:\n%s\n\n", goalText)
-	fmt.Fprintf(&b, "Objective: %s, to %s.\n", seg.ObjectiveLabel, seg.Direction)
+	fmt.Fprintf(&b, "Analyst goal:\n%s\n\n", fence.Wrap(goalText))
+	fmt.Fprintf(&b, "Objective (to %s):\n%s\n", seg.Direction, fence.Wrap(seg.ObjectiveLabel))
 	fmt.Fprintf(&b, "Unfiltered baseline: %v\n", seg.Baseline)
 	fmt.Fprintf(&b, "Measured value for this segment: %v\n\n", seg.Value)
-	fmt.Fprintf(&b, "The segment is the conjunction of these predicates:\n%s\n", filterSummary(seg.Filters))
+	fmt.Fprintf(&b, "The segment is the conjunction of these predicates:\n%s\n", fence.Wrap(filterSummary(seg.Filters)))
 	b.WriteString("\nAbstract this finding into one generalized, reusable heuristic.\n")
 	return b.String()
 }

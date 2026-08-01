@@ -10,17 +10,23 @@ import (
 )
 
 // fakeCompleter is a stand-in for the LLM backend API call, so parsing and
-// schema construction are exercised without a real API.
+// schema construction are exercised without a real API. It records the system
+// and user prompts it was handed so a fencing test can assert what actually
+// reached the backend.
 type fakeCompleter struct {
-	text string
-	err  error
+	text      string
+	err       error
+	gotSystem string
+	gotUser   string
 }
 
-func (f *fakeCompleter) complete(_ context.Context, _, _ string, _ map[string]any) (string, error) {
+func (f *fakeCompleter) complete(_ context.Context, system, user string, _ map[string]any) (string, error) {
+	f.gotSystem, f.gotUser = system, user
 	return f.text, f.err
 }
 
-func (f *fakeCompleter) completeWithPDF(_ context.Context, _ string, _ []byte, _ string, _ map[string]any) (string, error) {
+func (f *fakeCompleter) completeWithPDF(_ context.Context, system string, _ []byte, instruction string, _ map[string]any) (string, error) {
+	f.gotSystem, f.gotUser = system, instruction
 	return f.text, f.err
 }
 

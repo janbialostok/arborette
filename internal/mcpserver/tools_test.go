@@ -13,6 +13,7 @@ import (
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/heuristics"
 	"github.com/arborette/arborette/internal/orchestratorclient"
+	"github.com/arborette/arborette/internal/store"
 )
 
 type fakeQuerier struct {
@@ -21,10 +22,12 @@ type fakeQuerier struct {
 	queryErr error
 	traceErr error
 	gotK     int
+	gotScope store.SearchScope
 }
 
-func (f *fakeQuerier) Query(_ context.Context, _ string, k int) ([]heuristics.Match, error) {
+func (f *fakeQuerier) Query(_ context.Context, _ string, k int, scope store.SearchScope) ([]heuristics.Match, error) {
 	f.gotK = k
+	f.gotScope = scope
 	return f.matches, f.queryErr
 }
 func (f *fakeQuerier) Trace(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
@@ -99,6 +102,9 @@ func TestGetOptimizedHeuristicsMapsAndClampsK(t *testing.T) {
 	if heur.gotK != maxSearchK {
 		t.Fatalf("k = %d, want clamped to %d", heur.gotK, maxSearchK)
 	}
+	if !heur.gotScope.CrossGoal || heur.gotScope.GoalID != "" {
+		t.Fatalf("scope = %+v, want cross-goal when goal_id is omitted", heur.gotScope)
+	}
 	var out getOptimizedHeuristicsOutput
 	decodeOutput(t, res, &out)
 	if len(out.Heuristics) != 1 || out.Heuristics[0].ID != "mh-1" || out.Heuristics[0].Definition != "scale reads" {
@@ -122,6 +128,25 @@ func TestGetOptimizedHeuristicsDefaultsKWhenOmitted(t *testing.T) {
 	}
 	if heur.gotK != defaultSearchK {
 		t.Fatalf("k = %d, want default %d", heur.gotK, defaultSearchK)
+	}
+}
+
+func TestGetOptimizedHeuristicsScopesToGoal(t *testing.T) {
+	heur := &fakeQuerier{}
+	cs := connectTools(t, heur, &fakeSubmitter{})
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "get_optimized_heuristics",
+		Arguments: map[string]any{"operational_state": "hot shard", "goal_id": "goal-7"},
+	})
+	if err != nil {
+		t.Fatalf("call tool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected tool error: %+v", res.Content)
+	}
+	if heur.gotScope.CrossGoal || heur.gotScope.GoalID != "goal-7" {
+		t.Fatalf("scope = %+v, want goal-scoped to goal-7", heur.gotScope)
 	}
 }
 

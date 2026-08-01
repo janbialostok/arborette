@@ -13,6 +13,7 @@ import (
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/embedding"
 	"github.com/arborette/arborette/internal/graph"
+	"github.com/arborette/arborette/internal/store"
 )
 
 // retireTimeout is the ceiling on how much cleanup latency a caller can be made
@@ -30,10 +31,10 @@ type Match struct {
 // cmd/orchestrator and cmd/mcpserver pass the concrete *store.EmbeddingStore and
 // *graph.Neo4jRepository, which satisfy them.
 
-// embeddingStore is the vector surface this seam needs: the similarity search
-// itself, plus the delete that retires a row the graph no longer backs.
+// embeddingStore is the vector surface this seam needs: the scoped similarity
+// search itself, plus the delete that retires a row the graph no longer backs.
 type embeddingStore interface {
-	SimilaritySearch(ctx context.Context, query []float32, k int) ([]string, error)
+	SimilaritySearch(ctx context.Context, query []float32, k int, scope store.SearchScope) ([]string, error)
 	Delete(ctx context.Context, nodeID string) error
 }
 
@@ -69,12 +70,12 @@ func NewService(provider embedding.Provider, embeddings embeddingStore, repo heu
 // neighbourhood touches it. Only absence is read that way -- a failed fetch still
 // propagates, because answering "no such heuristic" when the graph is merely
 // unreachable would silently narrow the corpus.
-func (s *Service) Query(ctx context.Context, stateString string, k int) ([]Match, error) {
+func (s *Service) Query(ctx context.Context, stateString string, k int, scope store.SearchScope) ([]Match, error) {
 	vec, err := s.provider.EmbedQuery(ctx, stateString)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
-	ids, err := s.embeddings.SimilaritySearch(ctx, vec, k)
+	ids, err := s.embeddings.SimilaritySearch(ctx, vec, k, scope)
 	if err != nil {
 		return nil, fmt.Errorf("similarity search: %w", err)
 	}
@@ -110,14 +111,17 @@ func (s *Service) Query(ctx context.Context, stateString string, k int) ([]Match
 //
 // It repairs nothing unless some other hit in the same batch resolved. Per hit,
 // "this node is gone" and "the whole graph is gone" are the same observation,
-// and deleting on the second reading would empty a table nothing regenerates --
-// resume keys off embedding_pending, already false for anything embedded. One
-// live sibling is the cheap proof that the miss is really about this id.
+// and deleting on the second reading would empty a table only the sleep cycle
+// repopulates -- reconcile re-embeds a missing row on its next run, but only for
+// a node still in the graph, so a wrongly emptied table stays dark to every
+// search until then. One live sibling is the cheap proof that the miss is really
+// about this id.
 //
 // That proof is per-batch, not per-goal, and abstraction runs one goal at a
 // time: a live hit from an already-abstracted goal will corroborate retiring a
-// goal whose nodes have not been rebuilt yet. Narrowing it needs a goal on the
-// embedding row, which the table does not carry.
+// goal whose nodes have not been rebuilt yet. The embedding row carries a goal_id
+// that could narrow the corroboration to the same goal, but this read path
+// deliberately does not use it.
 //
 // Deletion is best-effort past that point. A search that found live heuristics
 // is a good answer, and failing it because the cleanup failed would turn a

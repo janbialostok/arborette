@@ -104,24 +104,24 @@ func asProperty(filters []domain.Constraint) any {
 }
 
 type fakeRepo struct {
-	findings        []graph.CausalTriplet
-	findingsErr     error
-	panicOnFindings bool
-	staleMarked     int
-	staleErr        error
-	pending         []domain.MetaHeuristic
-	pendingErr      error
-	existing        map[string]domain.MetaHeuristic
-	getErr          map[string]error
-	createErrs      map[string]error
-	states          []domain.State
-	interventions   []domain.Intervention
-	outcomes        []domain.Outcome
-	preConditions   [][2]string
-	produced        []domain.ProducedEdge
-	heuristics      []domain.MetaHeuristic
-	abstractedFrom  map[string][]string
-	cleared         []string
+	findings          []graph.CausalTriplet
+	findingsErr       error
+	panicOnFindings   bool
+	staleMarked       int
+	staleErr          error
+	metaHeuristics    []domain.MetaHeuristic
+	metaHeuristicsErr error
+	existing          map[string]domain.MetaHeuristic
+	getErr            map[string]error
+	createErrs        map[string]error
+	states            []domain.State
+	interventions     []domain.Intervention
+	outcomes          []domain.Outcome
+	preConditions     [][2]string
+	produced          []domain.ProducedEdge
+	heuristics        []domain.MetaHeuristic
+	abstractedFrom    map[string][]string
+	cleared           []string
 }
 
 func newFakeRepo() *fakeRepo {
@@ -204,8 +204,8 @@ func (f *fakeRepo) ClearEmbeddingPending(_ context.Context, id string) error {
 	f.cleared = append(f.cleared, id)
 	return nil
 }
-func (f *fakeRepo) ListEmbeddingPending(context.Context) ([]domain.MetaHeuristic, error) {
-	return f.pending, f.pendingErr
+func (f *fakeRepo) ListMetaHeuristics(context.Context) ([]domain.MetaHeuristic, error) {
+	return f.metaHeuristics, f.metaHeuristicsErr
 }
 
 func stringProp(v any) string {
@@ -369,15 +369,39 @@ func (f *fakeProvider) EmbedDocument(context.Context, string) ([]float32, error)
 func (f *fakeProvider) Dimensions() int { return 2 }
 
 type fakeEmbeddings struct {
-	err      error
-	upserted []string
+	err          error
+	upserted     []string
+	upsertGoal   map[string]string
+	refs         []store.NodeRef
+	refsErr      error
+	setGoalErr   error
+	goalRepaired map[string]string
 }
 
-func (f *fakeEmbeddings) Upsert(_ context.Context, nodeID string, _ []float32) error {
+func (f *fakeEmbeddings) Upsert(_ context.Context, nodeID, goalID string, _ []float32) error {
 	if f.err != nil {
 		return f.err
 	}
+	if f.upsertGoal == nil {
+		f.upsertGoal = map[string]string{}
+	}
 	f.upserted = append(f.upserted, nodeID)
+	f.upsertGoal[nodeID] = goalID
+	return nil
+}
+
+func (f *fakeEmbeddings) ListNodeRefs(context.Context) ([]store.NodeRef, error) {
+	return f.refs, f.refsErr
+}
+
+func (f *fakeEmbeddings) SetGoalID(_ context.Context, nodeID, goalID string) error {
+	if f.setGoalErr != nil {
+		return f.setGoalErr
+	}
+	if f.goalRepaired == nil {
+		f.goalRepaired = map[string]string{}
+	}
+	f.goalRepaired[nodeID] = goalID
 	return nil
 }
 

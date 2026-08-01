@@ -51,9 +51,15 @@ func main() {
 	if err := store.ValidateEmbeddingDimension(ctx, pool, cfg.Embedding.Dimension); err != nil {
 		log.Fatalf("mcpserver: %v", err)
 	}
+	if err := store.ValidateDistanceFloor(cfg.Embedding.DistanceFloor); err != nil {
+		log.Fatalf("mcpserver: %v", err)
+	}
+	if err := store.ValidateVectorExtensionVersion(ctx, pool); err != nil {
+		log.Fatalf("mcpserver: %v", err)
+	}
 
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
-	queries := heuristics.NewService(provider, store.NewEmbeddingStore(pool), repo)
+	queries := heuristics.NewService(provider, store.NewEmbeddingStore(pool, cfg.Embedding.DistanceFloor), repo)
 	log.Printf("mcpserver: wired neo4j, postgres, heuristics query service (dim=%d), serving HTTP on :%s", provider.Dimensions(), cfg.MCP.Port)
 
 	// No internal secret: this server reaches only the analyst-facing /goals route.

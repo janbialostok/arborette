@@ -7,6 +7,7 @@ import (
 
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/service"
+	"github.com/arborette/arborette/internal/store"
 )
 
 // defaultSearchK is the similarity-search result count used when the request
@@ -67,7 +68,12 @@ func (s *Server) handleHeuristicSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	matches, err := s.heur.Query(r.Context(), q, k)
+	// The browser's heuristic surface is deliberately cross-goal by default: it
+	// browses the whole accumulated corpus, including the NULL-goal legacy rows. An
+	// explicit goal_id narrows it to one goal's heuristics.
+	scope := store.ScopeFromGoalID(r.URL.Query().Get("goal_id"))
+
+	matches, err := s.heur.Query(r.Context(), q, k, scope)
 	if err != nil {
 		log.Printf("orchestrator: heuristic search: %v", err)
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")
