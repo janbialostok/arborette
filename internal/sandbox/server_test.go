@@ -82,7 +82,7 @@ func testLimiter() *classLimiter {
 func TestHandlerValidation(t *testing.T) {
 	// nil object store, cache, and validator are safe: every case returns before any
 	// staging. A real limiter is required because Acquire precedes staticValidate.
-	h := NewServer(nil, nil, nil, testLimiter(), 1<<20, 1<<20, "1GiB").Routes()
+	h := NewServer(nil, nil, nil, testLimiter(), 1<<20, 1<<20, "1GiB", 50).Routes()
 	cases := []struct {
 		name, path, body string
 		want             int
@@ -136,7 +136,7 @@ func TestRefScoping(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			h := NewServer(nil, c.validator, nil, testLimiter(), 1<<20, 1<<20, "1GiB").Routes()
+			h := NewServer(nil, c.validator, nil, testLimiter(), 1<<20, 1<<20, "1GiB", 50).Routes()
 			req := httptest.NewRequest(http.MethodPost, "/execute", strings.NewReader(body))
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
@@ -155,7 +155,7 @@ func TestRefScoping(t *testing.T) {
 // request with no credential is rejected before reaching a handler, and a correct
 // one passes through to the handler's own validation.
 func TestRoutesComposeWithBearerAuth(t *testing.T) {
-	h := service.BearerAuth("s3cret", NewServer(nil, nil, nil, testLimiter(), 1<<20, 1<<20, "1GiB").Routes())
+	h := service.BearerAuth("s3cret", NewServer(nil, nil, nil, testLimiter(), 1<<20, 1<<20, "1GiB", 50).Routes())
 
 	unauth := httptest.NewRequest(http.MethodPost, "/execute", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()

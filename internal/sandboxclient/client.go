@@ -32,10 +32,14 @@ const defaultSandboxTimeout = 2 * time.Minute
 // agg(expr) shape, so it can never collide with this key.
 const RowCountKey = "row_count"
 
-// Column is one introspected column name and its type.
+// Column is one introspected column name and its type. DistinctValues carries the
+// column's distinct value set when it is a low-cardinality categorical column, and
+// is nil otherwise (high-cardinality, continuous, or not probed); omitempty so the
+// legacy value-less schema is unchanged on the wire.
 type Column struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name           string   `json:"name"`
+	Type           string   `json:"type"`
+	DistinctValues []string `json:"distinct_values,omitempty"`
 }
 
 // Schema is a data source's introspected shape.
@@ -92,6 +96,8 @@ type ExecuteRequest struct {
 	Target          domain.Target           `json:"target"`
 	ValueExpression *domain.Expression      `json:"value_expression,omitempty"`
 	ObjectiveLabel  string                  `json:"objective_label,omitempty"`
+	EntityKeyColumn string                  `json:"entity_key_column,omitempty"`
+	TimeColumn      string                  `json:"time_column,omitempty"`
 	IncludeRowCount bool                    `json:"include_row_count,omitempty"`
 	Filters         []domain.Constraint     `json:"filters"`
 }

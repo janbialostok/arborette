@@ -4,6 +4,8 @@
 package domain
 
 import (
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -201,12 +203,14 @@ func (t Target) ValueExpression() Expression {
 type ExpressionKind string
 
 const (
-	ColumnRefKind  ExpressionKind = "column_ref"
-	LiteralKind    ExpressionKind = "literal"
-	CastKind       ExpressionKind = "cast"
-	ComparisonKind ExpressionKind = "comparison"
-	ArithmeticKind ExpressionKind = "arithmetic"
-	CaseKind       ExpressionKind = "case"
+	ColumnRefKind         ExpressionKind = "column_ref"
+	LiteralKind           ExpressionKind = "literal"
+	CastKind              ExpressionKind = "cast"
+	ComparisonKind        ExpressionKind = "comparison"
+	ArithmeticKind        ExpressionKind = "arithmetic"
+	CaseKind              ExpressionKind = "case"
+	LagKind               ExpressionKind = "lag"
+	TrailingAggregateKind ExpressionKind = "trailing_aggregate"
 )
 
 // LiteralValue is the typed scalar carried by a LiteralKind Expression. Exactly
@@ -248,6 +252,14 @@ type Expression struct {
 	// Case
 	Cases []CaseBranch `json:"cases,omitempty"`
 	Else  *Expression  `json:"else,omitempty"`
+	// Window (Lag / TrailingAggregate): Inner is the per-row expression the window
+	// is computed over its entity's ordered history. Lag reads the value Offset rows
+	// back; TrailingAggregate applies WindowAgg over the WindowSize rows preceding
+	// the current one. A window kind may not nest inside another (see ValidateWindowShape).
+	Inner      *Expression `json:"inner,omitempty"`
+	Offset     int         `json:"offset,omitempty"`
+	WindowSize int         `json:"window_size,omitempty"`
+	WindowAgg  string      `json:"window_agg,omitempty"`
 }
 
 // RenderObjectiveLabel derives the human-readable key an objective is carried
@@ -281,6 +293,10 @@ func renderExpr(e Expression) string {
 		}
 		b.WriteString(" END")
 		return b.String()
+	case LagKind:
+		return "lag(" + renderChild(e.Inner) + ", " + strconv.Itoa(e.Offset) + ")"
+	case TrailingAggregateKind:
+		return e.WindowAgg + "(" + renderChild(e.Inner) + ") over trailing " + strconv.Itoa(e.WindowSize)
 	default:
 		return ""
 	}
@@ -383,6 +399,8 @@ func ExpressionDepth(e Expression) int {
 			deepest = max(deepest, max(childDepth(br.When), childDepth(br.Then)))
 		}
 		return 1 + deepest
+	case LagKind, TrailingAggregateKind:
+		return 1 + childDepth(e.Inner)
 	default:
 		return 1
 	}
@@ -393,6 +411,112 @@ func childDepth(e *Expression) int {
 		return 0
 	}
 	return ExpressionDepth(*e)
+}
+
+// MaxWindowSize caps a trailing-aggregate window's row span and a lag's offset, so
+// a pathological window the plain-string output schema does not bound cannot be
+// requested. Real entity-relative signals span a handful to a few hundred rows;
+// 10_000 is generous headroom while keeping the frame bound small enough to format
+// or bind safely.
+const MaxWindowSize = 10_000
+
+// Sentinel errors for a structurally-invalid windowed expression, so the
+// orchestrator can classify a shape-guard rejection as a repairable objective-fit
+// failure (like the depth guard) rather than a fault.
+var (
+	ErrWindowNested = errors.New("a window expression may not nest inside another window expression")
+	ErrWindowBounds = errors.New("window offset or size out of range")
+)
+
+// ValidateWindowShape rejects a structurally-invalid windowed expression: a window
+// kind nested anywhere under another window kind (a row's window value is an
+// intrinsic property of its entity's history, so windows do not compose), or a lag
+// offset / trailing-window size outside [1, MaxWindowSize]. It is CGO-free so the
+// orchestrator can guard a decoded objective before dispatch, alongside the depth
+// guard. A non-windowed expression passes trivially; operand type/aggregate
+// validity is the sandbox compiler's concern, not this guard's.
+func ValidateWindowShape(e Expression) error {
+	return validateWindowShape(e, false)
+}
+
+func validateWindowShape(e Expression, underWindow bool) error {
+	switch e.Kind {
+	case LagKind:
+		if underWindow {
+			return ErrWindowNested
+		}
+		if e.Offset < 1 || e.Offset > MaxWindowSize {
+			return fmt.Errorf("%w: lag offset %d not in [1, %d]", ErrWindowBounds, e.Offset, MaxWindowSize)
+		}
+		return validateWindowShape(derefExpr(e.Inner), true)
+	case TrailingAggregateKind:
+		if underWindow {
+			return ErrWindowNested
+		}
+		if e.WindowSize < 1 || e.WindowSize > MaxWindowSize {
+			return fmt.Errorf("%w: trailing window size %d not in [1, %d]", ErrWindowBounds, e.WindowSize, MaxWindowSize)
+		}
+		return validateWindowShape(derefExpr(e.Inner), true)
+	case CastKind:
+		return validateWindowShape(derefExpr(e.Operand), underWindow)
+	case ComparisonKind, ArithmeticKind:
+		if err := validateWindowShape(derefExpr(e.Left), underWindow); err != nil {
+			return err
+		}
+		return validateWindowShape(derefExpr(e.Right), underWindow)
+	case CaseKind:
+		for _, br := range e.Cases {
+			if err := validateWindowShape(derefExpr(br.When), underWindow); err != nil {
+				return err
+			}
+			if err := validateWindowShape(derefExpr(br.Then), underWindow); err != nil {
+				return err
+			}
+		}
+		return validateWindowShape(derefExpr(e.Else), underWindow)
+	default:
+		return nil
+	}
+}
+
+// HasWindowKind reports whether an expression tree contains any windowed construct
+// (lag or trailing aggregate). It is the cheap "this objective is windowed"
+// detector used to require the entity/time bindings and to route windowed findings
+// to their own verification outcome.
+func HasWindowKind(e Expression) bool {
+	switch e.Kind {
+	case LagKind, TrailingAggregateKind:
+		return true
+	case CastKind:
+		return hasWindowChild(e.Operand)
+	case ComparisonKind, ArithmeticKind:
+		return hasWindowChild(e.Left) || hasWindowChild(e.Right)
+	case CaseKind:
+		for _, br := range e.Cases {
+			if hasWindowChild(br.When) || hasWindowChild(br.Then) {
+				return true
+			}
+		}
+		return hasWindowChild(e.Else)
+	default:
+		return false
+	}
+}
+
+func hasWindowChild(e *Expression) bool {
+	if e == nil {
+		return false
+	}
+	return HasWindowKind(*e)
+}
+
+// derefExpr dereferences an AST child, returning a zero Expression (which the
+// window walkers treat as a leaf) when the child is nil.
+func derefExpr(e *Expression) Expression {
+	if e == nil {
+		return Expression{}
+	}
+	return *e
 }
 
 // ConstraintOp expresses a comparison used by both the matrix's numeric
@@ -502,4 +626,107 @@ func columnKnown(field string, columns []string) bool {
 		}
 	}
 	return false
+}
+
+// UnknownFilterValues returns the equality/membership filter operands that name a
+// value absent from their column's known distinct-value set, rendered as
+// "column=value" offenders and deduplicated in first-seen order. It is the value
+// analogue of UnknownFilterColumns: only eq/neq/in/not_in constraints are checked,
+// and only against columns present in values -- a column with no listed values
+// (high-cardinality or continuous) is not value-constrained and is skipped, not an
+// error. Comparison is case-insensitive on both the column key and the value,
+// mirroring the compiler's case-insensitive column matching and absorbing the
+// boolean rendering difference between a proposal's True and DuckDB's cast true.
+// Operands are rendered to the string form the distinct-value probe stored (a
+// CAST(... AS VARCHAR)) -- integer literals without a trailing decimal -- so a
+// valid proposal is never falsely rejected. CGO-free so the orchestrator can
+// pre-check a proposal's filter values without importing the sandbox compiler.
+func UnknownFilterValues(filters []Constraint, values map[string][]string) []string {
+	seen := map[string]bool{}
+	var unknown []string
+	for _, f := range filters {
+		known, ok := knownValues(f.Field, values)
+		if !ok {
+			continue
+		}
+		for _, operand := range filterOperands(f) {
+			if valueKnown(operand, known) {
+				continue
+			}
+			offender := f.Field + "=" + operand
+			key := strings.ToLower(offender)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			unknown = append(unknown, offender)
+		}
+	}
+	return unknown
+}
+
+// knownValues finds a column's distinct-value set under case-insensitive column
+// matching, reporting whether the column is value-constrained at all.
+func knownValues(field string, values map[string][]string) ([]string, bool) {
+	for col, vs := range values {
+		if strings.EqualFold(field, col) {
+			return vs, true
+		}
+	}
+	return nil, false
+}
+
+// valueKnown reports whether operand matches any known value case-insensitively.
+func valueKnown(operand string, known []string) bool {
+	for _, v := range known {
+		if strings.EqualFold(operand, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterOperands renders a constraint's equality/membership operands to the
+// strings a distinct-value set is matched against. A numeric-threshold constraint
+// carries no categorical operand and yields nothing.
+func filterOperands(c Constraint) []string {
+	switch {
+	case c.IsEqualityOp():
+		if c.Operand == nil {
+			return nil
+		}
+		return []string{renderOperandValue(c.Operand)}
+	case c.IsMembershipOp():
+		out := make([]string, 0, len(c.Members))
+		for i := range c.Members {
+			out = append(out, renderOperandValue(&c.Members[i]))
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// renderOperandValue renders a filter operand to the string form the distinct-
+// value probe stored (a DuckDB CAST(... AS VARCHAR)): a string verbatim, a boolean
+// as true/false (matched case-insensitively), and a number without a trailing
+// decimal for an integral value, so an integer column's 5 is not compared as 5.0.
+// The 'f' format avoids the scientific notation 'g' would emit for large integers,
+// which DuckDB's integer cast never produces.
+func renderOperandValue(l *LiteralValue) string {
+	switch {
+	case l == nil:
+		return ""
+	case l.String != nil:
+		return *l.String
+	case l.Bool != nil:
+		if *l.Bool {
+			return "true"
+		}
+		return "false"
+	case l.Number != nil:
+		return strconv.FormatFloat(*l.Number, 'f', -1, 64)
+	default:
+		return ""
+	}
 }

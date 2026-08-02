@@ -24,6 +24,9 @@ const (
 // carries exactly one objective form: a tabular goal has an EvaluationMatrix
 // (TargetFields empty); a document goal has TargetFields (a zero-value matrix).
 // ConfidenceThreshold is nil when the goal takes the service-wide HITL default.
+// EntityKeyColumn and TimeColumn are the window bindings a windowed/entity-relative
+// objective compiles against; both empty when the goal has a plain aggregate
+// objective. They are always both set or both empty (validated at registration).
 type Goal struct {
 	OptimizationFunctionID string
 	GoalText               string
@@ -32,6 +35,8 @@ type Goal struct {
 	DataSourceRef          string
 	ConfidenceThreshold    *float64
 	EpochMode              EpochMode
+	EntityKeyColumn        string
+	TimeColumn             string
 	CreatedAt              time.Time
 }
 
@@ -50,9 +55,12 @@ func NewGoalRegistry(pool *Pool) *GoalRegistry {
 }
 
 // goalColumns is the read projection Get and List share, so their column order
-// and scan order cannot drift apart.
+// and scan order cannot drift apart. The nullable window-binding columns are
+// COALESCEd to ” so they scan into plain string fields (empty ⇒ unbound), per the
+// store's NULL-scan convention.
 const goalColumns = "optimization_function_id, goal_text, evaluation_matrix, datasource_ref, " +
-	"target_fields, confidence_threshold, epoch_mode, created_at"
+	"target_fields, confidence_threshold, epoch_mode, " +
+	"coalesce(entity_key_column, ''), coalesce(time_column, ''), created_at"
 
 // Insert persists a registered goal. A document goal writes a NULL
 // evaluation_matrix and populated target_fields; a tabular goal does the reverse.
@@ -75,12 +83,16 @@ func (g *GoalRegistry) Insert(ctx context.Context, goal Goal) error {
 	if epochMode == "" {
 		epochMode = EpochSpeculative
 	}
+	// An unbound window binding writes SQL NULL (not an empty string), so a windowed
+	// goal is cheaply distinguishable by its non-NULL columns.
+	entityKey := nullableText(goal.EntityKeyColumn)
+	timeColumn := nullableText(goal.TimeColumn)
 	_, err = g.pool.Exec(ctx,
 		"INSERT INTO goal_registry "+
-			"(optimization_function_id, goal_text, evaluation_matrix, datasource_ref, target_fields, confidence_threshold, epoch_mode) "+
-			"VALUES ($1, $2, $3, $4, $5, $6, $7)",
+			"(optimization_function_id, goal_text, evaluation_matrix, datasource_ref, target_fields, confidence_threshold, epoch_mode, entity_key_column, time_column) "+
+			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
 		goal.OptimizationFunctionID, goal.GoalText, matrix, goal.DataSourceRef, targetFields,
-		goal.ConfidenceThreshold, epochMode,
+		goal.ConfidenceThreshold, epochMode, entityKey, timeColumn,
 	)
 	if err != nil {
 		return fmt.Errorf("insert goal: %w", err)
@@ -125,7 +137,7 @@ func (g *GoalRegistry) Get(ctx context.Context, optimizationFunctionID string) (
 		"SELECT "+goalColumns+" FROM goal_registry WHERE optimization_function_id = $1",
 		optimizationFunctionID,
 	).Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix, &goal.DataSourceRef, &targetFields,
-		&goal.ConfidenceThreshold, &goal.EpochMode, &goal.CreatedAt)
+		&goal.ConfidenceThreshold, &goal.EpochMode, &goal.EntityKeyColumn, &goal.TimeColumn, &goal.CreatedAt)
 	if err != nil {
 		return Goal{}, fmt.Errorf("get goal %q: %w", optimizationFunctionID, err)
 	}
@@ -153,7 +165,7 @@ func (g *GoalRegistry) List(ctx context.Context) ([]Goal, error) {
 		var matrix, targetFields []byte
 		if err := rows.Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix,
 			&goal.DataSourceRef, &targetFields, &goal.ConfidenceThreshold, &goal.EpochMode,
-			&goal.CreatedAt); err != nil {
+			&goal.EntityKeyColumn, &goal.TimeColumn, &goal.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan goal row: %w", err)
 		}
 		if err := decodeGoalObjective(&goal, matrix, targetFields); err != nil {

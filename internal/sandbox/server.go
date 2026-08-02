@@ -30,28 +30,30 @@ type refValidator interface {
 // layer over immutable content-addressed refs. The limiter bounds per-class
 // concurrency, and the ref validator scopes requests to registered data sources.
 type Server struct {
-	objects        *objectstore.Client
-	validator      refValidator
-	cache          *StageCache
-	limiter        *classLimiter
-	maxObjectBytes int64
-	maxBodyBytes   int64
-	maxTempDirSize string
+	objects          *objectstore.Client
+	validator        refValidator
+	cache            *StageCache
+	limiter          *classLimiter
+	maxObjectBytes   int64
+	maxBodyBytes     int64
+	maxTempDirSize   string
+	distinctValueCap int
 }
 
 // NewServer wires the handlers to the object store, the ref validator, the staging
 // cache, the concurrency limiter, and the staging limits. It takes primitives and
 // narrow types only (infra-constructor convention). A nil validator and a nil cache
 // are documented test seams; the wired binary passes real ones.
-func NewServer(objects *objectstore.Client, validator refValidator, cache *StageCache, limiter *classLimiter, maxObjectBytes, maxBodyBytes int64, maxTempDirSize string) *Server {
+func NewServer(objects *objectstore.Client, validator refValidator, cache *StageCache, limiter *classLimiter, maxObjectBytes, maxBodyBytes int64, maxTempDirSize string, distinctValueCap int) *Server {
 	return &Server{
-		objects:        objects,
-		validator:      validator,
-		cache:          cache,
-		limiter:        limiter,
-		maxObjectBytes: maxObjectBytes,
-		maxBodyBytes:   maxBodyBytes,
-		maxTempDirSize: maxTempDirSize,
+		objects:          objects,
+		validator:        validator,
+		cache:            cache,
+		limiter:          limiter,
+		maxObjectBytes:   maxObjectBytes,
+		maxBodyBytes:     maxBodyBytes,
+		maxTempDirSize:   maxTempDirSize,
+		distinctValueCap: distinctValueCap,
 	}
 }
 
@@ -68,8 +70,9 @@ func (s *Server) Routes() http.Handler {
 // the shared datasource types are tag-less by design, so the sandbox maps to
 // these local DTOs rather than tagging the shared package.
 type columnDTO struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name           string   `json:"name"`
+	Type           string   `json:"type"`
+	DistinctValues []string `json:"distinct_values,omitempty"`
 }
 
 type schemaDTO struct {
@@ -128,6 +131,8 @@ type ExecuteRequest struct {
 	Target          domain.Target           `json:"target"`
 	ValueExpression *domain.Expression      `json:"value_expression,omitempty"`
 	ObjectiveLabel  string                  `json:"objective_label,omitempty"`
+	EntityKeyColumn string                  `json:"entity_key_column,omitempty"`
+	TimeColumn      string                  `json:"time_column,omitempty"`
 	IncludeRowCount bool                    `json:"include_row_count,omitempty"`
 	Filters         []domain.Constraint     `json:"filters"`
 }
@@ -185,7 +190,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
+	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize, s.distinctValueCap)
 	schema, err := src.Introspect(r.Context())
 	if err != nil {
 		writeStageErr(w, err)
@@ -306,9 +311,16 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		writeStageErr(w, err)
 		return
 	}
+	// A windowed value expression needs entity/time bindings to compile; reject one
+	// without them here, pre-staging, since the check is schema-independent.
+	if req.ValueExpression != nil && domain.HasWindowKind(*req.ValueExpression) &&
+		(req.EntityKeyColumn == "" || req.TimeColumn == "") {
+		service.WriteErr(w, http.StatusBadRequest, "windowed objective requires entity_key_column and time_column")
+		return
+	}
 
-	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
-	m, err := src.ExecuteCounted(r.Context(), req.Aggregation, req.Target, req.ValueExpression, req.Filters, req.IncludeRowCount)
+	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize, s.distinctValueCap)
+	m, err := src.ExecuteCounted(r.Context(), req.Aggregation, req.Target, req.ValueExpression, req.Filters, req.IncludeRowCount, req.EntityKeyColumn, req.TimeColumn)
 	if err != nil {
 		writeStageErr(w, err)
 		return
@@ -355,7 +367,7 @@ func bindTargets(targets []domain.Target, cols []datasource.Column) ([]TargetBin
 func toSchemaDTO(schema *datasource.Schema) schemaDTO {
 	cols := make([]columnDTO, 0, len(schema.Columns))
 	for _, c := range schema.Columns {
-		cols = append(cols, columnDTO{Name: c.Name, Type: c.Type})
+		cols = append(cols, columnDTO{Name: c.Name, Type: c.Type, DistinctValues: c.DistinctValues})
 	}
 	return schemaDTO{Kind: string(schema.Kind), Columns: cols}
 }

@@ -242,6 +242,11 @@ func (w *Worker) Run(ctx context.Context, goalID string) (err error) {
 	if err != nil {
 		return fmt.Errorf("pin objective: %w", err)
 	}
+	// The window bindings live on the goal, not the matrix, so populate them after
+	// pinning — a windowed objective compiles against the same entity/time columns
+	// here as in the Phase-1 loop.
+	obj.EntityKeyColumn = goal.EntityKeyColumn
+	obj.TimeColumn = goal.TimeColumn
 	target := searchTarget{
 		goalID:        goalID,
 		dataSourceRef: goal.DataSourceRef,

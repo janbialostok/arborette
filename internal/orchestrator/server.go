@@ -44,8 +44,8 @@ const (
 // document methods sit here beside the tabular ones: the document intake path
 // derives extractable fields, and the extraction loop measures each field.
 type claudeClient interface {
-	GenerateEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema) (domain.EvaluationMatrix, error)
-	RepairEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema, prior domain.EvaluationMatrix, validationErr string) (domain.EvaluationMatrix, error)
+	GenerateEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema, windowed bool) (domain.EvaluationMatrix, error)
+	RepairEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema, prior domain.EvaluationMatrix, validationErr string, windowed bool) (domain.EvaluationMatrix, error)
 	ProposeInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema llm.SandboxSchema, node llm.TreeContext) (llm.Proposal, error)
 	RepairInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema llm.SandboxSchema, node llm.TreeContext, prior llm.Proposal, validationErr string) (llm.Proposal, error)
 	IntrospectDocumentFields(ctx context.Context, goalText, sample string) ([]domain.TargetField, error)

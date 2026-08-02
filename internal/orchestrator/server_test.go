@@ -293,6 +293,7 @@ type fakeClaude struct {
 	proposalErr       error
 	childProposal     *llm.Proposal
 	gotSchema         llm.SandboxSchema
+	gotWindowed       bool
 	gotNodes          []llm.TreeContext
 	treeRepair        llm.Proposal
 	treeRepairErr     error
@@ -309,11 +310,12 @@ type fakeClaude struct {
 	gotMethods        []string
 }
 
-func (f *fakeClaude) GenerateEvaluationMatrix(_ context.Context, _ string, schema llm.SandboxSchema) (domain.EvaluationMatrix, error) {
+func (f *fakeClaude) GenerateEvaluationMatrix(_ context.Context, _ string, schema llm.SandboxSchema, windowed bool) (domain.EvaluationMatrix, error) {
 	f.gotSchema = schema
+	f.gotWindowed = windowed
 	return f.matrix, f.matrixErr
 }
-func (f *fakeClaude) RepairEvaluationMatrix(_ context.Context, _ string, _ llm.SandboxSchema, _ domain.EvaluationMatrix, _ string) (domain.EvaluationMatrix, error) {
+func (f *fakeClaude) RepairEvaluationMatrix(_ context.Context, _ string, _ llm.SandboxSchema, _ domain.EvaluationMatrix, _ string, _ bool) (domain.EvaluationMatrix, error) {
 	f.repairCalls++
 	return f.repair, f.repairErr
 }

@@ -13,10 +13,14 @@ type SandboxSchema struct {
 	Columns []SandboxColumn
 }
 
-// SandboxColumn is one introspected column name and its type.
+// SandboxColumn is one introspected column name and its type. DistinctValues is
+// the column's value set when it is a low-cardinality categorical column, nil
+// otherwise; the tree-proposal prompt grounds filter values on it, and the
+// deterministic post-check rejects proposals naming a value outside it.
 type SandboxColumn struct {
-	Name string
-	Type string
+	Name           string
+	Type           string
+	DistinctValues []string
 }
 
 // TreeContext carries the fixed objective and the parent's cumulative filter

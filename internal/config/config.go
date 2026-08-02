@@ -92,6 +92,13 @@ type EmbeddingConfig struct {
 // policy, so there is no separate eviction knob. ExecuteConcurrency is the default
 // request class's concurrent-slot count; MaxBodyBytes caps each request body.
 //
+// DistinctValueCap is the low-cardinality cutoff for value grounding: a
+// categorical column (text/boolean/integer) with at most this many distinct
+// values has them returned by introspection, so the tree-proposal prompt can be
+// grounded on the real values and the deterministic value post-check can reject
+// invented ones; a column above the cap is treated as high-cardinality and
+// returns no values. A zero/negative value disables the probe.
+//
 // InternalAuthToken is the shared secret the sandbox verifies on every route -- the
 // same INTERNAL_AUTH_TOKEN the orchestrator's internal write surfaces verify and
 // the callers present (empty disables the guard).
@@ -103,6 +110,7 @@ type SandboxConfig struct {
 	StageCacheMaxBytes int64
 	ExecuteConcurrency int
 	MaxBodyBytes       int64
+	DistinctValueCap   int
 	InternalAuthToken  string
 }
 
@@ -316,6 +324,7 @@ func Load() (Config, error) {
 			StageCacheMaxBytes: int64Env("SANDBOX_STAGE_CACHE_MAX_BYTES", 2<<30),
 			ExecuteConcurrency: intEnv("SANDBOX_EXECUTE_CONCURRENCY", 8),
 			MaxBodyBytes:       int64Env("SANDBOX_MAX_BODY_BYTES", 1<<20),
+			DistinctValueCap:   intEnv("SANDBOX_DISTINCT_VALUE_CAP", 50),
 			InternalAuthToken:  os.Getenv("INTERNAL_AUTH_TOKEN"),
 		},
 		Orchestrator: OrchestratorConfig{

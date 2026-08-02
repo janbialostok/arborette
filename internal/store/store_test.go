@@ -551,6 +551,53 @@ func TestGoalRegistryDocumentGoal(t *testing.T) {
 	}
 }
 
+// TestGoalRegistryWindowBindings round-trips the entity-key/time-column window
+// bindings: a goal that binds them reads them back verbatim, and a goal that binds
+// neither reads them back as empty strings (the COALESCE of their NULL columns).
+func TestGoalRegistryWindowBindings(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	registry := store.NewGoalRegistry(p)
+
+	boundID := testutil.NewID(t)
+	if err := registry.Insert(ctx, store.Goal{
+		OptimizationFunctionID: boundID,
+		GoalText:               "flag anomalous velocity",
+		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "amount", Direction: domain.Maximize, Aggregation: "avg"}}},
+		DataSourceRef:          "s3://arborette/txns.csv",
+		EntityKeyColumn:        "account_id",
+		TimeColumn:             "ts",
+	}); err != nil {
+		t.Fatalf("insert windowed goal: %v", err)
+	}
+	got, err := registry.Get(ctx, boundID)
+	if err != nil {
+		t.Fatalf("get windowed goal: %v", err)
+	}
+	if got.EntityKeyColumn != "account_id" || got.TimeColumn != "ts" {
+		t.Fatalf("window bindings round-trip mismatch: entity=%q time=%q", got.EntityKeyColumn, got.TimeColumn)
+	}
+
+	// A goal with no bindings reads both back as empty (NULL columns COALESCEd).
+	unboundID := testutil.NewID(t)
+	if err := registry.Insert(ctx, store.Goal{
+		OptimizationFunctionID: unboundID,
+		GoalText:               "grow revenue",
+		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
+		DataSourceRef:          "s3://arborette/data.csv",
+	}); err != nil {
+		t.Fatalf("insert unbound goal: %v", err)
+	}
+	got, err = registry.Get(ctx, unboundID)
+	if err != nil {
+		t.Fatalf("get unbound goal: %v", err)
+	}
+	if got.EntityKeyColumn != "" || got.TimeColumn != "" {
+		t.Fatalf("unbound goal must read empty bindings, got entity=%q time=%q", got.EntityKeyColumn, got.TimeColumn)
+	}
+}
+
 // seedGoal inserts a minimal registered goal a run row can reference, returning
 // its id.
 func seedGoal(t *testing.T, ctx context.Context, p *store.Pool) string {

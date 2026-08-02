@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -74,6 +75,91 @@ func parseReviewSettings(r *http.Request) (reviewSettings, error) {
 	return settings, nil
 }
 
+// parseWindowBindings reads the optional entity-key/time-column window bindings off
+// the registration form and validates them against the introspected schema: both or
+// neither must be present, each must resolve to exactly one column
+// (case-insensitive, mirroring the sandbox's own field resolution), and the time
+// column must be orderable (temporal or numeric). It returns the resolved actual
+// column names so they persist and compile against the exact schema spelling, or an
+// analyst-fixable error the caller maps to 422.
+func parseWindowBindings(r *http.Request, cols []columnDTO) (entityKey, timeColumn string, err error) {
+	entity := strings.TrimSpace(r.FormValue("entity_key_column"))
+	ts := strings.TrimSpace(r.FormValue("time_column"))
+	if entity == "" && ts == "" {
+		return "", "", nil
+	}
+	if entity == "" || ts == "" {
+		return "", "", errors.New("entity_key_column and time_column must be provided together")
+	}
+	entityCol, ok := resolveSchemaColumn(cols, entity)
+	if !ok {
+		return "", "", fmt.Errorf("entity_key_column %q does not resolve to a unique column in the data source", entity)
+	}
+	timeCol, ok := resolveSchemaColumn(cols, ts)
+	if !ok {
+		return "", "", fmt.Errorf("time_column %q does not resolve to a unique column in the data source", ts)
+	}
+	if !isOrderableColumnType(timeCol.Type) {
+		return "", "", fmt.Errorf("time_column %q must be a temporal or numeric column, not %s", ts, timeCol.Type)
+	}
+	return entityCol.Name, timeCol.Name, nil
+}
+
+// resolveSchemaColumn resolves a request field to its single introspected column
+// under case-insensitive matching, reporting false when no column or more than one
+// column matches (a case-colliding schema is ambiguous, not a silent pick) —
+// mirroring the sandbox compiler's resolveColumn semantics.
+func resolveSchemaColumn(cols []columnDTO, field string) (columnDTO, bool) {
+	var match columnDTO
+	found := 0
+	for _, c := range cols {
+		if strings.EqualFold(c.Name, field) {
+			match = c
+			found++
+		}
+	}
+	if found != 1 {
+		return columnDTO{}, false
+	}
+	return match, true
+}
+
+// isOrderableColumnType reports whether a DuckDB column type can back a window's
+// ORDER BY: a numeric or temporal type. It mirrors the sandbox compiler's coarse
+// type classification, which lives behind the CGO firewall and cannot be imported,
+// so the orchestrator can reject a non-orderable time column at registration.
+func isOrderableColumnType(t string) bool {
+	u := strings.ToUpper(strings.TrimSpace(t))
+	switch {
+	case orderableNumericTypes[u],
+		strings.HasPrefix(u, "DECIMAL"),
+		strings.HasPrefix(u, "DATE"),
+		strings.HasPrefix(u, "TIME"),
+		strings.HasPrefix(u, "TIMESTAMP"):
+		return true
+	default:
+		return false
+	}
+}
+
+// orderableNumericTypes is the DuckDB numeric set (the fixed-point DECIMAL(p,s) is
+// matched by prefix in isOrderableColumnType), mirroring the sandbox compiler's
+// numericTypes across the CGO firewall.
+var orderableNumericTypes = map[string]bool{
+	"TINYINT":   true,
+	"SMALLINT":  true,
+	"INTEGER":   true,
+	"BIGINT":    true,
+	"HUGEINT":   true,
+	"UTINYINT":  true,
+	"USMALLINT": true,
+	"UINTEGER":  true,
+	"UBIGINT":   true,
+	"UHUGEINT":  true,
+	"FLOAT":     true,
+	"DOUBLE":    true,
+}
+
 // handleSubmitGoal registers an analyst goal: it ingests the data source into the
 // object store, introspects the source as a precondition, fits the Evaluation
 // Matrix to that schema, validates the fitted objective by a dry-run against the
@@ -134,7 +220,21 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	schema := toSandboxSchema(introspect.Schema)
 
-	matrix, err := s.claude.GenerateEvaluationMatrix(ctx, goal, schema)
+	// Window bindings are validated against the introspected schema before fitting:
+	// both-or-neither, each resolving to a unique column, and an orderable time
+	// column. A binding failure is analyst-fixable, so it is a 422 like an unfittable
+	// objective. The resolved actual names persist so they compile against the exact
+	// schema spelling.
+	entityKey, timeColumn, err := parseWindowBindings(r, introspect.Schema.Columns)
+	if err != nil {
+		service.WriteErr(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	// Window kinds are reachable only when the goal bound its entity/time columns, so
+	// availability rides that binding into the fitting prompt and the dry-run.
+	windowed := entityKey != ""
+
+	matrix, err := s.claude.GenerateEvaluationMatrix(ctx, goal, schema, windowed)
 	if err != nil {
 		log.Printf("orchestrator: generate evaluation matrix: %v", err)
 		service.WriteErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
@@ -144,16 +244,16 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	// Validate the fitted objective by executing it against the sandbox with no
 	// filters (the exact request the root baseline will run). A sandbox fault
 	// (pre- or post-repair) is surfaced as-is, never labeled an unfixable objective.
-	verr := s.dryRunObjective(ctx, ref, matrix)
+	verr := s.dryRunObjective(ctx, ref, matrix, entityKey, timeColumn)
 	for attempts := 0; isObjectiveValidationFailure(verr) && attempts < maxObjectiveRepairs; attempts++ {
-		repaired, rerr := s.claude.RepairEvaluationMatrix(ctx, goal, schema, matrix, verr.Error())
+		repaired, rerr := s.claude.RepairEvaluationMatrix(ctx, goal, schema, matrix, verr.Error(), windowed)
 		if rerr != nil {
 			log.Printf("orchestrator: repair evaluation matrix: %v", rerr)
 			service.WriteErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
 			return
 		}
 		matrix = repaired
-		verr = s.dryRunObjective(ctx, ref, matrix)
+		verr = s.dryRunObjective(ctx, ref, matrix, entityKey, timeColumn)
 	}
 	if isObjectiveValidationFailure(verr) {
 		service.WriteErr(w, http.StatusUnprocessableEntity, "could not fit the goal to the data source: "+verr.Error())
@@ -172,6 +272,8 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		DataSourceRef:          ref,
 		ConfidenceThreshold:    review.threshold,
 		EpochMode:              review.epochMode,
+		EntityKeyColumn:        entityKey,
+		TimeColumn:             timeColumn,
 	}); err != nil {
 		log.Printf("orchestrator: insert goal: %v", err)
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")

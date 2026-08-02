@@ -39,7 +39,7 @@ func TestRowCountColumnIsOptIn(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		uncounted, _, err := compileObjectiveCounted(testTableFn, testCols(), "avg", expr, filters, false)
+		uncounted, _, err := compileObjectiveCounted(testTableFn, testCols(), "avg", expr, filters, false, "", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -47,7 +47,7 @@ func TestRowCountColumnIsOptIn(t *testing.T) {
 			t.Fatalf("uncounted SQL drifted from the legacy path:\n got %q\nwant %q", uncounted, legacy)
 		}
 
-		counted, args, err := compileObjectiveCounted(testTableFn, testCols(), "avg", expr, filters, true)
+		counted, args, err := compileObjectiveCounted(testTableFn, testCols(), "avg", expr, filters, true, "", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

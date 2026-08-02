@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -143,6 +144,12 @@ func TestExpressionDepth(t *testing.T) {
 		{"case bucket", caseBucket, 3},
 		{"case with deepest else arm", caseElseDeepest, 3},
 		{"nil children are depth zero", Expression{Kind: ComparisonKind, Op: "="}, 1},
+		{"lag counts through its inner expression", Expression{Kind: LagKind, Offset: 1,
+			Inner: &Expression{Kind: ColumnRefKind, Column: "amount"}}, 2},
+		{"trailing aggregate counts through its inner expression", Expression{Kind: TrailingAggregateKind, WindowAgg: "avg", WindowSize: 5,
+			Inner: &Expression{Kind: ComparisonKind, Op: "=",
+				Left:  &Expression{Kind: ColumnRefKind, Column: "flag"},
+				Right: &Expression{Kind: LiteralKind, Literal: &LiteralValue{Bool: ptr(true)}}}}, 3},
 		{"over-cap cast chain", overCap, MaxObjectiveExpressionDepth + 2},
 	}
 	for _, c := range cases {
@@ -312,6 +319,144 @@ func TestRenderConstraint(t *testing.T) {
 				t.Fatalf("RenderConstraint = %q, want %q", got, c.want)
 			}
 		})
+	}
+}
+
+func TestUnknownFilterValues(t *testing.T) {
+	values := map[string][]string{
+		"HomePlanet": {"Europa", "Mars"},
+		"flag":       {"true", "false"},
+		"rating":     {"1", "2", "3"},
+	}
+
+	t.Run("known value passes case-insensitively", func(t *testing.T) {
+		filters := []Constraint{{Field: "homeplanet", Op: Equal, Operand: &LiteralValue{String: ptr("europa")}}}
+		if got := UnknownFilterValues(filters, values); got != nil {
+			t.Fatalf("case-insensitive value match should pass, got %v", got)
+		}
+	})
+
+	t.Run("unknown value is reported as column=value", func(t *testing.T) {
+		filters := []Constraint{{Field: "HomePlanet", Op: Equal, Operand: &LiteralValue{String: ptr("Pluto")}}}
+		got := UnknownFilterValues(filters, values)
+		if len(got) != 1 || got[0] != "HomePlanet=Pluto" {
+			t.Fatalf("unknown = %v, want [HomePlanet=Pluto]", got)
+		}
+	})
+
+	t.Run("membership reports only the absent members", func(t *testing.T) {
+		filters := []Constraint{{Field: "HomePlanet", Op: In, Members: []LiteralValue{{String: ptr("Europa")}, {String: ptr("Xyz")}}}}
+		got := UnknownFilterValues(filters, values)
+		if len(got) != 1 || got[0] != "HomePlanet=Xyz" {
+			t.Fatalf("unknown = %v, want [HomePlanet=Xyz]", got)
+		}
+	})
+
+	t.Run("column without a value list is skipped", func(t *testing.T) {
+		filters := []Constraint{{Field: "Age", Op: Equal, Operand: &LiteralValue{String: ptr("anything")}}}
+		if got := UnknownFilterValues(filters, values); got != nil {
+			t.Fatalf("high-cardinality column must be skipped, got %v", got)
+		}
+	})
+
+	t.Run("boolean operand matches the cast true/false", func(t *testing.T) {
+		filters := []Constraint{{Field: "flag", Op: Equal, Operand: &LiteralValue{Bool: ptr(true)}}}
+		if got := UnknownFilterValues(filters, values); got != nil {
+			t.Fatalf("boolean true should match cast 'true', got %v", got)
+		}
+	})
+
+	t.Run("integer operand renders without a decimal", func(t *testing.T) {
+		known := []Constraint{{Field: "rating", Op: Equal, Operand: &LiteralValue{Number: ptr(2.0)}}}
+		if got := UnknownFilterValues(known, values); got != nil {
+			t.Fatalf("integral 2 should match '2', got %v", got)
+		}
+		unknown := []Constraint{{Field: "rating", Op: Equal, Operand: &LiteralValue{Number: ptr(5.0)}}}
+		if got := UnknownFilterValues(unknown, values); len(got) != 1 || got[0] != "rating=5" {
+			t.Fatalf("unknown = %v, want [rating=5]", got)
+		}
+	})
+
+	t.Run("numeric threshold ops carry no categorical operand", func(t *testing.T) {
+		filters := []Constraint{{Field: "rating", Op: GreaterThan, Value: 99}}
+		if got := UnknownFilterValues(filters, values); got != nil {
+			t.Fatalf("threshold ops are not value-checked, got %v", got)
+		}
+	})
+
+	t.Run("repeated offenders dedupe case-insensitively", func(t *testing.T) {
+		filters := []Constraint{
+			{Field: "HomePlanet", Op: Equal, Operand: &LiteralValue{String: ptr("Pluto")}},
+			{Field: "homeplanet", Op: NotEqual, Operand: &LiteralValue{String: ptr("pluto")}},
+		}
+		if got := UnknownFilterValues(filters, values); len(got) != 1 {
+			t.Fatalf("repeated offender must dedupe, got %v", got)
+		}
+	})
+}
+
+func TestValidateWindowShape(t *testing.T) {
+	col := Expression{Kind: ColumnRefKind, Column: "amount"}
+	lag := func(inner Expression, offset int) Expression {
+		return Expression{Kind: LagKind, Inner: &inner, Offset: offset}
+	}
+	trailing := func(agg string, inner Expression, size int) Expression {
+		return Expression{Kind: TrailingAggregateKind, WindowAgg: agg, Inner: &inner, WindowSize: size}
+	}
+
+	t.Run("valid windows pass", func(t *testing.T) {
+		if err := ValidateWindowShape(lag(col, 1)); err != nil {
+			t.Fatalf("valid lag should pass: %v", err)
+		}
+		if err := ValidateWindowShape(trailing("avg", col, 10)); err != nil {
+			t.Fatalf("valid trailing aggregate should pass: %v", err)
+		}
+	})
+
+	t.Run("non-windowed expression passes", func(t *testing.T) {
+		if err := ValidateWindowShape(col); err != nil {
+			t.Fatalf("non-windowed expression should pass: %v", err)
+		}
+	})
+
+	t.Run("directly nested window rejected", func(t *testing.T) {
+		if err := ValidateWindowShape(trailing("avg", lag(col, 1), 5)); !errors.Is(err, ErrWindowNested) {
+			t.Fatalf("nested window must be rejected: %v", err)
+		}
+	})
+
+	t.Run("window nested under a non-window is still detected", func(t *testing.T) {
+		nested := Expression{Kind: ArithmeticKind, Op: "/", Left: &col, Right: ptr(trailing("avg", lag(col, 1), 5))}
+		if err := ValidateWindowShape(nested); !errors.Is(err, ErrWindowNested) {
+			t.Fatalf("nested window under arithmetic must be detected: %v", err)
+		}
+	})
+
+	t.Run("sibling windows under a non-window are allowed", func(t *testing.T) {
+		siblings := Expression{Kind: ArithmeticKind, Op: "/", Left: ptr(lag(col, 1)), Right: ptr(trailing("avg", col, 5))}
+		if err := ValidateWindowShape(siblings); err != nil {
+			t.Fatalf("sibling (non-nested) windows should pass: %v", err)
+		}
+	})
+
+	t.Run("out-of-range offsets and sizes rejected", func(t *testing.T) {
+		for _, e := range []Expression{lag(col, 0), lag(col, MaxWindowSize+1), trailing("avg", col, 0), trailing("avg", col, MaxWindowSize+1)} {
+			if err := ValidateWindowShape(e); !errors.Is(err, ErrWindowBounds) {
+				t.Fatalf("out-of-range window must be rejected: %v", err)
+			}
+		}
+	})
+}
+
+func TestHasWindowKind(t *testing.T) {
+	col := Expression{Kind: ColumnRefKind, Column: "amount"}
+	if HasWindowKind(col) {
+		t.Fatal("a bare column is not windowed")
+	}
+	windowed := Expression{Kind: ArithmeticKind, Op: "/", Left: &col,
+		Right: &Expression{Kind: TrailingAggregateKind, WindowAgg: "avg", WindowSize: 5, Inner: &col}}
+	if !HasWindowKind(windowed) {
+		t.Fatal("a window nested under arithmetic must be detected as windowed")
 	}
 }
 

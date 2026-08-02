@@ -14,10 +14,16 @@ const (
 	KindDocument SourceKind = "document"
 )
 
-// Column is a tabular column discovered by introspection.
+// Column is a tabular column discovered by introspection. DistinctValues carries
+// the column's distinct value set when it is a low-cardinality categorical column
+// (text/boolean/integer at or under the introspection cap); it is nil for a
+// high-cardinality or continuous column, or when the source did not probe values.
+// A nil is never a partially-populated set: the probe fills all of a column's
+// values or none, so a consumer treats nil as "unknown, do not ground on it".
 type Column struct {
-	Name string
-	Type string
+	Name           string
+	Type           string
+	DistinctValues []string
 }
 
 // Field is a document candidate-extractable field discovered by introspection

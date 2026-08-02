@@ -26,7 +26,7 @@ func TestStageCacheAmortizesAndFreezesType(t *testing.T) {
 		t.Fatalf("new stage cache: %v", err)
 	}
 
-	cached := NewFileSource(client, cache, ref, 1<<20, "1GiB")
+	cached := NewFileSource(client, cache, ref, 1<<20, "1GiB", 50)
 	gt := []domain.Constraint{{Field: "qty", Op: domain.GreaterThan, Value: 1}}
 
 	first, err := cached.Execute(ctx, "avg", domain.Target{Field: "amount"}, nil, gt)
@@ -47,7 +47,7 @@ func TestStageCacheAmortizesAndFreezesType(t *testing.T) {
 	}
 
 	// The converted Parquet must measure identically to the raw CSV read (nil cache).
-	direct := NewFileSource(client, nil, ref, 1<<20, "1GiB")
+	direct := NewFileSource(client, nil, ref, 1<<20, "1GiB", 50)
 	want, err := direct.Execute(ctx, "avg", domain.Target{Field: "amount"}, nil, gt)
 	if err != nil {
 		t.Fatalf("direct execute: %v", err)
@@ -85,7 +85,7 @@ func TestStageCacheParquetPathAndBypass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cache: %v", err)
 	}
-	src := NewFileSource(client, cache, ref, 1<<20, "1GiB")
+	src := NewFileSource(client, cache, ref, 1<<20, "1GiB", 50)
 	v1, err := src.Execute(ctx, "avg", domain.Target{Field: "amount"}, nil, gt)
 	if err != nil {
 		t.Fatalf("parquet execute 1: %v", err)
@@ -106,7 +106,7 @@ func TestStageCacheParquetPathAndBypass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tiny cache: %v", err)
 	}
-	bypassed := NewFileSource(client, tiny, ref, 1<<20, "1GiB")
+	bypassed := NewFileSource(client, tiny, ref, 1<<20, "1GiB", 50)
 	v2, err := bypassed.Execute(ctx, "avg", domain.Target{Field: "amount"}, nil, gt)
 	if err != nil {
 		t.Fatalf("bypass execute: %v", err)

@@ -59,7 +59,7 @@ func main() {
 
 	limiter := sandbox.NewClassLimiter(map[string]int{sandbox.ClassDefault: cfg.Sandbox.ExecuteConcurrency})
 	srv := sandbox.NewServer(objects, validator, cache, limiter,
-		cfg.Sandbox.MaxObjectBytes, cfg.Sandbox.MaxBodyBytes, cfg.Sandbox.MaxTempDirSize)
+		cfg.Sandbox.MaxObjectBytes, cfg.Sandbox.MaxBodyBytes, cfg.Sandbox.MaxTempDirSize, cfg.Sandbox.DistinctValueCap)
 
 	log.Printf("sandbox: wired object store, postgres, stage cache; serving HTTP on :%s", cfg.Sandbox.Port)
 	if err := service.RunHTTPServer("sandbox", ":"+cfg.Sandbox.Port,

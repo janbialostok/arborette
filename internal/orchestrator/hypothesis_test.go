@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -250,6 +251,207 @@ func TestRunLoopMissingRowCountIsNonFatal(t *testing.T) {
 	}
 	if repo.outcomes[0].Support != 0 {
 		t.Fatalf("support = %d, want 0 when the sandbox returned no count", repo.outcomes[0].Support)
+	}
+}
+
+// TestRunLoopZeroRowSegmentIsNonFatal pins the zero-row outcome: a candidate whose
+// segment matched no rows (counted row_count 0) writes no triplet, records a
+// distinct hypothesis_zero_row_segment audit (not a branch failure), and makes one
+// re-proposal in its place — all without failing the run.
+func TestRunLoopZeroRowSegmentIsNonFatal(t *testing.T) {
+	repo := &fakeRepo{}
+	audits := &fakeAudits{}
+	claude := &fakeClaude{
+		proposal:   llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: nil}}},
+		treeRepair: llm.Proposal{}, // the zero-row re-proposal returns no replacements
+	}
+	sandbox := &fakeSandbox{
+		introspect: revenueSchema(),
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}},                                       // root baseline
+			{Value: map[string]any{"avg(revenue)": nil, sandboxclient.RowCountKey: float64(0)}}, // candidate: empty segment
+		},
+	}
+	srv := newTestServerRepo(repo, &fakeGoals{}, audits, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if len(repo.outcomes) != 0 {
+		t.Fatalf("a zero-row segment must not write a triplet, got %d", len(repo.outcomes))
+	}
+	var zeroRow, branchFail int
+	for _, r := range audits.records {
+		switch r.Action {
+		case "hypothesis_zero_row_segment":
+			zeroRow++
+		case "hypothesis_branch_failure":
+			branchFail++
+		}
+	}
+	if zeroRow != 1 {
+		t.Fatalf("expected one hypothesis_zero_row_segment audit, got %d: %+v", zeroRow, audits.records)
+	}
+	if branchFail != 0 {
+		t.Fatalf("a zero-row segment must not be recorded as a branch failure, got %d", branchFail)
+	}
+	if claude.treeRepairCalls != 1 {
+		t.Fatalf("expected one zero-row re-proposal, got %d", claude.treeRepairCalls)
+	}
+}
+
+// TestRunLoopValueGroundingRepairsInvalidValue pins the value post-check + repair
+// wiring: a candidate naming a value absent from its column's distinct set is
+// repaired against a message that names the offender, and the repaired candidate is
+// what gets measured.
+func TestRunLoopValueGroundingRepairsInvalidValue(t *testing.T) {
+	repo := &fakeRepo{}
+	pluto, europa := "Pluto", "Europa"
+	claude := &fakeClaude{
+		proposal:   llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: []domain.Constraint{{Field: "HomePlanet", Op: domain.Equal, Operand: &domain.LiteralValue{String: &pluto}}}}}},
+		treeRepair: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: []domain.Constraint{{Field: "HomePlanet", Op: domain.Equal, Operand: &domain.LiteralValue{String: &europa}}}}}},
+	}
+	sandbox := &fakeSandbox{
+		introspect: IntrospectResponse{Schema: schemaDTO{Columns: []columnDTO{
+			{Name: "revenue", Type: "DOUBLE"},
+			{Name: "HomePlanet", Type: "VARCHAR", DistinctValues: []string{"Europa", "Mars"}},
+		}}},
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}},                                        // root baseline
+			{Value: map[string]any{"avg(revenue)": 8.0, sandboxclient.RowCountKey: float64(50)}}, // repaired candidate, no improvement → prune
+		},
+	}
+	srv := newTestServerRepo(repo, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if claude.treeRepairCalls != 1 {
+		t.Fatalf("expected one value-grounding repair, got %d", claude.treeRepairCalls)
+	}
+	if msg := claude.treeRepairErrMsg[0]; !strings.Contains(msg, "HomePlanet=Pluto") {
+		t.Fatalf("repair message must name the invalid value, got %q", msg)
+	}
+	if len(repo.outcomes) != 1 {
+		t.Fatalf("the repaired candidate must produce exactly one triplet, got %d", len(repo.outcomes))
+	}
+}
+
+// windowedMatrix fits a windowed objective: avg of a trailing-5 average of
+// order_value. Its dry-run needs entity/time bindings to compile.
+func windowedMatrix() domain.EvaluationMatrix {
+	inner := domain.Expression{Kind: domain.TrailingAggregateKind, WindowAgg: "avg", WindowSize: 5,
+		Inner: &domain.Expression{Kind: domain.ColumnRefKind, Column: "order_value"}}
+	return domain.EvaluationMatrix{Targets: []domain.Target{{Direction: domain.Maximize, Aggregation: "avg", Value: &inner}}}
+}
+
+// TestIsObjectiveValidationFailureClassifiesWindowErrors pins that a windowed-shape
+// or missing-bindings failure is treated as a repairable objective-fit failure (so
+// registration routes it to the repair loop, then a 422), never as a sandbox fault.
+func TestIsObjectiveValidationFailureClassifiesWindowErrors(t *testing.T) {
+	for _, err := range []error{
+		errWindowedWithoutBindings,
+		domain.ErrWindowNested,
+		domain.ErrWindowBounds,
+		fmt.Errorf("wrapped: %w", domain.ErrWindowBounds),
+	} {
+		if !isObjectiveValidationFailure(err) {
+			t.Fatalf("%v must classify as a repairable validation failure", err)
+		}
+	}
+	if isObjectiveValidationFailure(&SandboxError{Status: http.StatusInternalServerError, Message: "boom"}) {
+		t.Fatal("a sandbox 500 must not classify as a validation failure")
+	}
+}
+
+// TestDryRunObjectiveWindowClassification pins the registration dry-run's handling
+// of windowed objectives: a windowed objective without bindings and a nested window
+// are repairable validation failures caught before any sandbox call, while a
+// well-formed windowed objective with bindings dry-runs through to the sandbox.
+func TestDryRunObjectiveWindowClassification(t *testing.T) {
+	srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, &fakeClaude{}, &fakeSandbox{})
+	ctx := context.Background()
+
+	err := srv.dryRunObjective(ctx, "ref", windowedMatrix(), "", "")
+	if !errors.Is(err, errWindowedWithoutBindings) {
+		t.Fatalf("windowed-without-bindings err = %v, want errWindowedWithoutBindings", err)
+	}
+
+	nested := domain.Expression{Kind: domain.TrailingAggregateKind, WindowAgg: "avg", WindowSize: 5,
+		Inner: &domain.Expression{Kind: domain.LagKind, Offset: 1,
+			Inner: &domain.Expression{Kind: domain.ColumnRefKind, Column: "order_value"}}}
+	nestedMatrix := domain.EvaluationMatrix{Targets: []domain.Target{{Direction: domain.Maximize, Aggregation: "avg", Value: &nested}}}
+	if err := srv.dryRunObjective(ctx, "ref", nestedMatrix, "region", "ts"); !errors.Is(err, domain.ErrWindowNested) {
+		t.Fatalf("nested-window err = %v, want domain.ErrWindowNested", err)
+	}
+
+	// With bindings and a well-formed window the dry-run reaches the sandbox, which
+	// the fake answers, so it succeeds.
+	if err := srv.dryRunObjective(ctx, "ref", windowedMatrix(), "region", "ts"); err != nil {
+		t.Fatalf("windowed objective with bindings should dry-run cleanly: %v", err)
+	}
+}
+
+// TestRunLoopThreadsWindowBindings pins that the goal's entity/time bindings ride
+// every execute request, so a windowed objective measures against the same
+// entity/time columns the goal registered (a bindings-less request would compile
+// the window with no partition).
+func TestRunLoopThreadsWindowBindings(t *testing.T) {
+	claude := &fakeClaude{proposal: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: nil}}}}
+	sandbox := &fakeSandbox{
+		introspect: revenueSchema(),
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}}, // root baseline
+			{Value: map[string]any{"avg(revenue)": 8.0}},  // candidate (no improvement → stop)
+		},
+	}
+	srv := newTestServerRepo(&fakeRepo{}, &fakeGoals{}, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	goal := revenueGoal()
+	goal.EntityKeyColumn = "region"
+	goal.TimeColumn = "ts"
+	srv.runLoop(context.Background(), goal, "run-1")
+
+	if len(sandbox.execReqs) == 0 {
+		t.Fatal("expected at least the baseline execute")
+	}
+	for i, req := range sandbox.execReqs {
+		if req.EntityKeyColumn != "region" || req.TimeColumn != "ts" {
+			t.Fatalf("execReq[%d] must carry the goal's window bindings, got (%q, %q)", i, req.EntityKeyColumn, req.TimeColumn)
+		}
+	}
+}
+
+// TestRunLoopZeroRowReproposalIsBounded pins the re-proposal budget: when the one
+// replacement is itself zero-row, it is recorded and pruned — not re-proposed again
+// — so the retry cannot loop.
+func TestRunLoopZeroRowReproposalIsBounded(t *testing.T) {
+	repo := &fakeRepo{}
+	audits := &fakeAudits{}
+	claude := &fakeClaude{
+		proposal:   llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: nil}}},
+		treeRepair: llm.Proposal{Candidates: []llm.CandidateIntervention{{Filters: nil}}}, // replacement, also zero-row
+	}
+	sandbox := &fakeSandbox{
+		introspect: revenueSchema(),
+		execResps: []ExecuteResponse{
+			{Value: map[string]any{"avg(revenue)": 10.0}},                                       // baseline
+			{Value: map[string]any{"avg(revenue)": nil, sandboxclient.RowCountKey: float64(0)}}, // candidate: zero-row
+			{Value: map[string]any{"avg(revenue)": nil, sandboxclient.RowCountKey: float64(0)}}, // replacement: also zero-row
+		},
+	}
+	srv := newTestServerRepo(repo, &fakeGoals{}, audits, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+	srv.runLoop(context.Background(), revenueGoal(), "run-1")
+
+	if claude.treeRepairCalls != 1 {
+		t.Fatalf("the zero-row re-proposal budget is 1; got %d re-proposals", claude.treeRepairCalls)
+	}
+	zeroRow := 0
+	for _, r := range audits.records {
+		if r.Action == "hypothesis_zero_row_segment" {
+			zeroRow++
+		}
+	}
+	if zeroRow != 2 {
+		t.Fatalf("expected two zero-row segments (original + replacement), got %d", zeroRow)
+	}
+	if len(repo.outcomes) != 0 {
+		t.Fatalf("no zero-row segment writes a triplet, got %d", len(repo.outcomes))
 	}
 }
 
@@ -572,7 +774,7 @@ func TestRunLoopChildRepairErrorIsNonTerminal(t *testing.T) {
 
 func TestRunLoopRepairMessageDedupsUnknownColumnsAcrossCandidates(t *testing.T) {
 	// Two invalid candidates reference distinct unknown columns, one repeated in a
-	// different case. splitByColumns collects the unknowns across candidates and dedups
+	// different case. splitByGrounding collects the unknowns across candidates and dedups
 	// case-insensitively in first-seen order; that deduped list is what reaches the
 	// repair call as its validation error.
 	claude := &fakeClaude{

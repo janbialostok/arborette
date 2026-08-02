@@ -17,6 +17,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/arborette/arborette/internal/datasource"
@@ -42,23 +43,27 @@ var (
 // download and parse are re-paid, never what a read returns. A nil cache preserves
 // the original per-request staging.
 type FileSource struct {
-	objects        *objectstore.Client
-	cache          *StageCache
-	dataSourceRef  string
-	maxObjectBytes int64
-	maxTempDirSize string
+	objects          *objectstore.Client
+	cache            *StageCache
+	dataSourceRef    string
+	maxObjectBytes   int64
+	maxTempDirSize   string
+	distinctValueCap int
 }
 
 // NewFileSource builds a FileSource for one object-store ref. cache is optional
 // (nil ⇒ per-request staging). maxObjectBytes caps the staged copy; maxTempDirSize
-// is a DuckDB size string (with a unit) bounding query spill.
-func NewFileSource(objects *objectstore.Client, cache *StageCache, dataSourceRef string, maxObjectBytes int64, maxTempDirSize string) *FileSource {
+// is a DuckDB size string (with a unit) bounding query spill. distinctValueCap is
+// the low-cardinality cutoff for introspection's value probe (0 disables it); it
+// is unused on the execute path, which never introspects values.
+func NewFileSource(objects *objectstore.Client, cache *StageCache, dataSourceRef string, maxObjectBytes int64, maxTempDirSize string, distinctValueCap int) *FileSource {
 	return &FileSource{
-		objects:        objects,
-		cache:          cache,
-		dataSourceRef:  dataSourceRef,
-		maxObjectBytes: maxObjectBytes,
-		maxTempDirSize: maxTempDirSize,
+		objects:          objects,
+		cache:            cache,
+		dataSourceRef:    dataSourceRef,
+		maxObjectBytes:   maxObjectBytes,
+		maxTempDirSize:   maxTempDirSize,
+		distinctValueCap: distinctValueCap,
 	}
 }
 
@@ -81,7 +86,67 @@ func (s *FileSource) Introspect(ctx context.Context) (*datasource.Schema, error)
 	if err != nil {
 		return nil, err
 	}
+	if err := s.probeDistinctValues(ctx, db, tableFn, cols); err != nil {
+		return nil, err
+	}
 	return &datasource.Schema{Kind: datasource.KindTabular, Columns: cols}, nil
+}
+
+// probeDistinctValues fills DistinctValues for each low-cardinality categorical
+// column (text/boolean/integer) over the same staged engine introspection already
+// opened, so value grounding pays no extra download or parse. A continuous or
+// high-cardinality column is left nil (ineligible). A zero/negative cap disables
+// probing. It mutates cols in place -- the slice shares its backing array with the
+// caller's, so the filled values travel back without a copy.
+func (s *FileSource) probeDistinctValues(ctx context.Context, db *sql.DB, tableFn string, cols []datasource.Column) error {
+	if s.distinctValueCap <= 0 {
+		return nil
+	}
+	for i := range cols {
+		if !isProbeableForDistinctValues(cols[i].Type) {
+			continue
+		}
+		values, err := distinctValues(ctx, db, tableFn, cols[i].Name, s.distinctValueCap)
+		if err != nil {
+			return err
+		}
+		cols[i].DistinctValues = values
+	}
+	return nil
+}
+
+// distinctValues reads up to limit+1 distinct non-NULL values of one column, cast
+// to VARCHAR, over the staged engine. The limit+1 read is the over-limit trick: a
+// column returning more than limit distinct values is ineligible for grounding, so
+// it returns (nil, nil) rather than a truncated set that would falsely reject
+// valid proposals. The VARCHAR cast makes every probed type read back as a
+// comparable string that the value post-check's stringification matches; NULLs are
+// excluded. The column name is a schema-derived identifier, quoted through the one
+// sanctioned path; the limit is a server-side integer, formatted directly.
+func distinctValues(ctx context.Context, db *sql.DB, tableFn, col string, limit int) ([]string, error) {
+	q := "SELECT DISTINCT CAST(" + quoteIdent(col) + " AS VARCHAR) FROM " + tableFn +
+		" WHERE " + quoteIdent(col) + " IS NOT NULL LIMIT " + strconv.Itoa(limit+1)
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("probe distinct values: %w", err)
+	}
+	defer rows.Close()
+
+	var values []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("scan distinct value: %w", err)
+		}
+		values = append(values, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("probe distinct values: %w", err)
+	}
+	if len(values) > limit {
+		return nil, nil
+	}
+	return values, nil
 }
 
 // Execute measures one aggregate over the object under the given filters. It
@@ -92,7 +157,7 @@ func (s *FileSource) Introspect(ctx context.Context) (*datasource.Schema, error)
 // legacy path). A nil result means the aggregate filtered to an empty set (SQL
 // NULL) for avg/sum/min/max; count over an empty set returns 0, not nil.
 func (s *FileSource) Execute(ctx context.Context, agg string, target domain.Target, expr *domain.Expression, filters []domain.Constraint) (*float64, error) {
-	m, err := s.ExecuteCounted(ctx, agg, target, expr, filters, false)
+	m, err := s.ExecuteCounted(ctx, agg, target, expr, filters, false, "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -114,8 +179,9 @@ type Measurement struct {
 // scan rather than a second round-trip. The count is populated even when the
 // objective scans as SQL NULL: an empty-filtered aggregate with support 0 is
 // exactly the case a support floor must see. count(*) never returns NULL, so it
-// scans into a plain int64.
-func (s *FileSource) ExecuteCounted(ctx context.Context, agg string, target domain.Target, expr *domain.Expression, filters []domain.Constraint, withCount bool) (Measurement, error) {
+// scans into a plain int64. entityKey/timeColumn are the window bindings a windowed
+// value expression compiles against; both empty for a plain aggregate objective.
+func (s *FileSource) ExecuteCounted(ctx context.Context, agg string, target domain.Target, expr *domain.Expression, filters []domain.Constraint, withCount bool, entityKey, timeColumn string) (Measurement, error) {
 	db, tableFn, cleanup, err := s.stage(ctx)
 	if err != nil {
 		return Measurement{}, err
@@ -130,7 +196,7 @@ func (s *FileSource) ExecuteCounted(ctx context.Context, agg string, target doma
 	var query string
 	var args []any
 	if expr != nil {
-		query, args, err = compileObjectiveCounted(tableFn, cols, agg, *expr, filters, withCount)
+		query, args, err = compileObjectiveCounted(tableFn, cols, agg, *expr, filters, withCount, entityKey, timeColumn)
 	} else {
 		query, args, err = compileQueryCounted(tableFn, cols, agg, target, filters, withCount)
 	}
