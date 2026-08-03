@@ -130,8 +130,10 @@ func RowCount(resp ExecuteResponse) (int64, bool) {
 
 // Analyze-kind discriminators, byte-identical to the sandbox's own constants.
 const (
-	AnalyzeContingency = "contingency"
-	AnalyzeMoments     = "moments"
+	AnalyzeContingency      = "contingency"
+	AnalyzeMoments          = "moments"
+	AnalyzeStratifiedEffect = "stratified_effect"
+	AnalyzeSampledEffect    = "sampled_effect"
 )
 
 // AnalyzeColumn is one contingency-table column: Bins 0 groups on the raw
@@ -141,16 +143,23 @@ type AnalyzeColumn struct {
 	Bins int    `json:"bins,omitempty"`
 }
 
-// AnalyzeRequest asks the sandbox for one contingency or moments aggregation. It is
-// a CGO-free copy of the sandbox wire struct (Columns for contingency; Variables +
-// GroupBy for moments); keep it byte-for-byte JSON-compatible.
+// AnalyzeRequest asks the sandbox for one contingency, moments, or effect
+// aggregation. It is a CGO-free copy of the sandbox wire struct (Columns for
+// contingency; Variables + GroupBy for moments; Aggregation + ValueExpression +
+// Segment + Adjust for the effect kinds); keep it byte-for-byte JSON-compatible.
 type AnalyzeRequest struct {
-	DataSourceRef string              `json:"data_source_ref"`
-	Kind          string              `json:"kind"`
-	Filters       []domain.Constraint `json:"filters,omitempty"`
-	Columns       []AnalyzeColumn     `json:"columns,omitempty"`
-	Variables     []string            `json:"variables,omitempty"`
-	GroupBy       []string            `json:"group_by,omitempty"`
+	DataSourceRef        string              `json:"data_source_ref"`
+	Kind                 string              `json:"kind"`
+	Filters              []domain.Constraint `json:"filters,omitempty"`
+	Columns              []AnalyzeColumn     `json:"columns,omitempty"`
+	Variables            []string            `json:"variables,omitempty"`
+	GroupBy              []string            `json:"group_by,omitempty"`
+	Aggregation          string              `json:"aggregation,omitempty"`
+	ValueExpression      *domain.Expression  `json:"value_expression,omitempty"`
+	Segment              []domain.Constraint `json:"segment,omitempty"`
+	Adjust               []AnalyzeColumn     `json:"adjust,omitempty"`
+	SampleFraction       float64             `json:"sample_fraction,omitempty"`
+	RandomStratifierBins int                 `json:"random_stratifier_bins,omitempty"`
 }
 
 // ContingencyCell is one contingency-table row: the group-key values and the count.
@@ -170,11 +179,25 @@ type MomentsRow struct {
 	Cross []float64 `json:"cross"`
 }
 
+// StratumRow is one stratum of an effect aggregation: the conditioning-set key
+// values, the total complete-case count, and the segment and baseline arms' counts
+// and objective aggregates (nullable — an empty arm aggregates to null). It is a
+// CGO-free copy of the sandbox wire struct; keep it byte-for-byte JSON-compatible.
+type StratumRow struct {
+	Values      []string `json:"values"`
+	N           int64    `json:"n"`
+	SegmentN    int64    `json:"segment_n"`
+	SegmentAgg  *float64 `json:"segment_agg"`
+	BaselineN   int64    `json:"baseline_n"`
+	BaselineAgg *float64 `json:"baseline_agg"`
+}
+
 // AnalyzeResponse carries the aggregation result keyed by kind.
 type AnalyzeResponse struct {
 	Kind    string            `json:"kind"`
 	Cells   []ContingencyCell `json:"cells,omitempty"`
 	Moments []MomentsRow      `json:"moments,omitempty"`
+	Strata  []StratumRow      `json:"strata,omitempty"`
 }
 
 // SandboxError is a non-200 response from the sandbox, carrying the HTTP status

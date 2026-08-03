@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -88,7 +89,14 @@ func destroyConn(ctx context.Context, conn *pgxpool.Conn) {
 // lockKey hashes the (goal, data-source) pair to the int64 advisory-lock key via
 // FNV-1a, the same key both processes derive so they contend on one lock.
 func lockKey(goalID, datasourceRef string) int64 {
+	return fnvInt64Key(goalID, datasourceRef)
+}
+
+// fnvInt64Key hashes its NUL-joined parts to the int64 Postgres advisory-lock key via
+// FNV-1a. Shared by the discovery (goal, data-source) session lock and the per-goal
+// verification transaction lock so the two derivations cannot drift.
+func fnvInt64Key(parts ...string) int64 {
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(goalID + "\x00" + datasourceRef))
+	_, _ = h.Write([]byte(strings.Join(parts, "\x00")))
 	return int64(h.Sum64())
 }

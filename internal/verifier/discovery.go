@@ -9,12 +9,23 @@ import (
 	"github.com/arborette/arborette/internal/verifier/stats"
 )
 
-// Config is the discovery sweep's tuning. The service maps its env-loaded
-// VerifierConfig into this. FDR "bh" applies Benjamini–Hochberg per level; "none"
-// thresholds each p at Alpha with no correction. MaxCondSet bounds the
-// conditioning-set size; Bins is the quantile bin count for binned columns;
-// ColumnCap caps the sweep's variable count; MaxTests bounds the total sandbox
-// round-trips; CallTimeout bounds one analyze call.
+// Config is the Verifier's tuning, shared by the discovery sweep and the
+// verification (adjustment + refutation) stage. The service maps its env-loaded
+// VerifierConfig into this.
+//
+// Discovery knobs: FDR "bh" applies Benjamini–Hochberg per level, "none" thresholds
+// each p at Alpha with no correction; MaxCondSet bounds the conditioning-set size;
+// Bins is the quantile bin count for binned columns (reused to bin numeric
+// adjustment conditioners); ColumnCap caps the sweep's variable count; MaxTests
+// bounds the total sandbox round-trips; CallTimeout bounds one analyze call.
+//
+// Verification knobs: SupportFloor is the per-stratum treated/baseline count below
+// which a stratum fails positivity (not identifiable); CollapseRatio is the fraction
+// of the naive effect the adjusted effect must retain to avoid the confounded verdict;
+// RefutationK is the subsample count; RefutationTau is the score threshold for
+// causally_verified; SampleFraction is each subsample's share; StabilityBand is the
+// relative band a subsample's effect must stay within to count as stable;
+// RandomStratifierBins is the synthetic random-confounder bucket count.
 type Config struct {
 	Alpha       float64
 	FDR         string
@@ -23,6 +34,14 @@ type Config struct {
 	ColumnCap   int
 	MaxTests    int
 	CallTimeout time.Duration
+
+	SupportFloor         int
+	CollapseRatio        float64
+	RefutationK          int
+	RefutationTau        float64
+	SampleFraction       float64
+	StabilityBand        float64
+	RandomStratifierBins int
 }
 
 // Pair is a canonical undirected column pair (A < B lexicographically), the key

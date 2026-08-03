@@ -54,7 +54,7 @@ type candidate struct {
 func (w *Worker) candidatesFromFindings(ctx context.Context, goalID string, findings []graph.CausalTriplet, obj objective.Objective, baseline float64) []candidate {
 	var cands []candidate
 	for _, f := range findings {
-		filters, err := decodeConstraints(f.Intervention.Properties[domain.PropEffectiveFilters])
+		filters, err := domain.DecodeConstraints(f.Intervention.Properties[domain.PropEffectiveFilters])
 		if err != nil {
 			w.publicationFailure(ctx, goalID, f.Intervention.ID, err)
 			continue

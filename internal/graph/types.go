@@ -13,11 +13,28 @@ import (
 )
 
 // CausalTriplet is the linearized State→Intervention→Outcome chain underlying a
-// Meta-Heuristic, returned by TraceCausalChain for trace_causal_chain.
+// Meta-Heuristic, returned by TraceCausalChain for trace_causal_chain. EpistemicSource
+// labels the PRODUCED edge each triplet was read through (observational or
+// causal_inferred), so a trace that intentionally returns both kinds distinguishes
+// them; it defaults to observational for an edge with no recorded value.
 type CausalTriplet struct {
-	State        domain.State
-	Intervention domain.Intervention
-	Outcome      domain.Outcome
+	State           domain.State
+	Intervention    domain.Intervention
+	Outcome         domain.Outcome
+	EpistemicSource domain.EpistemicSource
+}
+
+// CausalEvidence is the latest non-superseded causal_inferred PRODUCED edge for one
+// intervention: the backdoor-adjusted effect, the refutation-derived confidence, and
+// the causal-graph version it was computed against. It is read through the dedicated
+// causal-evidence lookup, which is exempt from the observational-only collection
+// filter, so a consumer that weights causal knowledge (search value backprop, the MCP
+// evidence output) can reach it without seeing observational edges.
+type CausalEvidence struct {
+	InterventionID string
+	EffectSize     float64
+	Confidence     float64
+	GraphVersion   int
 }
 
 // ExtractionOutcome is an extract-type Outcome joined to the two things a bare

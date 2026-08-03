@@ -31,10 +31,12 @@ var (
 // the handler maps to 422 before any staging, distinct from the compile sentinels
 // above (mapped to 400 by writeStageErr).
 var (
-	errAnalyzeUnknownKind    = errors.New("unsupported analyze kind")
-	errAnalyzeColumnCount    = errors.New("analyze column count out of range")
-	errAnalyzeBinCount       = errors.New("analyze quantile bin count out of range")
-	errAnalyzeMissingColumns = errors.New("analyze request names no columns")
+	errAnalyzeUnknownKind      = errors.New("unsupported analyze kind")
+	errAnalyzeColumnCount      = errors.New("analyze column count out of range")
+	errAnalyzeBinCount         = errors.New("analyze quantile bin count out of range")
+	errAnalyzeMissingColumns   = errors.New("analyze request names no columns")
+	errAnalyzeMissingObjective = errors.New("analyze effect request has no aggregation")
+	errAnalyzeSampleFraction   = errors.New("analyze sample fraction out of range")
 )
 
 // allowedAgg maps a request aggregation to the SQL function emitted. Anything
@@ -921,43 +923,74 @@ func quoteIdent(name string) string {
 }
 
 // staticValidateAnalyze rejects an analyze request whose shape is invalid without
-// the schema: an unknown kind, a column/variable count outside [1, maxColumns], or
-// a quantile bin count outside [2, maxBins]. Column existence and type checks need
-// the schema and stay in the compile step. maxColumns is the per-kind bound (2
-// endpoints + the conditioning-set size); it derives from config, never a literal.
-func staticValidateAnalyze(kind string, columns []AnalyzeColumn, variables, groupBy []string, maxColumns, maxBins int) error {
-	switch kind {
+// the schema: an unknown kind, a column/variable/adjustment count outside its cap, a
+// quantile bin count outside [2, maxBins], a missing objective aggregation, or a
+// sample fraction outside (0, 1]. Column existence and type checks need the schema
+// and stay in the compile step. maxColumns is the per-kind bound (2 endpoints + the
+// conditioning-set size); it derives from config, never a literal.
+func staticValidateAnalyze(req AnalyzeRequest, maxColumns, maxBins int) error {
+	switch req.Kind {
 	case AnalyzeContingency:
-		if len(columns) == 0 {
+		if len(req.Columns) == 0 {
 			return fmt.Errorf("%w: contingency", errAnalyzeMissingColumns)
 		}
-		if len(columns) > maxColumns {
-			return fmt.Errorf("%w: %d columns exceeds cap %d", errAnalyzeColumnCount, len(columns), maxColumns)
+		if len(req.Columns) > maxColumns {
+			return fmt.Errorf("%w: %d columns exceeds cap %d", errAnalyzeColumnCount, len(req.Columns), maxColumns)
 		}
-		for _, c := range columns {
+		for _, c := range req.Columns {
 			if c.Bins != 0 && (c.Bins < 2 || c.Bins > maxBins) {
 				return fmt.Errorf("%w: %q bins %d not in [2, %d]", errAnalyzeBinCount, c.Name, c.Bins, maxBins)
 			}
 		}
 		return nil
 	case AnalyzeMoments:
-		if len(variables) == 0 {
+		if len(req.Variables) == 0 {
 			return fmt.Errorf("%w: moments", errAnalyzeMissingColumns)
 		}
-		if len(variables) > maxColumns {
-			return fmt.Errorf("%w: %d variables exceeds cap %d", errAnalyzeColumnCount, len(variables), maxColumns)
+		if len(req.Variables) > maxColumns {
+			return fmt.Errorf("%w: %d variables exceeds cap %d", errAnalyzeColumnCount, len(req.Variables), maxColumns)
 		}
 		// The group-by conditioners are capped the same way: each adds a GROUP BY
 		// reference and a null predicate, so an unbounded list is a compile-size / DoS
 		// amplification vector even though every name is still schema-validated and
 		// quoted. The cap mirrors the endpoint/conditioning-set bound.
-		if len(groupBy) > maxColumns {
-			return fmt.Errorf("%w: %d group-by columns exceeds cap %d", errAnalyzeColumnCount, len(groupBy), maxColumns)
+		if len(req.GroupBy) > maxColumns {
+			return fmt.Errorf("%w: %d group-by columns exceeds cap %d", errAnalyzeColumnCount, len(req.GroupBy), maxColumns)
 		}
 		return nil
+	case AnalyzeStratifiedEffect, AnalyzeSampledEffect:
+		return staticValidateEffect(req, maxColumns, maxBins)
 	default:
-		return fmt.Errorf("%w: %q", errAnalyzeUnknownKind, kind)
+		return fmt.Errorf("%w: %q", errAnalyzeUnknownKind, req.Kind)
 	}
+}
+
+// staticValidateEffect checks the schema-independent shape of a stratified or
+// sampled effect request: the adjustment set (empty is the legal Z-less naive call)
+// stays within maxColumns, each binned adjustment column's bin count is in [2,
+// maxBins], the random-stratifier bin count (0 = off) is likewise, an aggregation is
+// named, and a sampled request's fraction lands in (0, 1]. The objective expression,
+// segment, and adjustment column existence/types are schema-dependent and stay in
+// the compile step.
+func staticValidateEffect(req AnalyzeRequest, maxColumns, maxBins int) error {
+	if len(req.Adjust) > maxColumns {
+		return fmt.Errorf("%w: %d adjustment columns exceeds cap %d", errAnalyzeColumnCount, len(req.Adjust), maxColumns)
+	}
+	for _, c := range req.Adjust {
+		if c.Bins != 0 && (c.Bins < 2 || c.Bins > maxBins) {
+			return fmt.Errorf("%w: %q bins %d not in [2, %d]", errAnalyzeBinCount, c.Name, c.Bins, maxBins)
+		}
+	}
+	if req.RandomStratifierBins != 0 && (req.RandomStratifierBins < 2 || req.RandomStratifierBins > maxBins) {
+		return fmt.Errorf("%w: random stratifier bins %d not in [2, %d]", errAnalyzeBinCount, req.RandomStratifierBins, maxBins)
+	}
+	if req.Aggregation == "" {
+		return fmt.Errorf("%w: %s", errAnalyzeMissingObjective, req.Kind)
+	}
+	if req.Kind == AnalyzeSampledEffect && (req.SampleFraction <= 0 || req.SampleFraction > 1) {
+		return fmt.Errorf("%w: %v not in (0, 1]", errAnalyzeSampleFraction, req.SampleFraction)
+	}
+	return nil
 }
 
 // quantileCutsSQL produces the query that computes a numeric column's bins-1
@@ -1110,4 +1143,149 @@ func compileMoments(tableFn string, cols []datasource.Column, variables, groupBy
 		query += " GROUP BY " + strings.Join(positions, ", ")
 	}
 	return query, filterArgs, len(varCols), nil
+}
+
+// Collision-proof subquery aliases for the effect compiler. A stratified-effect
+// query computes the segment flag and objective operand once in an inner select and
+// aggregates them by conditioning stratum in the outer select, so each carries a
+// fixed alias the outer references. The inner select never emits `*`, so these
+// aliases cannot collide with a real column.
+const (
+	effectSegAlias = "__arborette_seg"
+	effectOpAlias  = "__arborette_op"
+)
+
+// compileStratifiedEffect builds the per-stratum backdoor-adjustment query for a
+// stratified_effect / sampled_effect request: an inner select computes, per row, the
+// (binned) adjustment-set key columns, the segment predicate as one boolean flag,
+// and the objective value operand; the outer select groups by the adjustment key and
+// emits, per stratum, the total complete-case count and the segment and baseline
+// arms' counts and objective aggregates. Computing the segment flag and operand once
+// in the inner select (referenced by alias in the outer) keeps every upstream-
+// influenced ? value bound exactly once and in emission order — bin cut points, then
+// the segment values, then the objective-expression literals. sampled_effect wraps
+// the inner scan in a reservoir USING SAMPLE; a positive RandomStratifierBins adds a
+// server-computed random bucket as an extra grouping term (the random-confounder
+// refutation). Reuses quoteIdent, compileExpr, aggregateOperand, compileFilters,
+// binExpr — the same injection contract as /execute and the other analyze kinds.
+func compileStratifiedEffect(tableFn string, cols []datasource.Column, req AnalyzeRequest, cuts map[int][]float64) (string, []any, error) {
+	sqlAgg, ok := allowedAgg[strings.ToLower(req.Aggregation)]
+	if !ok {
+		return "", nil, fmt.Errorf("%w: %q", errUnknownAggregation, req.Aggregation)
+	}
+	if req.ValueExpression == nil {
+		return "", nil, fmt.Errorf("%w: effect request has no value expression", errTypeIncompatible)
+	}
+	// The objective is never windowed here: a windowed finding short-circuits to
+	// unsupported_objective before any effect query, so an empty window binding is
+	// correct and a window kind would (rightly) fail to compile.
+	if domain.HasWindowKind(*req.ValueExpression) {
+		return "", nil, fmt.Errorf("%w: windowed objective is not adjustable", errTypeIncompatible)
+	}
+
+	cc := compileCtx{cols: cols}
+	exprSQL, exprType, exprArgs, err := compileExpr(cc, *req.ValueExpression)
+	if err != nil {
+		return "", nil, err
+	}
+	operand, err := aggregateOperand(sqlAgg, exprSQL, exprType)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Inner select: the (binned) adjustment key columns, the random bucket when
+	// requested, the segment flag, and the objective operand. Args accumulate in
+	// emission (left-to-right) order for positional binding.
+	var innerSelects []string
+	var innerArgs []any
+	nullPreds := make([]string, 0, len(req.Adjust))
+	groupCount := 0
+	for i, c := range req.Adjust {
+		col, err := resolveColumn(cols, c.Name)
+		if err != nil {
+			return "", nil, err
+		}
+		if c.Bins > 0 {
+			if !isNumeric(col.Type) {
+				return "", nil, fmt.Errorf("%w: binned column %q (%s)", errNonNumeric, col.Name, col.Type)
+			}
+			expr, binArgs := binExpr(col.Name, cuts[i])
+			innerSelects = append(innerSelects, expr+" AS "+quoteIdent(adjustAlias(groupCount)))
+			innerArgs = append(innerArgs, binArgs...)
+		} else {
+			innerSelects = append(innerSelects, "CAST("+quoteIdent(col.Name)+" AS VARCHAR) AS "+quoteIdent(adjustAlias(groupCount)))
+		}
+		nullPreds = append(nullPreds, quoteIdent(col.Name)+" IS NOT NULL")
+		groupCount++
+	}
+	if req.RandomStratifierBins > 0 {
+		// A server-computed integer bucket in [0, bins): random() ∈ [0,1) times the
+		// bin count, floored. The bin count is a validated integer literal, never
+		// request text, so it is injection-safe.
+		rand := "CAST(CAST(floor(random() * " + strconv.Itoa(req.RandomStratifierBins) + ") AS INTEGER) AS VARCHAR) AS " + quoteIdent(adjustAlias(groupCount))
+		innerSelects = append(innerSelects, rand)
+		groupCount++
+	}
+
+	segPreds, segArgs, err := compileFilters(cols, req.Segment)
+	if err != nil {
+		return "", nil, err
+	}
+	segment := "TRUE"
+	if len(segPreds) > 0 {
+		segment = "(" + strings.Join(segPreds, " AND ") + ")"
+	}
+	innerSelects = append(innerSelects, segment+" AS "+quoteIdent(effectSegAlias))
+	innerArgs = append(innerArgs, segArgs...)
+	innerSelects = append(innerSelects, operand+" AS "+quoteIdent(effectOpAlias))
+	innerArgs = append(innerArgs, exprArgs...)
+
+	scan := tableFn
+	if req.Kind == AnalyzeSampledEffect {
+		scan += " " + samplingClause(req.SampleFraction)
+	}
+	inner := "SELECT " + strings.Join(innerSelects, ", ") + " FROM " + scan
+	if len(nullPreds) > 0 {
+		inner += " WHERE " + strings.Join(nullPreds, " AND ")
+	}
+
+	// Outer select: the stratum key columns, then the five per-stratum measures. The
+	// segment flag and operand are referenced by alias, so no ? is re-emitted here.
+	seg := quoteIdent(effectSegAlias)
+	op := quoteIdent(effectOpAlias)
+	outerSelects := make([]string, 0, groupCount+5)
+	for i := 0; i < groupCount; i++ {
+		outerSelects = append(outerSelects, quoteIdent(adjustAlias(i)))
+	}
+	outerSelects = append(outerSelects,
+		"CAST(count(*) AS BIGINT)",
+		"CAST(count(CASE WHEN "+seg+" THEN 1 END) AS BIGINT)",
+		"CAST("+sqlAgg+"(CASE WHEN "+seg+" THEN "+op+" END) AS DOUBLE)",
+		"CAST(count(CASE WHEN NOT "+seg+" THEN 1 END) AS BIGINT)",
+		"CAST("+sqlAgg+"(CASE WHEN NOT "+seg+" THEN "+op+" END) AS DOUBLE)",
+	)
+
+	query := "SELECT " + strings.Join(outerSelects, ", ") + " FROM (" + inner + ")"
+	if groupCount > 0 {
+		positions := make([]string, groupCount)
+		for i := range positions {
+			positions[i] = strconv.Itoa(i + 1)
+		}
+		query += " GROUP BY " + strings.Join(positions, ", ")
+	}
+	return query, innerArgs, nil
+}
+
+// adjustAlias names the i-th stratum key column of the effect subquery.
+func adjustAlias(i int) string {
+	return "__arborette_g" + strconv.Itoa(i)
+}
+
+// samplingClause renders the reservoir USING SAMPLE clause for a sampled_effect
+// scan. The fraction is a validated (0, 1] server value rendered as a percentage
+// literal (never request text), so it is injection-safe; reservoir sampling draws a
+// fresh subsample per call, which is what the K-subsample stability refutation needs.
+func samplingClause(fraction float64) string {
+	pct := strconv.FormatFloat(fraction*100, 'f', 4, 64)
+	return "USING SAMPLE " + pct + "% (reservoir)"
 }

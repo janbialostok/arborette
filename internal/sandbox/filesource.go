@@ -252,6 +252,8 @@ func (s *FileSource) Analyze(ctx context.Context, req AnalyzeRequest) (AnalyzeRe
 		return s.analyzeContingency(ctx, db, tableFn, cols, req)
 	case AnalyzeMoments:
 		return s.analyzeMoments(ctx, db, tableFn, cols, req)
+	case AnalyzeStratifiedEffect, AnalyzeSampledEffect:
+		return s.analyzeEffect(ctx, db, tableFn, cols, req)
 	default:
 		return AnalyzeResponse{}, fmt.Errorf("%w: %q", errAnalyzeUnknownKind, req.Kind)
 	}
@@ -366,6 +368,69 @@ func (s *FileSource) analyzeMoments(ctx context.Context, db *sql.DB, tableFn str
 	return AnalyzeResponse{Kind: AnalyzeMoments, Moments: moments}, nil
 }
 
+// analyzeEffect stages once and answers a stratified or sampled backdoor-adjustment
+// aggregation: it precomputes each binned adjustment column's quantile cut points
+// over the full staged engine (so bin boundaries stay stable across a sampled
+// subsample), compiles the per-stratum query, and scans each row into a StratumRow.
+// The segment and baseline aggregates scan through sql.NullFloat64 so an empty arm
+// stays a null pointer rather than a spurious zero — the positivity signal the caller
+// gates on.
+func (s *FileSource) analyzeEffect(ctx context.Context, db *sql.DB, tableFn string, cols []datasource.Column, req AnalyzeRequest) (AnalyzeResponse, error) {
+	cuts := map[int][]float64{}
+	for i, c := range req.Adjust {
+		if c.Bins <= 0 {
+			continue
+		}
+		got, err := s.quantileCuts(ctx, db, tableFn, c.Name, c.Bins)
+		if err != nil {
+			return AnalyzeResponse{}, err
+		}
+		cuts[i] = got
+	}
+
+	query, args, err := compileStratifiedEffect(tableFn, cols, req, cuts)
+	if err != nil {
+		return AnalyzeResponse{}, err
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return AnalyzeResponse{}, fmt.Errorf("effect query: %w", err)
+	}
+	defer rows.Close()
+
+	nGroup := len(req.Adjust)
+	if req.RandomStratifierBins > 0 {
+		nGroup++
+	}
+	var strata []StratumRow
+	for rows.Next() {
+		values := make([]string, nGroup)
+		var n, segN, baseN int64
+		var segAgg, baseAgg sql.NullFloat64
+		scanTargets := make([]any, 0, nGroup+5)
+		for i := range values {
+			scanTargets = append(scanTargets, &values[i])
+		}
+		scanTargets = append(scanTargets, &n, &segN, &segAgg, &baseN, &baseAgg)
+		if err := rows.Scan(scanTargets...); err != nil {
+			return AnalyzeResponse{}, fmt.Errorf("scan stratum row: %w", err)
+		}
+		row := StratumRow{Values: values, N: n, SegmentN: segN, BaselineN: baseN}
+		if row.SegmentAgg, err = finitePtr(segAgg); err != nil {
+			return AnalyzeResponse{}, err
+		}
+		if row.BaselineAgg, err = finitePtr(baseAgg); err != nil {
+			return AnalyzeResponse{}, err
+		}
+		strata = append(strata, row)
+	}
+	if err := rows.Err(); err != nil {
+		return AnalyzeResponse{}, fmt.Errorf("effect query: %w", err)
+	}
+	return AnalyzeResponse{Kind: req.Kind, Strata: strata}, nil
+}
+
 // quantileCuts reads one column's bins-1 interior quantile cut points over the
 // staged engine, dropping any that came back NULL (an empty or degenerate column),
 // so binExpr collapses to a single bucket rather than binding a NULL boundary.
@@ -400,6 +465,21 @@ func finiteOrZero(v sql.NullFloat64) (float64, error) {
 		return 0, errNonFiniteValue
 	}
 	return v.Float64, nil
+}
+
+// finitePtr unwraps a scanned stratum aggregate into a nullable pointer: an SQL NULL
+// (an empty segment/baseline arm) becomes nil so the caller sees an unpopulated arm
+// rather than a zero, and a non-finite DOUBLE is rejected as errNonFiniteValue (a
+// JSON body cannot encode it) rather than emitted.
+func finitePtr(v sql.NullFloat64) (*float64, error) {
+	if !v.Valid {
+		return nil, nil
+	}
+	if math.IsInf(v.Float64, 0) || math.IsNaN(v.Float64) {
+		return nil, errNonFiniteValue
+	}
+	f := v.Float64
+	return &f, nil
 }
 
 // stage resolves the source file (from the cache when configured, else a fresh

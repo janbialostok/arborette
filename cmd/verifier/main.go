@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/arborette/arborette/internal/config"
 	"github.com/arborette/arborette/internal/graph"
@@ -56,14 +57,20 @@ func main() {
 		log.Fatalf("verifier: load config: %v", err)
 	}
 
-	worker, cleanup, err := wireVerifier(ctx, cfg)
+	worker, verifications, cleanup, err := wireVerifier(ctx, cfg)
 	if err != nil {
 		log.Fatalf("verifier: %v", err)
 	}
 	defer cleanup()
 
 	if *serve {
-		// A dispatch body is small (two ids plus a kind), so the 1 MiB cap is generous.
+		// Reap crashed verification leases on a ticker so a dead Verifier's budget and
+		// in-flight slots recover within about one lease TTL even with no new dispatch.
+		reapCtx, cancelReap := context.WithCancel(ctx)
+		defer cancelReap()
+		go reapLeases(reapCtx, verifications, cfg.Verifier.HeartbeatEvery)
+
+		// A dispatch body is small (a few ids plus a kind), so the 1 MiB cap is generous.
 		srv := verifier.NewServer(worker, 1<<20)
 		log.Printf("verifier: serving HTTP on :%s", cfg.Verifier.Port)
 		if err := service.RunHTTPServer("verifier", ":"+cfg.Verifier.Port,
@@ -80,23 +87,24 @@ func main() {
 	log.Printf("verifier: discovery for goal %q complete", *goalID)
 }
 
-// wireVerifier builds the worker and its collaborators, returning a cleanup that
-// closes the graph and Postgres connections. The cleanup is returned rather than
-// deferred inside so serve mode's connections live for the whole serve loop.
-func wireVerifier(ctx context.Context, cfg config.Config) (*verifier.Worker, func(), error) {
+// wireVerifier builds the worker and its collaborators, returning the verification
+// store (for the serve-mode reaper) and a cleanup that closes the graph and Postgres
+// connections. The cleanup is returned rather than deferred inside so serve mode's
+// connections live for the whole serve loop.
+func wireVerifier(ctx context.Context, cfg config.Config) (*verifier.Worker, *store.CausalVerifications, func(), error) {
 	repo, err := graph.NewNeo4jRepository(ctx, cfg.Neo4j.URI, cfg.Neo4j.User, cfg.Neo4j.Password)
 	if err != nil {
-		return nil, nil, fmt.Errorf("connect neo4j: %w", err)
+		return nil, nil, nil, fmt.Errorf("connect neo4j: %w", err)
 	}
 	if err := repo.InitSchema(ctx); err != nil {
 		repo.Close(ctx)
-		return nil, nil, fmt.Errorf("init schema: %w", err)
+		return nil, nil, nil, fmt.Errorf("init schema: %w", err)
 	}
 
 	pool, err := store.NewPool(ctx, cfg.Postgres.ServiceDSN())
 	if err != nil {
 		repo.Close(ctx)
-		return nil, nil, fmt.Errorf("connect postgres: %w", err)
+		return nil, nil, nil, fmt.Errorf("connect postgres: %w", err)
 	}
 	cleanup := func() {
 		pool.Close()
@@ -106,9 +114,10 @@ func wireVerifier(ctx context.Context, cfg config.Config) (*verifier.Worker, fun
 	claude, err := llm.NewClient(cfg.LLM)
 	if err != nil {
 		cleanup()
-		return nil, nil, fmt.Errorf("llm client: %w", err)
+		return nil, nil, nil, fmt.Errorf("llm client: %w", err)
 	}
 
+	verifications := store.NewCausalVerifications(pool, cfg.Verifier.LeaseTTL, cfg.Verifier.InflightCap, cfg.Verifier.VerificationBudget)
 	worker := verifier.NewWorker(
 		sandboxclient.NewClient(cfg.Verifier.SandboxURL, cfg.Verifier.InternalAuthToken, nil),
 		repo,
@@ -116,18 +125,46 @@ func wireVerifier(ctx context.Context, cfg config.Config) (*verifier.Worker, fun
 		store.NewAdvisoryLock(pool),
 		store.NewGoalRegistry(pool),
 		orchestratorclient.NewClient(cfg.Verifier.OrchestratorURL, cfg.Verifier.InternalAuthToken, nil),
+		verifications,
 		verifier.Config{
-			Alpha:       cfg.Verifier.DiscoveryAlpha,
-			FDR:         cfg.Verifier.DiscoveryFDR,
-			MaxCondSet:  cfg.Verifier.DiscoveryMaxCondSet,
-			Bins:        cfg.Verifier.DiscoveryBins,
-			ColumnCap:   cfg.Verifier.DiscoveryColumnCap,
-			MaxTests:    cfg.Verifier.DiscoveryMaxTests,
-			CallTimeout: cfg.Verifier.DiscoveryCallTimeout,
+			Alpha:                cfg.Verifier.DiscoveryAlpha,
+			FDR:                  cfg.Verifier.DiscoveryFDR,
+			MaxCondSet:           cfg.Verifier.DiscoveryMaxCondSet,
+			Bins:                 cfg.Verifier.DiscoveryBins,
+			ColumnCap:            cfg.Verifier.DiscoveryColumnCap,
+			MaxTests:             cfg.Verifier.DiscoveryMaxTests,
+			CallTimeout:          cfg.Verifier.DiscoveryCallTimeout,
+			SupportFloor:         cfg.Verifier.SupportFloor,
+			CollapseRatio:        cfg.Verifier.CollapseRatio,
+			RefutationK:          cfg.Verifier.RefutationK,
+			RefutationTau:        cfg.Verifier.RefutationTau,
+			SampleFraction:       cfg.Verifier.SampleFraction,
+			StabilityBand:        cfg.Verifier.StabilityBand,
+			RandomStratifierBins: cfg.Verifier.RandomStratifierBins,
 		},
 		cfg.Verifier.OrientMaxRepairs,
+		cfg.Verifier.HeartbeatEvery,
 	)
 
 	log.Printf("verifier: wired neo4j, postgres, sandbox, llm")
-	return worker, cleanup, nil
+	return worker, verifications, cleanup, nil
+}
+
+// reapLeases flips expired verification leases to failed on a ticker until the
+// context is cancelled, refunding a crashed run's budget and in-flight slot.
+func reapLeases(ctx context.Context, verifications *store.CausalVerifications, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if n, err := verifications.ReapExpired(ctx); err != nil {
+				log.Printf("verifier: reap expired leases: %v", err)
+			} else if n > 0 {
+				log.Printf("verifier: reaped %d expired verification leases", n)
+			}
+		}
+	}
 }

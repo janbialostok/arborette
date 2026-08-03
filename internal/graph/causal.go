@@ -20,6 +20,54 @@ import (
 // querying. MERGE on {id} then keeps writes idempotent under the id-unique
 // constraint while the composite parts remain honest, queryable properties.
 
+// GetCausalEvidence returns the latest non-superseded causal_inferred PRODUCED edge
+// for an intervention and whether one exists. It is the dedicated causal-evidence
+// read path — deliberately exempt from the observational-only collection filter — so
+// a consumer that weights causal knowledge reaches the backdoor-adjusted effect and
+// its refutation confidence. Ordering by graph_version DESC picks the most recent
+// verification; superseded edges (retracted by a newer version or a non-confirming
+// re-verification) are excluded by construction.
+func (r *Neo4jRepository) GetCausalEvidence(ctx context.Context, interventionID string) (CausalEvidence, bool, error) {
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (i:"+labelIntervention+" {id: $id})-[e:"+domain.Produced+"]->(:"+labelOutcome+") "+
+				"WHERE e.epistemic_source = $source AND coalesce(e.superseded, false) = false "+
+				"RETURN e ORDER BY e.graph_version DESC LIMIT 1",
+			map[string]any{"id": interventionID, "source": string(domain.EpistemicCausalInferred)},
+		)
+		if err != nil {
+			return nil, err
+		}
+		recs, err := result.Collect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(recs) == 0 {
+			return nil, nil
+		}
+		rel, err := recordRelationship(recs[0], "e")
+		if err != nil {
+			return nil, err
+		}
+		effect, _ := rel.Props["effect_size"].(float64)
+		confidence, _ := rel.Props["confidence"].(float64)
+		version, _ := rel.Props["graph_version"].(int64)
+		return CausalEvidence{
+			InterventionID: interventionID,
+			EffectSize:     effect,
+			Confidence:     confidence,
+			GraphVersion:   int(version),
+		}, nil
+	})
+	if err != nil {
+		return CausalEvidence{}, false, fmt.Errorf("get causal evidence for %q: %w", interventionID, err)
+	}
+	if res == nil {
+		return CausalEvidence{}, false, nil
+	}
+	return res.(CausalEvidence), true, nil
+}
+
 func dataColumnID(goalID, datasourceRef, name string) string {
 	return hashID(goalID, datasourceRef, name)
 }
@@ -28,9 +76,92 @@ func causalMetaID(goalID, datasourceRef string, version int) string {
 	return hashID(goalID, datasourceRef, strconv.Itoa(version))
 }
 
+// causalOutcomeID is the deterministic id of the causal Outcome a verification writes,
+// keyed on (interventionID, graph version) so a re-run at the same version MERGEs over
+// the same node idempotently while a newer version allocates a distinct one.
+func causalOutcomeID(interventionID string, version int) string {
+	return hashID(interventionID, strconv.Itoa(version))
+}
+
 func hashID(parts ...string) string {
 	h := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(h[:])
+}
+
+// WriteCausalVerification records a confirmed verification additively in one write:
+// it MERGEs the causal Outcome (verified, the adjusted effect in its value) on the
+// deterministic (interventionID, version) id, MERGEs the causal_inferred PRODUCED
+// edge from the finding's Intervention carrying the adjusted effect, the
+// refutation-derived confidence, and the graph version, and in the same transaction
+// supersedes every prior (older-version) causal_inferred edge for that intervention.
+// Observational edges are never touched (the supersession clause filters on
+// epistemic_source). The MERGEs make a re-run at the same version idempotent — one
+// Outcome, one edge.
+func (r *Neo4jRepository) WriteCausalVerification(ctx context.Context, interventionID string, version int, outcome domain.Outcome, edge domain.ProducedEdge) error {
+	value, err := marshalProps(outcome.Value)
+	if err != nil {
+		return err
+	}
+	oid := causalOutcomeID(interventionID, version)
+	return r.writeOp(ctx, "write causal verification "+interventionID, func(tx neo4j.ManagedTransaction) (any, error) {
+		if _, err := tx.Run(ctx,
+			"MERGE (o:"+labelOutcome+" {id: $oid}) "+
+				"SET o.goal_id = $goalID, o.verification_status = $status, o.value = $value",
+			map[string]any{"oid": oid, "goalID": outcome.GoalID, "status": string(outcome.VerificationStatus), "value": value},
+		); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Run(ctx,
+			"MATCH (i:"+labelIntervention+" {id: $interventionID}) "+
+				"MATCH (o:"+labelOutcome+" {id: $oid}) "+
+				"MERGE (i)-[e:"+domain.Produced+"]->(o) "+
+				"SET e.effect_size = $effectSize, e.confidence = $confidence, "+
+				"e.epistemic_source = $source, e.superseded = false, e.graph_version = $version",
+			map[string]any{
+				"interventionID": interventionID,
+				"oid":            oid,
+				"effectSize":     edge.EffectSize,
+				"confidence":     edge.Confidence,
+				"source":         string(domain.EpistemicCausalInferred),
+				"version":        version,
+			},
+		); err != nil {
+			return nil, err
+		}
+		result, err := tx.Run(ctx,
+			"MATCH (i:"+labelIntervention+" {id: $interventionID})-[pe:"+domain.Produced+"]->(:"+labelOutcome+") "+
+				"WHERE pe.epistemic_source = $source AND coalesce(pe.superseded, false) = false AND pe.graph_version < $version "+
+				"SET pe.superseded = true",
+			map[string]any{"interventionID": interventionID, "source": string(domain.EpistemicCausalInferred), "version": version},
+		)
+		if err != nil {
+			return nil, err
+		}
+		_, err = result.Consume(ctx)
+		return nil, err
+	})
+}
+
+// SupersedePriorCausalOutcomes retracts an intervention's causal evidence without
+// writing a new edge — the standalone path for a non-confirming verification
+// (confounded / not_identifiable / unsupported_objective): it marks every
+// non-superseded causal_inferred edge at or below the given version superseded, so a
+// result that invalidates a prior claim removes it from serving. Observational edges
+// are never touched.
+func (r *Neo4jRepository) SupersedePriorCausalOutcomes(ctx context.Context, interventionID string, version int) error {
+	return r.writeOp(ctx, "supersede causal outcomes "+interventionID, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (i:"+labelIntervention+" {id: $interventionID})-[pe:"+domain.Produced+"]->(:"+labelOutcome+") "+
+				"WHERE pe.epistemic_source = $source AND coalesce(pe.superseded, false) = false AND pe.graph_version <= $version "+
+				"SET pe.superseded = true",
+			map[string]any{"interventionID": interventionID, "source": string(domain.EpistemicCausalInferred), "version": version},
+		)
+		if err != nil {
+			return nil, err
+		}
+		_, err = result.Consume(ctx)
+		return nil, err
+	})
 }
 
 // UpsertDataColumns writes (or re-writes) the graph's DataColumn nodes for a

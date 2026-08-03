@@ -36,11 +36,13 @@ type orienter interface {
 	RepairOrientCausalEdges(ctx context.Context, goalText string, columns []llm.ColumnSemantics, edges []llm.OrientEdge, prior []llm.OrientDecision, validationErr string) ([]llm.OrientDecision, error)
 }
 
-// graphWriter is the graph surface the discovery persist path needs: the committed
-// read (for the single-flight recheck and the endpoint), the version-scoped
-// cleanup, the three upserts written columns→edges→meta (meta last, the commit
-// marker), and the eligible-findings read that supplies finding-referenced columns
-// for selection. Backed by *graph.Neo4jRepository.
+// graphWriter is the graph surface both Verifier stages need: discovery's committed
+// read (for the single-flight recheck and the endpoint), version-scoped cleanup, the
+// three upserts written columns→edges→meta (meta last, the commit marker), and the
+// eligible-findings read; plus verification's finding read (GetIntervention, the
+// segment-predicate source), the exempt causal-evidence read, and the two causal
+// Outcome writers (confirming and retracting). Kept one interface rather than a
+// second graph seam; *graph.Neo4jRepository satisfies the whole surface.
 type graphWriter interface {
 	GetCausalGraph(ctx context.Context, goalID, datasourceRef string) (domain.CausalGraph, bool, error)
 	DeleteCausalGraphVersion(ctx context.Context, goalID, datasourceRef string, version int) error
@@ -48,6 +50,10 @@ type graphWriter interface {
 	UpsertCausalEdges(ctx context.Context, edges []domain.CausalEdge) error
 	UpsertCausalGraphMeta(ctx context.Context, meta domain.CausalGraphMeta) error
 	ListEligibleFindings(ctx context.Context, goalID string) ([]graph.CausalTriplet, error)
+	GetIntervention(ctx context.Context, id string) (domain.Intervention, error)
+	GetCausalEvidence(ctx context.Context, interventionID string) (graph.CausalEvidence, bool, error)
+	WriteCausalVerification(ctx context.Context, interventionID string, version int, outcome domain.Outcome, edge domain.ProducedEdge) error
+	SupersedePriorCausalOutcomes(ctx context.Context, interventionID string, version int) error
 }
 
 // locker is the cross-process single-flight: a Postgres advisory lock on the (goal,
@@ -62,44 +68,65 @@ type goalReader interface {
 	Get(ctx context.Context, optimizationFunctionID string) (store.Goal, error)
 }
 
-// auditClient reports discovery lifecycle events through the orchestrator's
-// authenticated internal audit API. Backed by *orchestratorclient.Client.
+// auditClient reports Verifier lifecycle events through the orchestrator's
+// authenticated internal API: discovery events go through Append (audit only), while
+// PublishVerification delivers a verification transition to both the goal's SSE
+// channel and the audit trail in one authenticated call. Backed by
+// *orchestratorclient.Client.
 type auditClient interface {
 	Append(ctx context.Context, action, eventType string, detail map[string]any) error
+	PublishVerification(ctx context.Context, goalID string, event map[string]any) error
+}
+
+// verificationStore is the leased-record surface VerifyOne drives: the charge-at-
+// accept dispatch, the mid-run lease renewal, and the guarded terminal write. Backed
+// by *store.CausalVerifications. Reaping and staleness marking run on the concrete
+// store outside the per-verification path.
+type verificationStore interface {
+	DispatchAccept(ctx context.Context, rec store.CausalVerification) (store.CausalVerification, bool, error)
+	Heartbeat(ctx context.Context, id string) error
+	Complete(ctx context.Context, id, status string, naive, adjusted *float64, adjustmentSet []string, refutationScore, confidence *float64) (bool, error)
 }
 
 // Worker runs causal discovery for one (goal, data-source) pair end to end. It is
 // wired once and reentrant across runs (the sleepcycle worker convention), so serve
 // mode dispatches many runs against one Worker.
 type Worker struct {
-	analyzer   analyzer
-	graph      graphWriter
-	orienter   orienter
-	locker     locker
-	goals      goalReader
-	audit      auditClient
-	cfg        Config
-	orientMax  int
-	pollMin    time.Duration
-	pollMax    time.Duration
-	waitBudget time.Duration
+	analyzer       analyzer
+	graph          graphWriter
+	orienter       orienter
+	locker         locker
+	goals          goalReader
+	audit          auditClient
+	verifications  verificationStore
+	cfg            Config
+	orientMax      int
+	heartbeatEvery time.Duration
+	pollMin        time.Duration
+	pollMax        time.Duration
+	waitBudget     time.Duration
 }
 
 // NewWorker wires the Worker from its narrow seams and configuration (infra-
-// constructor convention). orientMaxRepairs bounds the LLM orientation repair loop.
-func NewWorker(a analyzer, g graphWriter, o orienter, lk locker, goals goalReader, audit auditClient, cfg Config, orientMaxRepairs int) *Worker {
+// constructor convention). orientMaxRepairs bounds the LLM orientation repair loop;
+// heartbeatEvery paces the verification lease renewal. verifications may be nil for a
+// discovery-only Worker (the one-shot discovery job); the verification path requires
+// it.
+func NewWorker(a analyzer, g graphWriter, o orienter, lk locker, goals goalReader, audit auditClient, verifications verificationStore, cfg Config, orientMaxRepairs int, heartbeatEvery time.Duration) *Worker {
 	return &Worker{
-		analyzer:   a,
-		graph:      g,
-		orienter:   o,
-		locker:     lk,
-		goals:      goals,
-		audit:      audit,
-		cfg:        cfg,
-		orientMax:  orientMaxRepairs,
-		pollMin:    2 * time.Second,
-		pollMax:    5 * time.Second,
-		waitBudget: 30 * time.Minute,
+		analyzer:       a,
+		graph:          g,
+		orienter:       o,
+		locker:         lk,
+		goals:          goals,
+		audit:          audit,
+		verifications:  verifications,
+		cfg:            cfg,
+		orientMax:      orientMaxRepairs,
+		heartbeatEvery: heartbeatEvery,
+		pollMin:        2 * time.Second,
+		pollMax:        5 * time.Second,
+		waitBudget:     30 * time.Minute,
 	}
 }
 

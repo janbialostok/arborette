@@ -157,7 +157,7 @@ func TestDecodeConstraintsRoundTripsGraphShape(t *testing.T) {
 		t.Fatal("the graph shape must not already be a typed slice, or this guard proves nothing")
 	}
 
-	decoded, err := decodeConstraints(props["new_filters"])
+	decoded, err := domain.DecodeConstraints(props["new_filters"])
 	if err != nil {
 		t.Fatalf("decode constraints: %v", err)
 	}

@@ -12,8 +12,9 @@ import (
 // (409) path is deterministic (claim is synchronous, so the slot is held before the
 // second request arrives).
 type fakeRunner struct {
-	block chan struct{}
-	calls chan struct{}
+	block       chan struct{}
+	calls       chan struct{}
+	verifyCalls chan struct{}
 }
 
 func (f *fakeRunner) RunDiscovery(context.Context, string, string) error {
@@ -22,6 +23,13 @@ func (f *fakeRunner) RunDiscovery(context.Context, string, string) error {
 	}
 	if f.block != nil {
 		<-f.block
+	}
+	return nil
+}
+
+func (f *fakeRunner) VerifyOne(context.Context, string, string, string, bool) error {
+	if f.verifyCalls != nil {
+		f.verifyCalls <- struct{}{}
 	}
 	return nil
 }
@@ -43,7 +51,8 @@ func TestVerifierServeValidation(t *testing.T) {
 		{"invalid body", `{`, http.StatusBadRequest},
 		{"missing goal", `{"datasource_ref":"r","kind":"discovery"}`, http.StatusBadRequest},
 		{"missing ref", `{"goal_id":"g","kind":"discovery"}`, http.StatusBadRequest},
-		{"unknown kind", `{"goal_id":"g","datasource_ref":"r","kind":"verify"}`, http.StatusUnprocessableEntity},
+		{"unknown kind", `{"goal_id":"g","datasource_ref":"r","kind":"bogus"}`, http.StatusUnprocessableEntity},
+		{"verify without intervention", `{"goal_id":"g","datasource_ref":"r","kind":"verify"}`, http.StatusBadRequest},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -71,4 +80,20 @@ func TestVerifierServeDispatchAndDuplicate(t *testing.T) {
 	}
 
 	close(runner.block) // release the run so its goroutine clears the slot
+}
+
+// TestVerifierServeVerifyDispatch: a verify dispatch with an intervention id is
+// accepted (202) and runs VerifyOne, and — unlike discovery — is not blocked by the
+// (goal, data-source) in-flight claim, so a second verify for the same pair also runs.
+func TestVerifierServeVerifyDispatch(t *testing.T) {
+	runner := &fakeRunner{verifyCalls: make(chan struct{}, 2)}
+	srv := NewServer(runner, 1<<20)
+	body := `{"goal_id":"g","datasource_ref":"r","kind":"verify","intervention_id":"i1"}`
+
+	for i := 0; i < 2; i++ {
+		if code := postVerification(srv, body).Code; code != http.StatusAccepted {
+			t.Fatalf("verify dispatch %d status = %d, want 202", i, code)
+		}
+		<-runner.verifyCalls
+	}
 }

@@ -27,11 +27,12 @@ import (
 // client rather than raising this.
 const defaultTimeout = 30 * time.Second
 
-// The audit path is internal and guarded by the shared secret; /goals is the
-// analyst-facing intake.
+// The audit and verification-event paths are internal and guarded by the shared
+// secret; /goals is the analyst-facing intake.
 const (
-	auditPath = "/internal/audit"
-	goalsPath = "/goals"
+	auditPath              = "/internal/audit"
+	verificationEventsPath = "/internal/verification-events"
+	goalsPath              = "/goals"
 )
 
 // OrchestratorError is a non-success response carrying the message the
@@ -82,6 +83,27 @@ func (c *Client) Append(ctx context.Context, action, eventType string, detail ma
 		return fmt.Errorf("marshal audit request: %w", err)
 	}
 	req, err := c.newRequest(ctx, auditPath, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	return c.do(req, http.StatusCreated, nil)
+}
+
+type verificationEventRequest struct {
+	GoalID string         `json:"goal_id"`
+	Event  map[string]any `json:"event"`
+}
+
+// PublishVerification delivers one verification transition to the orchestrator, which
+// fans it out on the goal's SSE channel and records it to the audit trail in one
+// authenticated call — both sinks through a single hop. It is the verification sibling
+// of Append; the endpoint answers 201 with no body on success.
+func (c *Client) PublishVerification(ctx context.Context, goalID string, event map[string]any) error {
+	body, err := json.Marshal(verificationEventRequest{GoalID: goalID, Event: event})
+	if err != nil {
+		return fmt.Errorf("marshal verification event: %w", err)
+	}
+	req, err := c.newRequest(ctx, verificationEventsPath, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

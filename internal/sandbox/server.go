@@ -159,10 +159,14 @@ type ExecuteResponse struct {
 }
 
 // Analyze-kind discriminators. contingency returns GROUP BY counts; moments
-// returns sum/sum-of-squares/cross-product aggregates for correlation estimation.
+// returns sum/sum-of-squares/cross-product aggregates for correlation estimation;
+// stratified_effect returns per-stratum segment/baseline aggregates for backdoor
+// adjustment; sampled_effect is the same shape over a reservoir subsample.
 const (
-	AnalyzeContingency = "contingency"
-	AnalyzeMoments     = "moments"
+	AnalyzeContingency      = "contingency"
+	AnalyzeMoments          = "moments"
+	AnalyzeStratifiedEffect = "stratified_effect"
+	AnalyzeSampledEffect    = "sampled_effect"
 )
 
 // AnalyzeColumn is one contingency-table column. Bins 0 groups on the raw
@@ -174,17 +178,33 @@ type AnalyzeColumn struct {
 	Bins int    `json:"bins,omitempty"`
 }
 
-// AnalyzeRequest asks for one contingency or moments aggregation over a data
-// source under optional hard-constraint filters. Columns (contingency) or Variables
-// + GroupBy (moments) are populated by kind. The discriminator is additive-friendly:
-// an unknown kind is rejected so later kinds slot in without breaking the contract.
+// AnalyzeRequest asks for one contingency, moments, or effect aggregation over a
+// data source under optional hard-constraint filters. Fields are populated by kind:
+// Columns (contingency), Variables + GroupBy (moments), or Aggregation +
+// ValueExpression + Segment + Adjust (stratified_effect/sampled_effect). The
+// discriminator is additive-friendly: an unknown kind is rejected so later kinds
+// slot in without breaking the contract.
+//
+// For the effect kinds Aggregation + ValueExpression are the objective measured per
+// stratum (reusing the /execute compiler, so the non-hallucination guarantee is
+// identical); Segment is the treatment predicate whose segment/baseline arms are
+// aggregated within each stratum; Adjust is the (binnable) conditioning set Z the
+// query groups over; SampleFraction (sampled_effect only) is the reservoir subsample
+// share in (0, 1]; RandomStratifierBins, when positive, adds a server-generated
+// random bucket as an extra grouping term (the random-confounder refutation).
 type AnalyzeRequest struct {
-	DataSourceRef string              `json:"data_source_ref"`
-	Kind          string              `json:"kind"`
-	Filters       []domain.Constraint `json:"filters,omitempty"`
-	Columns       []AnalyzeColumn     `json:"columns,omitempty"`
-	Variables     []string            `json:"variables,omitempty"`
-	GroupBy       []string            `json:"group_by,omitempty"`
+	DataSourceRef        string              `json:"data_source_ref"`
+	Kind                 string              `json:"kind"`
+	Filters              []domain.Constraint `json:"filters,omitempty"`
+	Columns              []AnalyzeColumn     `json:"columns,omitempty"`
+	Variables            []string            `json:"variables,omitempty"`
+	GroupBy              []string            `json:"group_by,omitempty"`
+	Aggregation          string              `json:"aggregation,omitempty"`
+	ValueExpression      *domain.Expression  `json:"value_expression,omitempty"`
+	Segment              []domain.Constraint `json:"segment,omitempty"`
+	Adjust               []AnalyzeColumn     `json:"adjust,omitempty"`
+	SampleFraction       float64             `json:"sample_fraction,omitempty"`
+	RandomStratifierBins int                 `json:"random_stratifier_bins,omitempty"`
 }
 
 // ContingencyCell is one row of a contingency table: the group-key values (in the
@@ -208,12 +228,29 @@ type MomentsRow struct {
 	Cross []float64 `json:"cross"`
 }
 
+// StratumRow is one stratum of an effect aggregation: the conditioning-set key
+// values (Adjust column order, numeric-binned rendered as bucket labels, plus the
+// random bucket last when requested), the stratum's total complete-case row count N,
+// and the segment and baseline arms' counts and objective aggregates. SegmentAgg and
+// BaselineAgg are nullable — an arm with no matching rows aggregates to SQL NULL —
+// mirroring ExecuteResponse's null-number convention so the caller distinguishes an
+// empty arm from a measured zero.
+type StratumRow struct {
+	Values      []string `json:"values"`
+	N           int64    `json:"n"`
+	SegmentN    int64    `json:"segment_n"`
+	SegmentAgg  *float64 `json:"segment_agg"`
+	BaselineN   int64    `json:"baseline_n"`
+	BaselineAgg *float64 `json:"baseline_agg"`
+}
+
 // AnalyzeResponse carries the aggregation result keyed by kind: Cells for
-// contingency, Moments for moments.
+// contingency, Moments for moments, Strata for stratified_effect/sampled_effect.
 type AnalyzeResponse struct {
 	Kind    string            `json:"kind"`
 	Cells   []ContingencyCell `json:"cells,omitempty"`
 	Moments []MomentsRow      `json:"moments,omitempty"`
+	Strata  []StratumRow      `json:"strata,omitempty"`
 }
 
 func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
@@ -446,7 +483,7 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	// unknown kind or over-cap column count is a caller contract error, not a
 	// staging fault. Column existence and type checks need the schema and stay in
 	// the compile step below.
-	if err := staticValidateAnalyze(req.Kind, req.Columns, req.Variables, req.GroupBy, s.analyzeMaxColumns, s.analyzeMaxBins); err != nil {
+	if err := staticValidateAnalyze(req, s.analyzeMaxColumns, s.analyzeMaxBins); err != nil {
 		service.WriteErr(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}

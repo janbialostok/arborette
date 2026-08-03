@@ -403,11 +403,12 @@ func (r *Neo4jRepository) ListEligibleFindings(ctx context.Context, goalID strin
 	}
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,
-			"MATCH (s:"+labelState+")-[:"+domain.PreConditionFor+"]->(i:"+labelIntervention+")-[:"+domain.Produced+"]->(o:"+labelOutcome+") "+
+			"MATCH (s:"+labelState+")-[:"+domain.PreConditionFor+"]->(i:"+labelIntervention+")-[e:"+domain.Produced+"]->(o:"+labelOutcome+") "+
 				"WHERE i.goal_id = $goalID "+
 				"AND (i.sleep_derived IS NULL OR i.sleep_derived = false) "+
 				"AND o.verification_status IN $statuses "+
-				"RETURN s, i, o",
+				"AND coalesce(e.epistemic_source, 'observational') = 'observational' "+
+				"RETURN s, i, o, e",
 			map[string]any{"goalID": goalID, "statuses": statuses},
 		)
 		if err != nil {
@@ -475,6 +476,7 @@ func (r *Neo4jRepository) UpdateOutcomeVerification(ctx context.Context, outcome
 	return r.writeOp(ctx, "update outcome verification "+outcomeID, func(tx neo4j.ManagedTransaction) (any, error) {
 		return tx.Run(ctx,
 			"MATCH (i:"+labelIntervention+")-[e:"+domain.Produced+"]->(o:"+labelOutcome+" {id: $id}) "+
+				"WHERE coalesce(e.epistemic_source, 'observational') = 'observational' "+
 				"SET o.verification_status = $status, e.confidence = $confidence",
 			map[string]any{"id": outcomeID, "status": string(status), "confidence": confidence},
 		)
@@ -497,6 +499,7 @@ func (r *Neo4jRepository) CorrectOutcome(ctx context.Context, outcomeID string, 
 	return r.writeOp(ctx, "correct outcome "+outcomeID, func(tx neo4j.ManagedTransaction) (any, error) {
 		return tx.Run(ctx,
 			"MATCH (i:"+labelIntervention+")-[e:"+domain.Produced+"]->(o:"+labelOutcome+" {id: $id}) "+
+				"WHERE coalesce(e.epistemic_source, 'observational') = 'observational' "+
 				"SET o.value = $value, o.provenance = $provenance, o.verification_status = $status, e.confidence = $confidence",
 			map[string]any{
 				"id":         outcomeID,
@@ -515,6 +518,7 @@ func (r *Neo4jRepository) ListExtractionOutcomes(ctx context.Context, goalID str
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,
 			"MATCH (i:"+labelIntervention+" {goal_id: $goalID, type: $type})-[e:"+domain.Produced+"]->(o:"+labelOutcome+") "+
+				"WHERE coalesce(e.epistemic_source, 'observational') = 'observational' "+
 				"RETURN o, i, e.confidence AS confidence",
 			map[string]any{"goalID": goalID, "type": string(domain.InterventionExtract)},
 		)
@@ -549,6 +553,7 @@ func (r *Neo4jRepository) GetExtractionOutcome(ctx context.Context, outcomeID st
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,
 			"MATCH (i:"+labelIntervention+" {type: $type})-[e:"+domain.Produced+"]->(o:"+labelOutcome+" {id: $id}) "+
+				"WHERE coalesce(e.epistemic_source, 'observational') = 'observational' "+
 				"RETURN o, i, e.confidence AS confidence",
 			map[string]any{"id": outcomeID, "type": string(domain.InterventionExtract)},
 		)
@@ -614,14 +619,16 @@ func extractionOutcomeFromRecord(rec *neo4j.Record) (ExtractionOutcome, error) {
 }
 
 // TraceCausalChain walks ABSTRACTED_FROM from a Meta-Heuristic back to the
-// State/Intervention/Outcome triplet(s) that support it.
+// State/Intervention/Outcome triplet(s) that support it. Unlike the collection reads,
+// it intentionally returns both observational and causal_inferred edges, each triplet
+// labeled with its edge's epistemic_source so the caller can distinguish them.
 func (r *Neo4jRepository) TraceCausalChain(ctx context.Context, metaHeuristicID string) ([]CausalTriplet, error) {
 	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		result, err := tx.Run(ctx,
 			"MATCH (m:"+labelMetaHeuristic+" {id: $id})-[:"+domain.AbstractedFrom+"]->(t) "+
-				"MATCH (s:"+labelState+")-[:"+domain.PreConditionFor+"]->(i:"+labelIntervention+")-[:"+domain.Produced+"]->(o:"+labelOutcome+") "+
+				"MATCH (s:"+labelState+")-[:"+domain.PreConditionFor+"]->(i:"+labelIntervention+")-[e:"+domain.Produced+"]->(o:"+labelOutcome+") "+
 				"WHERE t = s OR t = i OR t = o "+
-				"RETURN DISTINCT s, i, o",
+				"RETURN DISTINCT s, i, o, e",
 			map[string]any{"id": metaHeuristicID},
 		)
 		if err != nil {
@@ -672,7 +679,16 @@ func tripletFromRecord(rec *neo4j.Record) (CausalTriplet, error) {
 	if err != nil {
 		return CausalTriplet{}, err
 	}
-	return CausalTriplet{State: state, Intervention: intervention, Outcome: outcome}, nil
+	// The producing PRODUCED edge is present in every triplet query (RETURN ... e), so
+	// its epistemic_source labels the triplet. An edge with no recorded value defaults
+	// to observational, preserving the forward-compatibility rule.
+	source := domain.EpistemicObservational
+	if rel, err := recordRelationship(rec, "e"); err == nil {
+		if s := stringProp(rel.Props["epistemic_source"]); s != "" {
+			source = domain.EpistemicSource(s)
+		}
+	}
+	return CausalTriplet{State: state, Intervention: intervention, Outcome: outcome, EpistemicSource: source}, nil
 }
 
 func stateFromNode(id string, node neo4j.Node) (domain.State, error) {

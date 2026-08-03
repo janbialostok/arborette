@@ -39,6 +39,18 @@ type fakeGraph struct {
 	edges      []domain.CausalEdge
 	metaCalls  int
 	deletes    int
+
+	graphValue         domain.CausalGraph // returned by GetCausalGraph when found (Meta.Version defaults to 1)
+	intervention       domain.Intervention
+	getInterventionErr error
+	causalEvidence     graph.CausalEvidence
+	hasCausalEvidence  bool
+	causalWrites       int
+	writtenVersion     int
+	writtenOutcome     domain.Outcome
+	writtenEdge        domain.ProducedEdge
+	supersedes         int
+	supersededVersion  int
 }
 
 func (f *fakeGraph) GetCausalGraph(context.Context, string, string) (domain.CausalGraph, bool, error) {
@@ -47,7 +59,11 @@ func (f *fakeGraph) GetCausalGraph(context.Context, string, string) (domain.Caus
 		return domain.CausalGraph{}, false, f.getErr
 	}
 	if f.found || (f.foundAfter > 0 && f.getCalls >= f.foundAfter) {
-		return domain.CausalGraph{Meta: domain.CausalGraphMeta{Version: 1}}, true, nil
+		g := f.graphValue
+		if g.Meta.Version == 0 {
+			g.Meta.Version = 1
+		}
+		return g, true, nil
 	}
 	return domain.CausalGraph{}, false, nil
 }
@@ -70,6 +86,24 @@ func (f *fakeGraph) UpsertCausalGraphMeta(context.Context, domain.CausalGraphMet
 func (f *fakeGraph) ListEligibleFindings(context.Context, string) ([]graph.CausalTriplet, error) {
 	return nil, nil
 }
+func (f *fakeGraph) GetIntervention(context.Context, string) (domain.Intervention, error) {
+	return f.intervention, f.getInterventionErr
+}
+func (f *fakeGraph) GetCausalEvidence(context.Context, string) (graph.CausalEvidence, bool, error) {
+	return f.causalEvidence, f.hasCausalEvidence, nil
+}
+func (f *fakeGraph) WriteCausalVerification(_ context.Context, _ string, version int, outcome domain.Outcome, edge domain.ProducedEdge) error {
+	f.causalWrites++
+	f.writtenVersion = version
+	f.writtenOutcome = outcome
+	f.writtenEdge = edge
+	return nil
+}
+func (f *fakeGraph) SupersedePriorCausalOutcomes(_ context.Context, _ string, version int) error {
+	f.supersedes++
+	f.supersededVersion = version
+	return nil
+}
 
 type fakeGoalReader struct{ goal store.Goal }
 
@@ -77,6 +111,7 @@ func (f fakeGoalReader) Get(context.Context, string) (store.Goal, error) { retur
 
 type fakeAudit struct {
 	actions []string
+	events  []map[string]any
 	err     error
 }
 
@@ -85,8 +120,13 @@ func (f *fakeAudit) Append(_ context.Context, action, _ string, _ map[string]any
 	return f.err
 }
 
+func (f *fakeAudit) PublishVerification(_ context.Context, _ string, event map[string]any) error {
+	f.events = append(f.events, event)
+	return f.err
+}
+
 func newTestWorker(a analyzer, g graphWriter, lk locker) *Worker {
-	w := NewWorker(a, g, nil, lk, fakeGoalReader{}, &fakeAudit{}, regressionConfig(), 0)
+	w := NewWorker(a, g, nil, lk, fakeGoalReader{}, &fakeAudit{}, nil, regressionConfig(), 0, time.Second)
 	// Squeeze the waiter timing so the tests do not sleep for seconds.
 	w.pollMin = time.Millisecond
 	w.pollMax = 2 * time.Millisecond
@@ -132,7 +172,7 @@ func TestRunDiscoveryRunsAndPersists(t *testing.T) {
 	g := &fakeGraph{found: false}
 	lk := &fakeLocker{acquired: true}
 	audit := &fakeAudit{}
-	w := NewWorker(newFakeAnalyzer(ds), g, nil, lk, fakeGoalReader{goal: store.Goal{GoalText: "maximize Y"}}, audit, regressionConfig(), 0)
+	w := NewWorker(newFakeAnalyzer(ds), g, nil, lk, fakeGoalReader{goal: store.Goal{GoalText: "maximize Y"}}, audit, nil, regressionConfig(), 0, time.Second)
 
 	if err := w.RunDiscovery(context.Background(), "goal", "ref"); err != nil {
 		t.Fatalf("RunDiscovery: %v", err)
@@ -156,7 +196,7 @@ func TestRunDiscoverySurvivesAuditFailure(t *testing.T) {
 	g := &fakeGraph{found: false}
 	audit := &fakeAudit{err: errors.New("audit 401")}
 	w := NewWorker(newFakeAnalyzer(ds), g, nil, &fakeLocker{acquired: true},
-		fakeGoalReader{goal: store.Goal{GoalText: "maximize Y"}}, audit, regressionConfig(), 0)
+		fakeGoalReader{goal: store.Goal{GoalText: "maximize Y"}}, audit, nil, regressionConfig(), 0, time.Second)
 
 	if err := w.RunDiscovery(context.Background(), "goal", "ref"); err != nil {
 		t.Fatalf("RunDiscovery must not fail on an audit error: %v", err)

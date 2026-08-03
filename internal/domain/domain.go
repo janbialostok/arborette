@@ -41,20 +41,28 @@ const (
 // eligible-finding Cypher binds the set as a query parameter.
 var SearchEligibleStatuses = []VerificationStatus{VerificationVerified, VerificationConfirmed, VerificationCorrected}
 
-// EpistemicSource records how a PRODUCED edge's effect was established. V1 writes
-// only observational — a measured correlation P(Outcome | Segment), not do-calculus
-// causation. interventional is reserved for a future V2 interventional layer
-// (physically-executed interventions, do-calculus edges) and is never written in
-// the MVP; a physically-executed intervention likewise reuses the existing
-// InterventionType field rather than adding a node-level field. Any consumer that
-// reads this property treats an absent/empty value as observational and must not
-// assume interventional exists.
+// EpistemicSource records how a PRODUCED edge's effect was established, ordered by
+// strength of causal evidence: observational (a measured correlation P(Outcome |
+// Segment)), causal_inferred (a backdoor-adjusted effect that survived the refutation
+// battery over the discovered graph — supported given that model, but not a
+// physically-executed intervention), and the still-reserved interventional (physical
+// execution, do-calculus edges, never written in the MVP; a physically-executed
+// intervention reuses the InterventionType field rather than a node-level field). Any
+// consumer that reads this property treats an absent/empty value as observational and
+// must not assume interventional exists.
 type EpistemicSource string
 
 const (
 	EpistemicObservational  EpistemicSource = "observational"
+	EpistemicCausalInferred EpistemicSource = "causal_inferred"
 	EpistemicInterventional EpistemicSource = "interventional"
 )
+
+// CausalInferredCaveat is the honest analyst-facing qualifier a causal_inferred edge
+// is rendered with: its effect is supported by backdoor adjustment and refutation
+// over the discovered causal model, not proven by a physical intervention, so it is
+// never presented as unconditional causation.
+const CausalInferredCaveat = "causally supported (given the discovered model)"
 
 // Relationship names for the graph edges. Kept as constants so both the graph
 // implementation and its consumers reference one spelling.

@@ -226,6 +226,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
 	mux.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)
 	mux.Handle("POST /internal/audit", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleAudit)))
+	mux.Handle("POST /internal/verification-events", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleVerificationEvent)))
 	return mux
 }
 

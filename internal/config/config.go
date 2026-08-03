@@ -227,6 +227,19 @@ type SleepCycleConfig struct {
 // dataset at conditioning bound 2 can reach tens of thousands otherwise);
 // DiscoveryCallTimeout bounds one analyze call; OrientMaxRepairs bounds the batched
 // LLM orientation repair loop.
+//
+// The verification knobs drive the adjustment + refutation stage: LeaseTTL is a
+// leased record's deadline and HeartbeatEvery paces its renewal (lease = 3×
+// heartbeat, so two missed beats precede a false reap); InflightCap bounds concurrent
+// verifications per goal; VerificationBudget is the per-goal budget default when the
+// registry carries no override; RefutationK is the subsample count; RefutationTau is
+// the score threshold for causally_verified; SampleFraction is each subsample's
+// share; StabilityBand is the relative band a subsample effect must stay within;
+// SupportFloor is the per-stratum positivity floor; CollapseRatio is the naive-effect
+// fraction the adjusted effect must retain to avoid the confounded verdict;
+// RandomStratifierBins is the synthetic random-confounder bucket count. The
+// refutation and effect knobs are calibration targets pending tuning against the
+// ground-truth fixture.
 type VerifierConfig struct {
 	Port                 string
 	SandboxURL           string
@@ -240,6 +253,18 @@ type VerifierConfig struct {
 	DiscoveryMaxTests    int
 	DiscoveryCallTimeout time.Duration
 	OrientMaxRepairs     int
+
+	LeaseTTL             time.Duration
+	HeartbeatEvery       time.Duration
+	InflightCap          int
+	VerificationBudget   int
+	RefutationK          int
+	RefutationTau        float64
+	SampleFraction       float64
+	StabilityBand        float64
+	SupportFloor         int
+	CollapseRatio        float64
+	RandomStratifierBins int
 }
 
 // LLMConfig selects the LLM provider and holds each provider's credentials.
@@ -415,6 +440,17 @@ func Load() (Config, error) {
 			DiscoveryMaxTests:    intEnv("VERIFIER_DISCOVERY_MAX_TESTS", 20000),
 			DiscoveryCallTimeout: time.Duration(intEnv("VERIFIER_DISCOVERY_CALL_TIMEOUT_SECONDS", 60)) * time.Second,
 			OrientMaxRepairs:     intEnv("VERIFIER_ORIENT_MAX_REPAIRS", 2),
+			LeaseTTL:             time.Duration(intEnv("VERIFIER_LEASE_TTL_SECONDS", 90)) * time.Second,
+			HeartbeatEvery:       time.Duration(intEnv("VERIFIER_HEARTBEAT_EVERY_SECONDS", 30)) * time.Second,
+			InflightCap:          intEnv("VERIFIER_INFLIGHT_CAP", 4),
+			VerificationBudget:   intEnv("VERIFIER_VERIFICATION_BUDGET", 20),
+			RefutationK:          intEnv("VERIFIER_REFUTATION_K", 20),
+			RefutationTau:        floatEnv("VERIFIER_REFUTATION_TAU", 0.8),
+			SampleFraction:       floatEnv("VERIFIER_SAMPLE_FRACTION", 0.7),
+			StabilityBand:        floatEnv("VERIFIER_STABILITY_BAND", 0.5),
+			SupportFloor:         intEnv("VERIFIER_SUPPORT_FLOOR", 20),
+			CollapseRatio:        floatEnv("VERIFIER_COLLAPSE_RATIO", 0.5),
+			RandomStratifierBins: intEnv("VERIFIER_RANDOM_STRATIFIER_BINS", 4),
 		},
 		LLM: LLMConfig{
 			Provider: env("LLM_PROVIDER", "anthropic"),

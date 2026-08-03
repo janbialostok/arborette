@@ -13,9 +13,70 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/arborette/arborette/internal/domain"
+	"github.com/arborette/arborette/internal/sandboxclient"
 	"github.com/arborette/arborette/internal/verifier/groundtruth"
 	"github.com/arborette/arborette/internal/verifier/stats"
 )
+
+// TestAnalyzeWireParity pins the byte-for-byte JSON compatibility between the sandbox
+// wire structs and their CGO-free sandboxclient twins for the effect kinds: a client
+// request must decode into the server struct field-for-field, and a server stratum
+// response must decode into the client struct. The interface-fake path cannot catch a
+// tag drift; this does.
+func TestAnalyzeWireParity(t *testing.T) {
+	seg := 1.5
+	base := 3.5
+	clientReq := sandboxclient.AnalyzeRequest{
+		DataSourceRef:        "ref.csv",
+		Kind:                 sandboxclient.AnalyzeStratifiedEffect,
+		Aggregation:          "avg",
+		ValueExpression:      &domain.Expression{Kind: domain.ColumnRefKind, Column: "Y"},
+		Segment:              []domain.Constraint{{Field: "X", Op: domain.GreaterThanOrEqual, Value: 0.5}},
+		Adjust:               []sandboxclient.AnalyzeColumn{{Name: "Z", Bins: 4}},
+		SampleFraction:       0.7,
+		RandomStratifierBins: 4,
+	}
+	var serverReq AnalyzeRequest
+	if err := roundTrip(clientReq, &serverReq); err != nil {
+		t.Fatalf("request round-trip: %v", err)
+	}
+	if serverReq.Kind != clientReq.Kind || serverReq.Aggregation != "avg" ||
+		serverReq.ValueExpression == nil || serverReq.ValueExpression.Column != "Y" ||
+		len(serverReq.Segment) != 1 || serverReq.Segment[0].Field != "X" ||
+		len(serverReq.Adjust) != 1 || serverReq.Adjust[0].Name != "Z" || serverReq.Adjust[0].Bins != 4 ||
+		serverReq.SampleFraction != 0.7 || serverReq.RandomStratifierBins != 4 {
+		t.Fatalf("request did not round-trip field-for-field: %+v", serverReq)
+	}
+
+	serverResp := AnalyzeResponse{Kind: AnalyzeStratifiedEffect, Strata: []StratumRow{
+		{Values: []string{"0"}, N: 100, SegmentN: 40, SegmentAgg: &seg, BaselineN: 60, BaselineAgg: &base},
+		{Values: []string{"1"}, N: 50, SegmentN: 20, SegmentAgg: nil, BaselineN: 30, BaselineAgg: &base},
+	}}
+	var clientResp sandboxclient.AnalyzeResponse
+	if err := roundTrip(serverResp, &clientResp); err != nil {
+		t.Fatalf("response round-trip: %v", err)
+	}
+	if len(clientResp.Strata) != 2 {
+		t.Fatalf("strata count = %d, want 2", len(clientResp.Strata))
+	}
+	s0 := clientResp.Strata[0]
+	if s0.N != 100 || s0.SegmentN != 40 || s0.SegmentAgg == nil || *s0.SegmentAgg != 1.5 || s0.BaselineN != 60 {
+		t.Fatalf("stratum 0 did not round-trip: %+v", s0)
+	}
+	// A null aggregate must decode to a nil pointer, not a zero.
+	if clientResp.Strata[1].SegmentAgg != nil {
+		t.Fatalf("a null segment aggregate must decode to nil, got %v", *clientResp.Strata[1].SegmentAgg)
+	}
+}
+
+func roundTrip(in, out any) error {
+	b, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, out)
+}
 
 // fakeRefValidator lets the handler tests exercise the ref-scoping branch without a
 // registry: it reports whether the ref is the one it was seeded with.
@@ -61,6 +122,12 @@ func TestAnalyzeRequestValidation(t *testing.T) {
 		{"moments no variables", `{"data_source_ref":"ok.csv","kind":"moments"}`, http.StatusUnprocessableEntity},
 		{"moments over cap", `{"data_source_ref":"ok.csv","kind":"moments","variables":["a","b","c","d","e"]}`, http.StatusUnprocessableEntity},
 		{"moments group_by over cap", `{"data_source_ref":"ok.csv","kind":"moments","variables":["a"],"group_by":["b","c","d","e","f"]}`, http.StatusUnprocessableEntity},
+		{"effect no aggregation", `{"data_source_ref":"ok.csv","kind":"stratified_effect","value_expression":{"kind":"column_ref","column":"y"}}`, http.StatusUnprocessableEntity},
+		{"effect adjust over cap", `{"data_source_ref":"ok.csv","kind":"stratified_effect","aggregation":"avg","value_expression":{"kind":"column_ref","column":"y"},"adjust":[{"name":"a"},{"name":"b"},{"name":"c"},{"name":"d"},{"name":"e"}]}`, http.StatusUnprocessableEntity},
+		{"effect bad bins", `{"data_source_ref":"ok.csv","kind":"stratified_effect","aggregation":"avg","value_expression":{"kind":"column_ref","column":"y"},"adjust":[{"name":"n","bins":1}]}`, http.StatusUnprocessableEntity},
+		{"effect random bins over max", `{"data_source_ref":"ok.csv","kind":"stratified_effect","aggregation":"avg","value_expression":{"kind":"column_ref","column":"y"},"random_stratifier_bins":999}`, http.StatusUnprocessableEntity},
+		{"sampled fraction zero", `{"data_source_ref":"ok.csv","kind":"sampled_effect","aggregation":"avg","value_expression":{"kind":"column_ref","column":"y"},"sample_fraction":0}`, http.StatusUnprocessableEntity},
+		{"sampled fraction over one", `{"data_source_ref":"ok.csv","kind":"sampled_effect","aggregation":"avg","value_expression":{"kind":"column_ref","column":"y"},"sample_fraction":1.5}`, http.StatusUnprocessableEntity},
 		{"invalid body", `{`, http.StatusBadRequest},
 	}
 	for _, c := range cases {
@@ -172,6 +239,87 @@ func TestAnalyzeStaging(t *testing.T) {
 		code, _ := post(`{"data_source_ref":"` + ref + `","kind":"contingency","columns":[{"name":"g","bins":2}]}`)
 		if code != http.StatusBadRequest {
 			t.Fatalf("binned categorical column status = %d, want 400", code)
+		}
+	})
+}
+
+// TestAnalyzeEffectStaging drives the real DuckDB staging path for the effect kinds:
+// a Z-less naive stratified_effect (one stratum, both arms), a binned-Z stratified
+// effect (per-stratum arms), the synthetic random stratifier, and a sampled_effect at
+// fraction 1.0 (reservoir at 100% equals the unsampled result). Integration-gated
+// (needs the object store).
+func TestAnalyzeEffectStaging(t *testing.T) {
+	ctx := context.Background()
+	client := newTestClient(t, ctx)
+	ref := putObject(t, ctx, client, ".csv", []byte(analyzeCSV))
+
+	limiter := NewClassLimiter(map[string]int{ClassAnalyze: 2})
+	srv := NewServer(client, nil, nil, limiter, 1<<20, 1<<20, "1GiB", 50, 4, 32)
+
+	post := func(body string) (int, AnalyzeResponse) {
+		req := httptest.NewRequest(http.MethodPost, "/analyze", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		var resp AnalyzeResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		return rec.Code, resp
+	}
+
+	// The segment g = 'a' has rows n∈{1,2}; the baseline (g = 'b') has n∈{3,4}.
+	segment := `"aggregation":"avg","value_expression":{"kind":"column_ref","column":"n"},"segment":[{"field":"g","op":"eq","operand":{"string":"a"}}]`
+
+	t.Run("naive z-less", func(t *testing.T) {
+		code, resp := post(`{"data_source_ref":"` + ref + `","kind":"stratified_effect",` + segment + `}`)
+		if code != http.StatusOK || len(resp.Strata) != 1 {
+			t.Fatalf("status = %d, strata = %d", code, len(resp.Strata))
+		}
+		s := resp.Strata[0]
+		if s.N != 4 || s.SegmentN != 2 || s.BaselineN != 2 {
+			t.Fatalf("counts = n:%d segN:%d baseN:%d, want 4/2/2", s.N, s.SegmentN, s.BaselineN)
+		}
+		if s.SegmentAgg == nil || *s.SegmentAgg != 1.5 || s.BaselineAgg == nil || *s.BaselineAgg != 3.5 {
+			t.Fatalf("aggs = seg:%v base:%v, want 1.5/3.5", s.SegmentAgg, s.BaselineAgg)
+		}
+	})
+
+	t.Run("binned adjustment strata", func(t *testing.T) {
+		code, resp := post(`{"data_source_ref":"` + ref + `","kind":"stratified_effect",` + segment + `,"adjust":[{"name":"n","bins":2}]}`)
+		if code != http.StatusOK {
+			t.Fatalf("status = %d", code)
+		}
+		var total int64
+		for _, s := range resp.Strata {
+			total += s.N
+		}
+		if total != 4 {
+			t.Fatalf("stratum counts sum to %d, want 4", total)
+		}
+	})
+
+	t.Run("random stratifier adds a key column", func(t *testing.T) {
+		code, resp := post(`{"data_source_ref":"` + ref + `","kind":"stratified_effect",` + segment + `,"random_stratifier_bins":2}`)
+		if code != http.StatusOK || len(resp.Strata) == 0 {
+			t.Fatalf("status = %d, strata = %d", code, len(resp.Strata))
+		}
+		var total int64
+		for _, s := range resp.Strata {
+			if len(s.Values) != 1 {
+				t.Fatalf("random-stratified values = %v, want one bucket key", s.Values)
+			}
+			total += s.N
+		}
+		if total != 4 {
+			t.Fatalf("random-stratum counts sum to %d, want 4", total)
+		}
+	})
+
+	t.Run("sampled fraction 1.0 equals unsampled", func(t *testing.T) {
+		code, resp := post(`{"data_source_ref":"` + ref + `","kind":"sampled_effect",` + segment + `,"sample_fraction":1.0}`)
+		if code != http.StatusOK || len(resp.Strata) != 1 {
+			t.Fatalf("status = %d, strata = %d", code, len(resp.Strata))
+		}
+		if resp.Strata[0].N != 4 {
+			t.Fatalf("sampled n = %d, want 4 (reservoir at 100%% is the whole set)", resp.Strata[0].N)
 		}
 	})
 }

@@ -112,7 +112,7 @@ func (o searchOutcome) winners(minSupport int64) []measuredNode {
 func buildAtoms(findings []graph.CausalTriplet) ([]atom, error) {
 	byKey := map[string]*atom{}
 	for _, f := range findings {
-		filters, err := decodeConstraints(f.Intervention.Properties[domain.PropNewFilters])
+		filters, err := domain.DecodeConstraints(f.Intervention.Properties[domain.PropNewFilters])
 		if err != nil {
 			return nil, err
 		}

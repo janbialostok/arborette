@@ -126,25 +126,3 @@ func derivedID(ns uuid.UUID, role, canonical string) string {
 func baselineStateID(ns uuid.UUID) string {
 	return derivedID(ns, roleBaselineState, "")
 }
-
-// decodeConstraints converts a node property back into typed constraints. It is
-// mandatory rather than defensive: new_filters is stored as a typed
-// []domain.Constraint, but the graph layer marshals the whole property map to a
-// JSON string and decodes it back into map[string]any -- so the value arrives as
-// []any of map[string]any with nested operand/members objects. A direct type
-// assertion fails at runtime and silently yields an empty atom set, which would
-// make every run degenerate.
-func decodeConstraints(v any) ([]domain.Constraint, error) {
-	if v == nil {
-		return nil, nil
-	}
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil, fmt.Errorf("re-encode filters: %w", err)
-	}
-	var filters []domain.Constraint
-	if err := json.Unmarshal(b, &filters); err != nil {
-		return nil, fmt.Errorf("decode filters: %w", err)
-	}
-	return filters, nil
-}
