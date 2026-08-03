@@ -3,8 +3,10 @@
 import { useEffect, useState } from "react";
 import {
   errorMessage,
+  listGoals,
   searchHeuristics,
   traceHeuristic,
+  type GoalListItem,
   type HeuristicMatch,
   type TraceTriplet,
 } from "@/lib/orchestrator";
@@ -26,6 +28,23 @@ export function HeuristicBrowser() {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [selected, setSelected] = useState<HeuristicMatch | null>(null);
+  const [goals, setGoals] = useState<GoalListItem[]>([]);
+  const [goalId, setGoalId] = useState("");
+
+  // Populate the scope selector. The corpus is browsable cross-goal by default;
+  // scoping to a goal is what surfaces that goal's own heuristics instead of the
+  // whole (legacy-heavy) corpus. A load failure just leaves the "All goals" option.
+  useEffect(() => {
+    let cancelled = false;
+    listGoals()
+      .then((gs) => {
+        if (!cancelled) setGoals(gs);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function onSearch(e: React.FormEvent) {
     e.preventDefault();
@@ -38,7 +57,7 @@ export function HeuristicBrowser() {
     setSearching(true);
     setSelected(null);
     try {
-      setResults(await searchHeuristics(q.trim()));
+      setResults(await searchHeuristics(q.trim(), undefined, goalId || undefined));
     } catch (err) {
       setResults(null);
       setSearchError(errorMessage(err, "Search failed. Please retry."));
@@ -56,11 +75,26 @@ export function HeuristicBrowser() {
         </h1>
         <p className="max-w-xl text-sm leading-relaxed text-muted">
           Search the meta-heuristics distilled by the sleep cycle. Open one to
-          trace the causal evidence it was abstracted from.
+          trace the causal evidence it was abstracted from. Scope to a goal to see
+          only that objective&rsquo;s heuristics, since abstracted definitions
+          rank poorly across the whole corpus by domain query.
         </p>
       </div>
 
-      <form onSubmit={onSearch} className="flex gap-2">
+      <form onSubmit={onSearch} className="flex flex-col gap-2 sm:flex-row">
+        <select
+          value={goalId}
+          onChange={(e) => setGoalId(e.target.value)}
+          aria-label="Heuristic scope"
+          className="rounded-lg border border-line bg-surface px-3 py-3 text-sm text-fg outline-none transition-colors focus:border-signal/60 focus:ring-2 focus:ring-signal/20 sm:w-56 sm:shrink-0"
+        >
+          <option value="">All goals</option>
+          {goals.map((g) => (
+            <option key={g.optimization_function_id} value={g.optimization_function_id}>
+              {g.goal_text}
+            </option>
+          ))}
+        </select>
         <input
           type="text"
           value={q}

@@ -328,3 +328,35 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Where**: `cmd/sleepcycle/main.go`, `internal/sleepcycle/worker.go:416-422`
 - **Why**: `worker.report` intentionally logs-and-swallows audit `Append` failures, so a misconfigured/mismatched `INTERNAL_AUTH_TOKEN` (introduced by the V2 shell-01 plan for `POST /internal/audit`) silently drops the entire audit trail — including `sleepcycle_run_complete`, the only carrier of Phase-2 winners. One authenticated probe call at worker startup would fail loudly at boot instead. Belongs with worker boot/serve wiring (V2 shell 03 territory), deliberately kept out of shell 01.
 - **Noted**: 2026-07-30
+
+### Eval framework measuring agent accuracy uplift from heuristics/causal traces vs baseline LLM
+
+- **Type**: plan
+- **Category**: feature
+- **Where**: agent preview / chat surface (`internal/orchestrator/chat.go`) + MCP read tools (`get_optimized_heuristics`, `trace_causal_chain`); a new eval harness + labeled question sets per dataset (e.g. Spaceship Titanic transport questions)
+- **Why**: There is no way to quantify whether the discovered heuristics and causal traces actually improve answer quality. An eval harness that runs a fixed question set through the agent (with heuristic/causal-trace retrieval) and through the bare baseline LLM, scoring accuracy on each, would measure uplift over time and guard against regressions — e.g. transport-related questions on the Spaceship Titanic corpus should score higher with the heuristics than without. Enables tracking model/prompt/heuristic changes against a baseline rather than eyeballing.
+- **Noted**: 2026-08-02
+
+### Index ontology-term mapping / goal text so cross-goal heuristic search can rank by domain query
+
+- **Type**: plan
+- **Category**: feature
+- **Where**: `internal/sleepcycle` (abstraction persists concrete↔ontological pairs — R15), `internal/embedding` + `internal/heuristics` (Query), `internal/orchestrator/heuristics.go` (search)
+- **Why**: Meta-Heuristic definitions are domain-abstracted (`[Categorical Attribute]`, `[System Output Rate]` — never "GPA"/"sleep"), so a domain query matches nothing on-topic: measured cosine distances compress into a flat ~0.38–0.52 band and the larger legacy corpus wins the top-k by sample size, not relevance (153 legacy rows buried a goal's 13 on-topic ones). Goal-scoping is the immediate fix, but cross-goal browse-by-question needs the abstract definition to carry a concrete surface — index the persisted ontology-term concrete↔ontological pairs and/or the goal text (e.g. a second embedding) so domain queries have something to land on.
+- **Noted**: 2026-08-03
+
+### Distance floor (0.5) cuts off the entire abstracted heuristic corpus for reasonable domain queries
+
+- **Type**: plan
+- **Category**: reliability
+- **Where**: `internal/config` (`EMBEDDING_DISTANCE_FLOOR`, 0.5 provisional), `internal/store` embedding `SimilaritySearch` (floor applied), relates to the ontology-term-mapping entry above
+- **Why**: A goal-scoped search for "Does sleep impact GPA" on a goal whose 13 heuristics are literally the sleep→GPA ones returns ZERO results: measured, all 13 sit at 0.527+ cosine distance (0/13 under the 0.5 floor), while the reworded "biggest impacts on GPA" sits at 0.41 (13/13 under). Abstracted definitions have no shared domain terms with natural-language queries, so they live at high absolute distances and a floor tuned for concrete text produces empty results for valid queries — a near-miss (0.527 vs 0.5). Levers: recalibrate/relax the floor for the abstracted corpus (or drop it when goal-scoped, where there's nothing to protect against), and/or index concrete terms (see ontology-term entry) to pull distances under the floor. Calibrate against the R30 dataset.
+- **Noted**: 2026-08-03
+
+### Make the heuristic-browser goal selector a typed autocomplete combobox
+
+- **Type**: plan
+- **Category**: feature
+- **Where**: `web/components/HeuristicBrowser.tsx` (scope `<select>`)
+- **Why**: The scope selector renders every goal as a native `<select>` option; with many goals that's a long, clunky list to scroll. A typed autocomplete/combobox (filter-as-you-type over goal text, keyboard-navigable, accessible) keeps selection fast as the goal count grows, and matches how analysts think about goals (by phrase, not position).
+- **Noted**: 2026-08-03

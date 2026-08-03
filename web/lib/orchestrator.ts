@@ -321,9 +321,13 @@ export function resolveVerification(
 export function searchHeuristics(
   q: string,
   k?: number,
+  goalId?: string,
 ): Promise<HeuristicMatch[]> {
   const params = new URLSearchParams({ q });
   if (k != null) params.set("k", String(k));
+  // An empty goalId omits the param, which the orchestrator reads as a
+  // cross-goal (whole-corpus) search; a set goalId narrows to one goal.
+  if (goalId) params.set("goal_id", goalId);
   return requestJSON<HeuristicMatch[]>(
     `${API_BASE}/heuristics/search?${params.toString()}`,
   );
