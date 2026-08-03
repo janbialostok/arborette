@@ -455,6 +455,10 @@ func (f *fakeRepo) CorrectOutcome(_ context.Context, outcomeID string, value map
 	return nil
 }
 
+func (f *fakeRepo) GetCausalGraph(_ context.Context, _, _ string) (domain.CausalGraph, bool, error) {
+	return domain.CausalGraph{}, false, nil
+}
+
 // polls reports how many times the blocking gate read an outcome's status.
 func (f *fakeRepo) polls() int {
 	f.mu.Lock()
@@ -603,7 +607,7 @@ func (ts testServer) build() *Server {
 		orElse(ts.claude, &fakeClaude{}).(claudeClient),
 		&fakeChat{},
 		orElse(ts.sandbox, &fakeSandbox{}).(sandboxExecutor),
-		NewHub(), StubLauncher{}, StubIdentity{ID: "analyst-test"},
+		NewHub(), StubLauncher{}, StubLauncher{}, StubIdentity{ID: "analyst-test"},
 		ts.localImportDir, "arborette-sleepcycle", ts.internalAuthToken,
 		testHITLThreshold, time.Minute,
 	)

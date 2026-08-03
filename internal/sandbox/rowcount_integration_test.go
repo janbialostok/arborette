@@ -18,7 +18,7 @@ func TestExecuteReturnsRowCount(t *testing.T) {
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(csvFixture))
 
-	ts := httptest.NewServer(NewServer(client, nil, nil, testLimiter(), 1<<20, 1<<20, "1GiB", 50).Routes())
+	ts := httptest.NewServer(NewServer(client, nil, nil, testLimiter(), 1<<20, 1<<20, "1GiB", 50, 4, 32).Routes())
 	defer ts.Close()
 
 	post := func(t *testing.T, body string) map[string]any {

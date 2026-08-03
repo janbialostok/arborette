@@ -48,6 +48,8 @@ type Client interface {
 	Extract(ctx context.Context, pdf []byte, field domain.TargetField, method string) (string, float64, error)
 	AbstractMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment) (Abstraction, error)
 	RepairMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment, prior Abstraction, validationErr string) (Abstraction, error)
+	OrientCausalEdges(ctx context.Context, goalText string, columns []ColumnSemantics, edges []OrientEdge) ([]OrientDecision, error)
+	RepairOrientCausalEdges(ctx context.Context, goalText string, columns []ColumnSemantics, edges []OrientEdge, prior []OrientDecision, validationErr string) ([]OrientDecision, error)
 }
 
 // NewClient builds an LLM client from configuration. The LLM_PROVIDER env

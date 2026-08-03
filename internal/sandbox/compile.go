@@ -26,6 +26,17 @@ var (
 	errNonFiniteValue     = errors.New("non-finite objective value")
 )
 
+// Analyze-request validation sentinels. These are caller-fixable request-shape
+// errors (unknown kind, over-cap column/variable counts, out-of-range bin counts)
+// the handler maps to 422 before any staging, distinct from the compile sentinels
+// above (mapped to 400 by writeStageErr).
+var (
+	errAnalyzeUnknownKind    = errors.New("unsupported analyze kind")
+	errAnalyzeColumnCount    = errors.New("analyze column count out of range")
+	errAnalyzeBinCount       = errors.New("analyze quantile bin count out of range")
+	errAnalyzeMissingColumns = errors.New("analyze request names no columns")
+)
+
 // allowedAgg maps a request aggregation to the SQL function emitted. Anything
 // outside this allowlist is rejected -- an aggregation name never reaches the SQL
 // string uninterpreted.
@@ -907,4 +918,196 @@ func isNumeric(t string) bool {
 // quoteIdent double-quotes a validated identifier, escaping embedded quotes.
 func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// staticValidateAnalyze rejects an analyze request whose shape is invalid without
+// the schema: an unknown kind, a column/variable count outside [1, maxColumns], or
+// a quantile bin count outside [2, maxBins]. Column existence and type checks need
+// the schema and stay in the compile step. maxColumns is the per-kind bound (2
+// endpoints + the conditioning-set size); it derives from config, never a literal.
+func staticValidateAnalyze(kind string, columns []AnalyzeColumn, variables, groupBy []string, maxColumns, maxBins int) error {
+	switch kind {
+	case AnalyzeContingency:
+		if len(columns) == 0 {
+			return fmt.Errorf("%w: contingency", errAnalyzeMissingColumns)
+		}
+		if len(columns) > maxColumns {
+			return fmt.Errorf("%w: %d columns exceeds cap %d", errAnalyzeColumnCount, len(columns), maxColumns)
+		}
+		for _, c := range columns {
+			if c.Bins != 0 && (c.Bins < 2 || c.Bins > maxBins) {
+				return fmt.Errorf("%w: %q bins %d not in [2, %d]", errAnalyzeBinCount, c.Name, c.Bins, maxBins)
+			}
+		}
+		return nil
+	case AnalyzeMoments:
+		if len(variables) == 0 {
+			return fmt.Errorf("%w: moments", errAnalyzeMissingColumns)
+		}
+		if len(variables) > maxColumns {
+			return fmt.Errorf("%w: %d variables exceeds cap %d", errAnalyzeColumnCount, len(variables), maxColumns)
+		}
+		// The group-by conditioners are capped the same way: each adds a GROUP BY
+		// reference and a null predicate, so an unbounded list is a compile-size / DoS
+		// amplification vector even though every name is still schema-validated and
+		// quoted. The cap mirrors the endpoint/conditioning-set bound.
+		if len(groupBy) > maxColumns {
+			return fmt.Errorf("%w: %d group-by columns exceeds cap %d", errAnalyzeColumnCount, len(groupBy), maxColumns)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", errAnalyzeUnknownKind, kind)
+	}
+}
+
+// quantileCutsSQL produces the query that computes a numeric column's bins-1
+// interior quantile cut points. Each cut is a separate scalar quantile_cont
+// aggregate (probabilities i/bins for i in 1..bins-1) so the result is a single
+// row of plain DOUBLEs, avoiding LIST scanning; the probabilities are server-derived
+// from the integer bin count, never request text, so they are injection-safe
+// literals. NULLs are excluded so the cuts describe the observed distribution.
+func quantileCutsSQL(tableFn, colName string, bins int) string {
+	col := quoteIdent(colName)
+	parts := make([]string, 0, bins-1)
+	for i := 1; i < bins; i++ {
+		p := float64(i) / float64(bins)
+		parts = append(parts, "quantile_cont("+col+", "+strconv.FormatFloat(p, 'f', 6, 64)+")")
+	}
+	return "SELECT " + strings.Join(parts, ", ") + " FROM " + tableFn + " WHERE " + col + " IS NOT NULL"
+}
+
+// binExpr builds a bucket expression assigning each row of a numeric column to a
+// quantile bucket by its cut points, returning a VARCHAR bucket label so a binned
+// column groups uniformly alongside raw categorical columns. Cut points are bound
+// as ? params (server-computed DOUBLEs, never interpolated). With no usable cuts —
+// an empty or constant column whose quantiles came back NULL — every row falls into
+// bucket "0", a single-bucket degenerate the caller's stats treat as untestable.
+func binExpr(colName string, cuts []float64) (string, []any) {
+	col := quoteIdent(colName)
+	if len(cuts) == 0 {
+		return "'0'", nil
+	}
+	var b strings.Builder
+	args := make([]any, 0, len(cuts))
+	b.WriteString("CASE")
+	for i, cut := range cuts {
+		b.WriteString(" WHEN " + col + " <= ? THEN '" + strconv.Itoa(i) + "'")
+		args = append(args, cut)
+	}
+	b.WriteString(" ELSE '" + strconv.Itoa(len(cuts)) + "' END")
+	return b.String(), args
+}
+
+// compileContingency builds the grouped count query for a contingency table: one
+// group expression per requested column (categorical columns grouped on their raw
+// value cast to VARCHAR; numeric columns bucketed via binExpr over the supplied
+// cut points), the matched-row count, and complete-case null handling (every group
+// column IS NOT NULL) plus the intervention filters. Binned columns' ? args precede
+// the filter args, matching their emission order (SELECT before WHERE). cuts maps a
+// column index to its precomputed quantile cut points; a categorical column has no
+// entry.
+func compileContingency(tableFn string, cols []datasource.Column, columns []AnalyzeColumn, filters []domain.Constraint, cuts map[int][]float64) (string, []any, error) {
+	groupExprs := make([]string, 0, len(columns))
+	nullPreds := make([]string, 0, len(columns))
+	var args []any
+	for i, c := range columns {
+		col, err := resolveColumn(cols, c.Name)
+		if err != nil {
+			return "", nil, err
+		}
+		if c.Bins > 0 {
+			if !isNumeric(col.Type) {
+				return "", nil, fmt.Errorf("%w: binned column %q (%s)", errNonNumeric, col.Name, col.Type)
+			}
+			expr, binArgs := binExpr(col.Name, cuts[i])
+			groupExprs = append(groupExprs, expr)
+			args = append(args, binArgs...)
+		} else {
+			groupExprs = append(groupExprs, "CAST("+quoteIdent(col.Name)+" AS VARCHAR)")
+		}
+		nullPreds = append(nullPreds, quoteIdent(col.Name)+" IS NOT NULL")
+	}
+
+	filterPreds, filterArgs, err := compileFilters(cols, filters)
+	if err != nil {
+		return "", nil, err
+	}
+	args = append(args, filterArgs...)
+
+	positions := make([]string, len(groupExprs))
+	for i := range positions {
+		positions[i] = strconv.Itoa(i + 1)
+	}
+	query := "SELECT " + strings.Join(groupExprs, ", ") + ", CAST(count(*) AS BIGINT) FROM " + tableFn +
+		" WHERE " + strings.Join(append(nullPreds, filterPreds...), " AND ") +
+		" GROUP BY " + strings.Join(positions, ", ")
+	return query, args, nil
+}
+
+// compileMoments builds the moment-aggregate query for a set of numeric variables,
+// optionally grouped by categorical conditioning columns (raw values — the moments
+// kind never bins). It emits, per stratum: the group key, the complete-case row
+// count, each variable's sum and sum-of-squares, and every pairwise cross-product
+// sum (i<j in variable order), all in DOUBLE space so an overflow yields +Inf the
+// scan guard catches rather than a mid-scan error. Null handling is listwise over
+// the full variable set (one shared IS NOT NULL predicate per variable and per
+// group column) so every sum in a row shares one n. Returns the query and the
+// variable count so the reader knows the cross-product layout.
+func compileMoments(tableFn string, cols []datasource.Column, variables, groupBy []string, filters []domain.Constraint) (string, []any, int, error) {
+	varCols := make([]datasource.Column, 0, len(variables))
+	nullPreds := make([]string, 0, len(variables)+len(groupBy))
+	for _, name := range variables {
+		col, err := resolveColumn(cols, name)
+		if err != nil {
+			return "", nil, 0, err
+		}
+		if !isNumeric(col.Type) {
+			return "", nil, 0, fmt.Errorf("%w: moments variable %q (%s)", errNonNumeric, col.Name, col.Type)
+		}
+		varCols = append(varCols, col)
+		nullPreds = append(nullPreds, quoteIdent(col.Name)+" IS NOT NULL")
+	}
+
+	groupExprs := make([]string, 0, len(groupBy))
+	for _, name := range groupBy {
+		col, err := resolveColumn(cols, name)
+		if err != nil {
+			return "", nil, 0, err
+		}
+		groupExprs = append(groupExprs, "CAST("+quoteIdent(col.Name)+" AS VARCHAR)")
+		nullPreds = append(nullPreds, quoteIdent(col.Name)+" IS NOT NULL")
+	}
+
+	dbl := func(c datasource.Column) string { return "CAST(" + quoteIdent(c.Name) + " AS DOUBLE)" }
+
+	selects := make([]string, 0, len(groupExprs)+1+2*len(varCols)+len(varCols)*(len(varCols)-1)/2)
+	selects = append(selects, groupExprs...)
+	selects = append(selects, "CAST(count(*) AS BIGINT)")
+	for _, c := range varCols {
+		selects = append(selects, "sum("+dbl(c)+")", "sum("+dbl(c)+" * "+dbl(c)+")")
+	}
+	for i := 0; i < len(varCols); i++ {
+		for j := i + 1; j < len(varCols); j++ {
+			selects = append(selects, "sum("+dbl(varCols[i])+" * "+dbl(varCols[j])+")")
+		}
+	}
+
+	filterPreds, filterArgs, err := compileFilters(cols, filters)
+	if err != nil {
+		return "", nil, 0, err
+	}
+
+	query := "SELECT " + strings.Join(selects, ", ") + " FROM " + tableFn
+	preds := append(nullPreds, filterPreds...)
+	if len(preds) > 0 {
+		query += " WHERE " + strings.Join(preds, " AND ")
+	}
+	if len(groupExprs) > 0 {
+		positions := make([]string, len(groupExprs))
+		for i := range positions {
+			positions[i] = strconv.Itoa(i + 1)
+		}
+		query += " GROUP BY " + strings.Join(positions, ", ")
+	}
+	return query, filterArgs, len(varCols), nil
 }

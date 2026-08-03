@@ -5,11 +5,15 @@ import (
 	"sync"
 )
 
-// ClassDefault is the single request class registered today, covering /introspect,
-// /execute, and /document/text. Later request kinds (an analyze class, say) register
-// their own class name and slot count without reshaping the limiter, so nothing
-// here hard-codes the default where a class parameter can flow.
-const ClassDefault = "default"
+// ClassDefault covers /introspect, /execute, and /document/text. ClassAnalyze is
+// the /analyze surface's own rate/concurrency class, so a discovery sweep's many
+// contingency/moments round-trips are throttled independently of the hypothesis
+// loop's execute calls. Each class registers its own slot count without reshaping
+// the limiter, so nothing here hard-codes a class where a class parameter can flow.
+const (
+	ClassDefault = "default"
+	ClassAnalyze = "analyze"
+)
 
 // classLimiter bounds concurrent in-flight work per request class. Each class is a
 // buffered-channel semaphore sized at construction; Acquire blocks until a slot

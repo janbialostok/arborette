@@ -24,6 +24,7 @@ type Config struct {
 	Orchestrator OrchestratorConfig
 	MCP          MCPConfig
 	SleepCycle   SleepCycleConfig
+	Verifier     VerifierConfig
 	LLM          LLMConfig
 }
 
@@ -102,6 +103,13 @@ type EmbeddingConfig struct {
 // InternalAuthToken is the shared secret the sandbox verifies on every route -- the
 // same INTERNAL_AUTH_TOKEN the orchestrator's internal write surfaces verify and
 // the callers present (empty disables the guard).
+//
+// The analysis surface (POST /analyze) gets its own rate/concurrency class:
+// AnalyzeConcurrency is that class's slot count, separate from ExecuteConcurrency so
+// a discovery sweep's many round-trips do not starve the hypothesis loop's execute
+// calls (or vice versa). AnalyzeMaxColumns bounds the per-kind column count (2
+// endpoints + the conditioning-set bound; must be >= the verifier's 2 +
+// DiscoveryMaxCondSet); AnalyzeMaxBins bounds a quantile-binned column's bin count.
 type SandboxConfig struct {
 	Port               string
 	MaxObjectBytes     int64
@@ -109,6 +117,9 @@ type SandboxConfig struct {
 	StageCacheDir      string
 	StageCacheMaxBytes int64
 	ExecuteConcurrency int
+	AnalyzeConcurrency int
+	AnalyzeMaxColumns  int
+	AnalyzeMaxBins     int
 	MaxBodyBytes       int64
 	DistinctValueCap   int
 	InternalAuthToken  string
@@ -142,6 +153,7 @@ type OrchestratorConfig struct {
 	Port                    string
 	SandboxURL              string
 	SleepCycleWorkerURL     string
+	VerifierWorkerURL       string
 	AnalystID               string
 	SleepCycleJobName       string
 	LocalImportDir          string
@@ -198,6 +210,36 @@ type SleepCycleConfig struct {
 	MinSupport        int
 	MinLift           float64
 	MaxPublications   int
+}
+
+// VerifierConfig drives the Verifier (Engine B, stage 1: causal discovery). Port is
+// the serve-mode listen port (8085; 8080-8084 are taken by the other services).
+// SandboxURL is the Sandbox Execution service the discovery sweep runs its
+// conditional-independence tests through; OrchestratorURL is for the audit client
+// only — goal data comes straight from Postgres via the goal registry.
+// InternalAuthToken is the shared INTERNAL_AUTH_TOKEN.
+//
+// The discovery knobs mirror the settled tuning: DiscoveryAlpha is the CI-test
+// significance threshold; DiscoveryFDR selects the multiple-testing correction (bh
+// or none); DiscoveryMaxCondSet bounds the conditioning-set size; DiscoveryBins is
+// the quantile bin count for binned columns; DiscoveryColumnCap caps the sweep's
+// variable count; DiscoveryMaxTests bounds the total sandbox round-trips (a wide
+// dataset at conditioning bound 2 can reach tens of thousands otherwise);
+// DiscoveryCallTimeout bounds one analyze call; OrientMaxRepairs bounds the batched
+// LLM orientation repair loop.
+type VerifierConfig struct {
+	Port                 string
+	SandboxURL           string
+	OrchestratorURL      string
+	InternalAuthToken    string
+	DiscoveryAlpha       float64
+	DiscoveryFDR         string
+	DiscoveryMaxCondSet  int
+	DiscoveryBins        int
+	DiscoveryColumnCap   int
+	DiscoveryMaxTests    int
+	DiscoveryCallTimeout time.Duration
+	OrientMaxRepairs     int
 }
 
 // LLMConfig selects the LLM provider and holds each provider's credentials.
@@ -323,6 +365,9 @@ func Load() (Config, error) {
 			StageCacheDir:      os.Getenv("SANDBOX_STAGE_CACHE_DIR"),
 			StageCacheMaxBytes: int64Env("SANDBOX_STAGE_CACHE_MAX_BYTES", 2<<30),
 			ExecuteConcurrency: intEnv("SANDBOX_EXECUTE_CONCURRENCY", 8),
+			AnalyzeConcurrency: intEnv("SANDBOX_ANALYZE_CONCURRENCY", 8),
+			AnalyzeMaxColumns:  intEnv("SANDBOX_ANALYZE_MAX_COLUMNS", 4),
+			AnalyzeMaxBins:     intEnv("SANDBOX_ANALYZE_MAX_BINS", 32),
 			MaxBodyBytes:       int64Env("SANDBOX_MAX_BODY_BYTES", 1<<20),
 			DistinctValueCap:   intEnv("SANDBOX_DISTINCT_VALUE_CAP", 50),
 			InternalAuthToken:  os.Getenv("INTERNAL_AUTH_TOKEN"),
@@ -331,6 +376,7 @@ func Load() (Config, error) {
 			Port:                    env("ORCHESTRATOR_PORT", "8080"),
 			SandboxURL:              env("SANDBOX_URL", "http://sandbox:8081"),
 			SleepCycleWorkerURL:     os.Getenv("SLEEPCYCLE_WORKER_URL"),
+			VerifierWorkerURL:       os.Getenv("VERIFIER_WORKER_URL"),
 			AnalystID:               env("ARBORETTE_ANALYST_ID", "analyst-stub"),
 			SleepCycleJobName:       env("SLEEPCYCLE_JOB_NAME", "arborette-sleepcycle"),
 			LocalImportDir:          env("ARBORETTE_LOCAL_IMPORT_DIR", "/import"),
@@ -355,6 +401,20 @@ func Load() (Config, error) {
 			MinSupport:        intEnv("SLEEPCYCLE_SEARCH_MIN_SUPPORT", 30),
 			MinLift:           floatEnv("SLEEPCYCLE_SEARCH_MIN_LIFT", 0.05),
 			MaxPublications:   intEnv("SLEEPCYCLE_MAX_PUBLICATIONS", 20),
+		},
+		Verifier: VerifierConfig{
+			Port:                 env("VERIFIER_PORT", "8085"),
+			SandboxURL:           env("SANDBOX_URL", "http://sandbox:8081"),
+			OrchestratorURL:      env("ORCHESTRATOR_URL", "http://orchestrator:8080"),
+			InternalAuthToken:    os.Getenv("INTERNAL_AUTH_TOKEN"),
+			DiscoveryAlpha:       floatEnv("VERIFIER_DISCOVERY_ALPHA", 0.05),
+			DiscoveryFDR:         env("VERIFIER_DISCOVERY_FDR", "bh"),
+			DiscoveryMaxCondSet:  intEnv("VERIFIER_DISCOVERY_MAX_COND_SET", 2),
+			DiscoveryBins:        intEnv("VERIFIER_DISCOVERY_BINS", 4),
+			DiscoveryColumnCap:   intEnv("VERIFIER_DISCOVERY_COLUMN_CAP", 50),
+			DiscoveryMaxTests:    intEnv("VERIFIER_DISCOVERY_MAX_TESTS", 20000),
+			DiscoveryCallTimeout: time.Duration(intEnv("VERIFIER_DISCOVERY_CALL_TIMEOUT_SECONDS", 60)) * time.Second,
+			OrientMaxRepairs:     intEnv("VERIFIER_ORIENT_MAX_REPAIRS", 2),
 		},
 		LLM: LLMConfig{
 			Provider: env("LLM_PROVIDER", "anthropic"),

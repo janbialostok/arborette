@@ -229,6 +229,179 @@ func (s *FileSource) ExecuteCounted(ctx context.Context, agg string, target doma
 	return measurement, nil
 }
 
+// Analyze stages the object once and answers a contingency or moments aggregation
+// over it — the read-only surface the causal-discovery sweep runs its
+// conditional-independence tests through. It reuses the same staging, schema
+// validation, and injection-safe compilers as Execute; a contingency request first
+// computes each binned column's quantile cut points over the same staged engine, so
+// binning pays no extra download.
+func (s *FileSource) Analyze(ctx context.Context, req AnalyzeRequest) (AnalyzeResponse, error) {
+	db, tableFn, cleanup, err := s.stage(ctx)
+	if err != nil {
+		return AnalyzeResponse{}, err
+	}
+	defer cleanup()
+
+	cols, err := columns(ctx, db, tableFn)
+	if err != nil {
+		return AnalyzeResponse{}, err
+	}
+
+	switch req.Kind {
+	case AnalyzeContingency:
+		return s.analyzeContingency(ctx, db, tableFn, cols, req)
+	case AnalyzeMoments:
+		return s.analyzeMoments(ctx, db, tableFn, cols, req)
+	default:
+		return AnalyzeResponse{}, fmt.Errorf("%w: %q", errAnalyzeUnknownKind, req.Kind)
+	}
+}
+
+func (s *FileSource) analyzeContingency(ctx context.Context, db *sql.DB, tableFn string, cols []datasource.Column, req AnalyzeRequest) (AnalyzeResponse, error) {
+	cuts := map[int][]float64{}
+	for i, c := range req.Columns {
+		if c.Bins <= 0 {
+			continue
+		}
+		got, err := s.quantileCuts(ctx, db, tableFn, c.Name, c.Bins)
+		if err != nil {
+			return AnalyzeResponse{}, err
+		}
+		cuts[i] = got
+	}
+
+	query, args, err := compileContingency(tableFn, cols, req.Columns, req.Filters, cuts)
+	if err != nil {
+		return AnalyzeResponse{}, err
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return AnalyzeResponse{}, fmt.Errorf("contingency query: %w", err)
+	}
+	defer rows.Close()
+
+	n := len(req.Columns)
+	var cells []ContingencyCell
+	for rows.Next() {
+		scanTargets := make([]any, n+1)
+		values := make([]string, n)
+		for i := range values {
+			scanTargets[i] = &values[i]
+		}
+		var count int64
+		scanTargets[n] = &count
+		if err := rows.Scan(scanTargets...); err != nil {
+			return AnalyzeResponse{}, fmt.Errorf("scan contingency cell: %w", err)
+		}
+		cells = append(cells, ContingencyCell{Values: values, Count: count})
+	}
+	if err := rows.Err(); err != nil {
+		return AnalyzeResponse{}, fmt.Errorf("contingency query: %w", err)
+	}
+	return AnalyzeResponse{Kind: AnalyzeContingency, Cells: cells}, nil
+}
+
+func (s *FileSource) analyzeMoments(ctx context.Context, db *sql.DB, tableFn string, cols []datasource.Column, req AnalyzeRequest) (AnalyzeResponse, error) {
+	query, args, nVars, err := compileMoments(tableFn, cols, req.Variables, req.GroupBy, req.Filters)
+	if err != nil {
+		return AnalyzeResponse{}, err
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return AnalyzeResponse{}, fmt.Errorf("moments query: %w", err)
+	}
+	defer rows.Close()
+
+	nGroup := len(req.GroupBy)
+	nCross := nVars * (nVars - 1) / 2
+	var moments []MomentsRow
+	for rows.Next() {
+		group := make([]string, nGroup)
+		var count int64
+		// perVarMoments holds each variable's sum and sum-of-squares interleaved
+		// (index 2v is the sum, 2v+1 the sum-of-squares), the order compileMoments
+		// emits them in.
+		perVarMoments := make([]sql.NullFloat64, 2*nVars)
+		cross := make([]sql.NullFloat64, nCross)
+
+		scanTargets := make([]any, 0, nGroup+1+2*nVars+nCross)
+		for i := range group {
+			scanTargets = append(scanTargets, &group[i])
+		}
+		scanTargets = append(scanTargets, &count)
+		for i := range perVarMoments {
+			scanTargets = append(scanTargets, &perVarMoments[i])
+		}
+		for i := range cross {
+			scanTargets = append(scanTargets, &cross[i])
+		}
+		if err := rows.Scan(scanTargets...); err != nil {
+			return AnalyzeResponse{}, fmt.Errorf("scan moments row: %w", err)
+		}
+
+		row := MomentsRow{N: count, Sum: make([]float64, nVars), SumSq: make([]float64, nVars), Cross: make([]float64, nCross)}
+		if nGroup > 0 {
+			row.Group = group
+		}
+		for v := 0; v < nVars; v++ {
+			if row.Sum[v], err = finiteOrZero(perVarMoments[2*v]); err != nil {
+				return AnalyzeResponse{}, err
+			}
+			if row.SumSq[v], err = finiteOrZero(perVarMoments[2*v+1]); err != nil {
+				return AnalyzeResponse{}, err
+			}
+		}
+		for i := range cross {
+			if row.Cross[i], err = finiteOrZero(cross[i]); err != nil {
+				return AnalyzeResponse{}, err
+			}
+		}
+		moments = append(moments, row)
+	}
+	if err := rows.Err(); err != nil {
+		return AnalyzeResponse{}, fmt.Errorf("moments query: %w", err)
+	}
+	return AnalyzeResponse{Kind: AnalyzeMoments, Moments: moments}, nil
+}
+
+// quantileCuts reads one column's bins-1 interior quantile cut points over the
+// staged engine, dropping any that came back NULL (an empty or degenerate column),
+// so binExpr collapses to a single bucket rather than binding a NULL boundary.
+func (s *FileSource) quantileCuts(ctx context.Context, db *sql.DB, tableFn, colName string, bins int) ([]float64, error) {
+	row := db.QueryRowContext(ctx, quantileCutsSQL(tableFn, colName, bins))
+	raw := make([]sql.NullFloat64, bins-1)
+	targets := make([]any, bins-1)
+	for i := range raw {
+		targets[i] = &raw[i]
+	}
+	if err := row.Scan(targets...); err != nil {
+		return nil, fmt.Errorf("quantile cuts for %q: %w", colName, err)
+	}
+	cuts := make([]float64, 0, bins-1)
+	for _, c := range raw {
+		if c.Valid && !math.IsInf(c.Float64, 0) && !math.IsNaN(c.Float64) {
+			cuts = append(cuts, c.Float64)
+		}
+	}
+	return cuts, nil
+}
+
+// finiteOrZero unwraps a scanned aggregate sum: an SQL NULL (an empty stratum)
+// becomes 0, and a non-finite DOUBLE — an overflow that reached +Inf in DOUBLE
+// space rather than erroring mid-scan — is rejected as errNonFiniteValue (mapped to
+// 400) rather than emitted in a JSON body that cannot encode it.
+func finiteOrZero(v sql.NullFloat64) (float64, error) {
+	if !v.Valid {
+		return 0, nil
+	}
+	if math.IsInf(v.Float64, 0) || math.IsNaN(v.Float64) {
+		return 0, errNonFiniteValue
+	}
+	return v.Float64, nil
+}
+
 // stage resolves the source file (from the cache when configured, else a fresh
 // per-request download) and opens a configured in-memory DuckDB over it, returning
 // the engine, the table-function expression both Introspect and Execute build

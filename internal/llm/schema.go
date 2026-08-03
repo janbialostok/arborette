@@ -131,6 +131,22 @@ func metaHeuristicSchema() map[string]any {
 	}, "definition", "ontology_terms")
 }
 
+// orientCausalEdgesSchema is the structured-output schema for OrientCausalEdges: an
+// array of per-edge decisions, each an echoed edge id (a plain string, matched
+// deterministically after decode), a direction enum over the small fixed set, and a
+// confidence number. The edge list is prompt-grounded data, not schema, so the
+// schema stays flat and static (one small enum, no recursion, no per-edge variance)
+// and inside the constrained-decoding ceiling.
+func orientCausalEdgesSchema() map[string]any {
+	return object(props{
+		"decisions": arrayOf(object(props{
+			"edge_id":    stringProp(),
+			"decision":   enumSchema([]any{OrientFirstCausesSecond, OrientSecondCausesFirst, OrientAbstain}),
+			"confidence": map[string]any{"type": "number"},
+		}, "edge_id", "decision", "confidence")),
+	}, "decisions")
+}
+
 // constraintItem is the schema for one matrix hard-constraint. The field is a plain
 // string (grounded via the prompt, validated after generation); only the op keeps
 // its fixed-cardinality enum. It stays numeric-only because it is shared with

@@ -57,9 +57,13 @@ func main() {
 		log.Fatalf("sandbox: init stage cache: %v", err)
 	}
 
-	limiter := sandbox.NewClassLimiter(map[string]int{sandbox.ClassDefault: cfg.Sandbox.ExecuteConcurrency})
+	limiter := sandbox.NewClassLimiter(map[string]int{
+		sandbox.ClassDefault: cfg.Sandbox.ExecuteConcurrency,
+		sandbox.ClassAnalyze: cfg.Sandbox.AnalyzeConcurrency,
+	})
 	srv := sandbox.NewServer(objects, validator, cache, limiter,
-		cfg.Sandbox.MaxObjectBytes, cfg.Sandbox.MaxBodyBytes, cfg.Sandbox.MaxTempDirSize, cfg.Sandbox.DistinctValueCap)
+		cfg.Sandbox.MaxObjectBytes, cfg.Sandbox.MaxBodyBytes, cfg.Sandbox.MaxTempDirSize, cfg.Sandbox.DistinctValueCap,
+		cfg.Sandbox.AnalyzeMaxColumns, cfg.Sandbox.AnalyzeMaxBins)
 
 	log.Printf("sandbox: wired object store, postgres, stage cache; serving HTTP on :%s", cfg.Sandbox.Port)
 	if err := service.RunHTTPServer("sandbox", ":"+cfg.Sandbox.Port,

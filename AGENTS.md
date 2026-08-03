@@ -71,6 +71,13 @@
   nil pointer stored in one is never `== nil`. Assert on content (length, a
   specific id) rather than `detail["k"] != nil`, which passes even when the value
   is the nil the assertion means to catch.
+- `audit_log` is a shared table read by ops queries. Key its `detail` map with the
+  codebase-wide vocabulary — `optimization_function_id` for the goal id,
+  `data_source_ref` for the source — even when a new service's own wire DTO spells
+  the same value differently (e.g. the verifier's `POST /verifications` body uses
+  `goal_id`/`datasource_ref`). The wire contract and the audit-detail schema are
+  separate concerns; a dashboard keyed on `detail->>'optimization_function_id'`
+  must match every engine's rows.
 - A test double that ignores its `context.Context` cannot catch a context bug. The
   real pools and drivers fail a call on a cancelled context, so a fake that does
   not is why a handler passing the wrong context (the request's, where a detached

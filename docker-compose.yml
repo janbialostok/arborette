@@ -141,6 +141,9 @@ services:
       # sleepcycle-serve worker (full URL, /runs included). Set here, not in .env,
       # so it always applies: compose environment wins over env_file.
       SLEEPCYCLE_WORKER_URL: http://sleepcycle-serve:8084/runs
+      # Selects the verifier HTTP launcher the same way (full URL, /verifications
+      # included). Wired here for the verifier-dispatch path a later shell adds.
+      VERIFIER_WORKER_URL: http://verifier-serve:8085/verifications
     ports:
       - "8080:8080"
     volumes:
@@ -216,6 +219,43 @@ services:
     ports:
       - "8084:8084"
     depends_on: *sleepcycle-depends
+
+  # One-shot Verifier job (profile "jobs", so `make up` skips it): runs a single
+  # causal discovery for a (goal, data-source) and exits, exercising the AWS Batch
+  # seam. Run it with:
+  #   docker compose run --rm verifier -goal <id> -datasource <ref>
+  # The long-running serve alternative (`make up` starts it) is verifier-serve.
+  verifier:
+    profiles: ["jobs"]
+    # Anchored so the serve variant below reuses the same image and wait-for graph.
+    build: &verifier-build
+      context: .
+      dockerfile: cmd/verifier/Dockerfile
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    depends_on: &verifier-depends
+      migrate:
+        condition: service_completed_successfully
+      neo4j:
+        condition: service_healthy
+      sandbox:
+        condition: service_started
+      orchestrator:
+        condition: service_started
+
+  # The Verifier in serve mode: same image and wiring as the one-shot job, but
+  # long-running (one discovery per POST /verifications) so the orchestrator's HTTP
+  # launcher can drive it. Un-profiled, so `make up` starts it.
+  verifier-serve:
+    build: *verifier-build
+    command: ["-serve"]
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    ports:
+      - "8085:8085"
+    depends_on: *verifier-depends
 
   mcpserver:
     build:

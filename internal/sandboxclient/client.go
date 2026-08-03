@@ -128,6 +128,55 @@ func RowCount(resp ExecuteResponse) (int64, bool) {
 	}
 }
 
+// Analyze-kind discriminators, byte-identical to the sandbox's own constants.
+const (
+	AnalyzeContingency = "contingency"
+	AnalyzeMoments     = "moments"
+)
+
+// AnalyzeColumn is one contingency-table column: Bins 0 groups on the raw
+// categorical value, a positive Bins quantile-buckets a numeric column.
+type AnalyzeColumn struct {
+	Name string `json:"name"`
+	Bins int    `json:"bins,omitempty"`
+}
+
+// AnalyzeRequest asks the sandbox for one contingency or moments aggregation. It is
+// a CGO-free copy of the sandbox wire struct (Columns for contingency; Variables +
+// GroupBy for moments); keep it byte-for-byte JSON-compatible.
+type AnalyzeRequest struct {
+	DataSourceRef string              `json:"data_source_ref"`
+	Kind          string              `json:"kind"`
+	Filters       []domain.Constraint `json:"filters,omitempty"`
+	Columns       []AnalyzeColumn     `json:"columns,omitempty"`
+	Variables     []string            `json:"variables,omitempty"`
+	GroupBy       []string            `json:"group_by,omitempty"`
+}
+
+// ContingencyCell is one contingency-table row: the group-key values and the count.
+type ContingencyCell struct {
+	Values []string `json:"values"`
+	Count  int64    `json:"count"`
+}
+
+// MomentsRow is one stratum's moment aggregates: the group key (empty when
+// ungrouped), the complete-case row count, per-variable Sum/SumSq in request order,
+// and the pairwise cross-product sums (pairs i<j in request order).
+type MomentsRow struct {
+	Group []string  `json:"group,omitempty"`
+	N     int64     `json:"n"`
+	Sum   []float64 `json:"sum"`
+	SumSq []float64 `json:"sum_sq"`
+	Cross []float64 `json:"cross"`
+}
+
+// AnalyzeResponse carries the aggregation result keyed by kind.
+type AnalyzeResponse struct {
+	Kind    string            `json:"kind"`
+	Cells   []ContingencyCell `json:"cells,omitempty"`
+	Moments []MomentsRow      `json:"moments,omitempty"`
+}
+
 // SandboxError is a non-200 response from the sandbox, carrying the HTTP status
 // and the decoded {error} body (or a status fallback when the body is empty).
 // Callers classify by Status: a 400 is an analyst-fixable compile/validation
@@ -172,6 +221,17 @@ func (c *Client) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	var resp ExecuteResponse
 	if err := c.post(ctx, "/execute", req, &resp); err != nil {
 		return ExecuteResponse{}, err
+	}
+	return resp, nil
+}
+
+// Analyze POSTs a contingency or moments aggregation request to /analyze. It is the
+// read-only surface the verifier's discovery sweep runs its conditional-independence
+// tests through; errors classify by SandboxError.Status like the other calls.
+func (c *Client) Analyze(ctx context.Context, req AnalyzeRequest) (AnalyzeResponse, error) {
+	var resp AnalyzeResponse
+	if err := c.post(ctx, "/analyze", req, &resp); err != nil {
+		return AnalyzeResponse{}, err
 	}
 	return resp, nil
 }

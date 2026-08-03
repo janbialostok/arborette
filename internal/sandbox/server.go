@@ -30,30 +30,36 @@ type refValidator interface {
 // layer over immutable content-addressed refs. The limiter bounds per-class
 // concurrency, and the ref validator scopes requests to registered data sources.
 type Server struct {
-	objects          *objectstore.Client
-	validator        refValidator
-	cache            *StageCache
-	limiter          *classLimiter
-	maxObjectBytes   int64
-	maxBodyBytes     int64
-	maxTempDirSize   string
-	distinctValueCap int
+	objects           *objectstore.Client
+	validator         refValidator
+	cache             *StageCache
+	limiter           *classLimiter
+	maxObjectBytes    int64
+	maxBodyBytes      int64
+	maxTempDirSize    string
+	distinctValueCap  int
+	analyzeMaxColumns int
+	analyzeMaxBins    int
 }
 
 // NewServer wires the handlers to the object store, the ref validator, the staging
 // cache, the concurrency limiter, and the staging limits. It takes primitives and
 // narrow types only (infra-constructor convention). A nil validator and a nil cache
-// are documented test seams; the wired binary passes real ones.
-func NewServer(objects *objectstore.Client, validator refValidator, cache *StageCache, limiter *classLimiter, maxObjectBytes, maxBodyBytes int64, maxTempDirSize string, distinctValueCap int) *Server {
+// are documented test seams; the wired binary passes real ones. analyzeMaxColumns
+// and analyzeMaxBins bound the /analyze request shape (per-kind column count and a
+// binned column's bin count), derived from config.
+func NewServer(objects *objectstore.Client, validator refValidator, cache *StageCache, limiter *classLimiter, maxObjectBytes, maxBodyBytes int64, maxTempDirSize string, distinctValueCap, analyzeMaxColumns, analyzeMaxBins int) *Server {
 	return &Server{
-		objects:          objects,
-		validator:        validator,
-		cache:            cache,
-		limiter:          limiter,
-		maxObjectBytes:   maxObjectBytes,
-		maxBodyBytes:     maxBodyBytes,
-		maxTempDirSize:   maxTempDirSize,
-		distinctValueCap: distinctValueCap,
+		objects:           objects,
+		validator:         validator,
+		cache:             cache,
+		limiter:           limiter,
+		maxObjectBytes:    maxObjectBytes,
+		maxBodyBytes:      maxBodyBytes,
+		maxTempDirSize:    maxTempDirSize,
+		distinctValueCap:  distinctValueCap,
+		analyzeMaxColumns: analyzeMaxColumns,
+		analyzeMaxBins:    analyzeMaxBins,
 	}
 }
 
@@ -62,6 +68,7 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /introspect", s.handleIntrospect)
 	mux.HandleFunc("POST /execute", s.handleExecute)
+	mux.HandleFunc("POST /analyze", s.handleAnalyze)
 	mux.HandleFunc("POST /document/text", s.handleDocumentText)
 	return mux
 }
@@ -151,6 +158,64 @@ type ExecuteResponse struct {
 	Value map[string]any `json:"value"`
 }
 
+// Analyze-kind discriminators. contingency returns GROUP BY counts; moments
+// returns sum/sum-of-squares/cross-product aggregates for correlation estimation.
+const (
+	AnalyzeContingency = "contingency"
+	AnalyzeMoments     = "moments"
+)
+
+// AnalyzeColumn is one contingency-table column. Bins 0 groups on the raw
+// (categorical) value; a positive Bins quantile-buckets a numeric column into that
+// many bins. The numeric endpoints of a mixed pair are binned this way by the
+// caller; the moments kind never bins.
+type AnalyzeColumn struct {
+	Name string `json:"name"`
+	Bins int    `json:"bins,omitempty"`
+}
+
+// AnalyzeRequest asks for one contingency or moments aggregation over a data
+// source under optional hard-constraint filters. Columns (contingency) or Variables
+// + GroupBy (moments) are populated by kind. The discriminator is additive-friendly:
+// an unknown kind is rejected so later kinds slot in without breaking the contract.
+type AnalyzeRequest struct {
+	DataSourceRef string              `json:"data_source_ref"`
+	Kind          string              `json:"kind"`
+	Filters       []domain.Constraint `json:"filters,omitempty"`
+	Columns       []AnalyzeColumn     `json:"columns,omitempty"`
+	Variables     []string            `json:"variables,omitempty"`
+	GroupBy       []string            `json:"group_by,omitempty"`
+}
+
+// ContingencyCell is one row of a contingency table: the group-key values (in the
+// requested column order, numeric-binned rendered as bucket labels) and the matched
+// row count.
+type ContingencyCell struct {
+	Values []string `json:"values"`
+	Count  int64    `json:"count"`
+}
+
+// MomentsRow is one stratum's moment aggregates. Group is the categorical group-key
+// values (empty for the ungrouped form); N is the complete-case row count; Sum and
+// SumSq are per-variable in request order; Cross is the pairwise cross-product sums
+// for pairs (i,j) with i<j in request order, so the caller can form the covariance
+// (and thus correlation) matrix.
+type MomentsRow struct {
+	Group []string  `json:"group,omitempty"`
+	N     int64     `json:"n"`
+	Sum   []float64 `json:"sum"`
+	SumSq []float64 `json:"sum_sq"`
+	Cross []float64 `json:"cross"`
+}
+
+// AnalyzeResponse carries the aggregation result keyed by kind: Cells for
+// contingency, Moments for moments.
+type AnalyzeResponse struct {
+	Kind    string            `json:"kind"`
+	Cells   []ContingencyCell `json:"cells,omitempty"`
+	Moments []MomentsRow      `json:"moments,omitempty"`
+}
+
 func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
 	release, ok := s.acquireSlot(r)
@@ -209,7 +274,13 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 // until one frees. A non-nil error means the request context was cancelled while
 // waiting -- the client is gone, so no response is written.
 func (s *Server) acquireSlot(r *http.Request) (func(), bool) {
-	release, err := s.limiter.Acquire(r.Context(), ClassDefault)
+	return s.acquireSlotClass(r, ClassDefault)
+}
+
+// acquireSlotClass takes a concurrency slot for the named class, so /analyze can
+// hold its own class independent of the default surface's slots.
+func (s *Server) acquireSlotClass(r *http.Request, class string) (func(), bool) {
+	release, err := s.limiter.Acquire(r.Context(), class)
 	if err != nil {
 		return nil, false
 	}
@@ -342,6 +413,51 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		value[rowCountKey] = m.RowCount
 	}
 	service.WriteJSON(w, http.StatusOK, ExecuteResponse{Value: value})
+}
+
+// handleAnalyze answers a contingency or moments aggregation, following
+// handleExecute's hardening order: MaxBytesReader -> acquire an analyze-class slot
+// -> decode -> validateRef -> static request-shape validation (a 422, pre-staging)
+// -> compile+run over the staged engine -> writeStageErr. It is the read-only
+// surface the causal-discovery sweep drives.
+func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
+	release, ok := s.acquireSlotClass(r, ClassAnalyze)
+	if !ok {
+		return
+	}
+	defer release()
+
+	var req AnalyzeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.DataSourceRef == "" {
+		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
+		return
+	}
+	if !s.validateRef(w, r, req.DataSourceRef) {
+		return
+	}
+
+	// Request-shape validation is schema-independent, so it runs before staging and
+	// answers 422 (unprocessable) rather than the 400/404 writeStageErr maps: an
+	// unknown kind or over-cap column count is a caller contract error, not a
+	// staging fault. Column existence and type checks need the schema and stay in
+	// the compile step below.
+	if err := staticValidateAnalyze(req.Kind, req.Columns, req.Variables, req.GroupBy, s.analyzeMaxColumns, s.analyzeMaxBins); err != nil {
+		service.WriteErr(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize, s.distinctValueCap)
+	resp, err := src.Analyze(r.Context(), req)
+	if err != nil {
+		writeStageErr(w, err)
+		return
+	}
+	service.WriteJSON(w, http.StatusOK, resp)
 }
 
 // bindTargets binds each target to a column using the shared case-insensitive

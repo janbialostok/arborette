@@ -19,10 +19,12 @@ var ErrNotFound = errors.New("node not found")
 // uses the hyphen-free MetaHeuristic label so no Cypher needs backtick quoting,
 // keeping every statement inside the Neptune-portable subset.
 const (
-	labelState         = "State"
-	labelIntervention  = "Intervention"
-	labelOutcome       = "Outcome"
-	labelMetaHeuristic = "MetaHeuristic"
+	labelState           = "State"
+	labelIntervention    = "Intervention"
+	labelOutcome         = "Outcome"
+	labelMetaHeuristic   = "MetaHeuristic"
+	labelDataColumn      = "DataColumn"
+	labelCausalGraphMeta = "CausalGraphMeta"
 )
 
 // goal_id and sleep_derived are deliberately written as top-level node

@@ -73,6 +73,7 @@ type graphRepo interface {
 	GetExtractionOutcome(ctx context.Context, outcomeID string) (graph.ExtractionOutcome, error)
 	UpdateOutcomeVerification(ctx context.Context, outcomeID string, status domain.VerificationStatus, confidence float64) error
 	CorrectOutcome(ctx context.Context, outcomeID string, value map[string]any, provenance *domain.ProvenanceLocator, status domain.VerificationStatus, confidence float64) error
+	GetCausalGraph(ctx context.Context, goalID, datasourceRef string) (domain.CausalGraph, bool, error)
 }
 
 type sandboxExecutor interface {
@@ -144,6 +145,7 @@ type Server struct {
 	sandbox             sandboxExecutor
 	hub                 *Hub
 	jobs                JobLauncher
+	verifierJobs        JobLauncher
 	identity            Identity
 	localImportDir      string
 	sleepCycleJobName   string
@@ -172,6 +174,7 @@ func NewServer(
 	sandbox sandboxExecutor,
 	hub *Hub,
 	jobs JobLauncher,
+	verifierJobs JobLauncher,
 	identity Identity,
 	localImportDir, sleepCycleJobName, internalAuthToken string,
 	hitlThreshold float64,
@@ -190,6 +193,7 @@ func NewServer(
 		sandbox:             sandbox,
 		hub:                 hub,
 		jobs:                jobs,
+		verifierJobs:        verifierJobs,
 		identity:            identity,
 		localImportDir:      localImportDir,
 		sleepCycleJobName:   sleepCycleJobName,
@@ -218,6 +222,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /goals/{id}/verifications/{outcomeID}", s.handleResolveVerification)
 	mux.HandleFunc("GET /goals/{id}/outcomes", s.handleListOutcomes)
 	mux.HandleFunc("GET /goals/{id}/outcomes/{outcomeID}/excerpt", s.handleOutcomeExcerpt)
+	mux.HandleFunc("GET /goals/{id}/causal-graph", s.handleCausalGraph)
 	mux.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
 	mux.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)
 	mux.Handle("POST /internal/audit", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleAudit)))

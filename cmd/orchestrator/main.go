@@ -94,9 +94,21 @@ func main() {
 		log.Printf("orchestrator: wired stub sleep-cycle launcher (no worker URL configured)")
 	}
 
+	// The verifier launcher is selected the same way (its differently-pathed endpoint
+	// reuses the HTTPLauncher unchanged). It is held for the verifier-dispatch path a
+	// later shell adds; this shell only wires it.
+	var verifierLauncher orchestrator.JobLauncher
+	if url := cfg.Orchestrator.VerifierWorkerURL; url != "" {
+		verifierLauncher = orchestrator.NewHTTPLauncher(url, cfg.Orchestrator.InternalAuthToken, nil)
+		log.Printf("orchestrator: wired HTTP verifier launcher -> %s", url)
+	} else {
+		verifierLauncher = orchestrator.StubLauncher{}
+		log.Printf("orchestrator: wired stub verifier launcher (no verifier URL configured)")
+	}
+
 	srv := orchestrator.NewServer(
 		repo, goals, runs, queue, audits, objects, heur, claude, chat, sandbox,
-		orchestrator.NewHub(), launcher,
+		orchestrator.NewHub(), launcher, verifierLauncher,
 		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID},
 		cfg.Orchestrator.LocalImportDir, cfg.Orchestrator.SleepCycleJobName,
 		cfg.Orchestrator.InternalAuthToken,

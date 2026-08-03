@@ -121,7 +121,7 @@ func TestDocumentSourceIntegration(t *testing.T) {
 	}
 
 	// The /document/text route returns the same per-page text.
-	srv := NewServer(client, nil, nil, testLimiter(), 512<<20, 1<<20, "1GiB", 50)
+	srv := NewServer(client, nil, nil, testLimiter(), 512<<20, 1<<20, "1GiB", 50, 4, 32)
 	body, _ := json.Marshal(DocumentTextRequest{DataSourceRef: key})
 	req := httptest.NewRequest(http.MethodPost, "/document/text", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
