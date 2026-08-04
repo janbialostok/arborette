@@ -85,6 +85,7 @@ const (
 	PropObjectiveAggregation = "objective_aggregation"
 	PropDataSourceRef        = "data_source_ref"
 	PropSupport              = "support"
+	PropClaimDerived         = "claim_derived"
 )
 
 // State is a snapshot/telemetry point in time. GoalID scopes it to the

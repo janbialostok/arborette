@@ -147,6 +147,22 @@ func orientCausalEdgesSchema() map[string]any {
 	}, "decisions")
 }
 
+// classifyGoalIntentSchema is the structured-output schema for ClassifyGoalIntent:
+// the routing track and the claim extracted with it. Only the two fixed enums
+// (track, claimed direction) stay strict; the claim's filter conjunction rides as a
+// JSON-encoded string, because filter columns and values are a dataset-sized growing
+// set and that is the axis the constrained-decoding grammar has a ceiling on. The
+// string is parsed and validated deterministically after generation, which also
+// keeps this schema static per code version and so statically cacheable.
+func classifyGoalIntentSchema() map[string]any {
+	return object(props{
+		"track":           enumSchema([]any{TrackExplore, TrackVerify}),
+		"rationale":       stringProp(),
+		"claim_filters":   stringProp(),
+		"claim_direction": enumSchema([]any{claimIncrease, claimDecrease, ""}),
+	}, "track", "rationale", "claim_filters", "claim_direction")
+}
+
 // constraintItem is the schema for one matrix hard-constraint. The field is a plain
 // string (grounded via the prompt, validated after generation); only the op keeps
 // its fixed-cardinality enum. It stays numeric-only because it is shared with

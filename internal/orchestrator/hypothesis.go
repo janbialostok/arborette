@@ -102,6 +102,9 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 	// the root-failure sites below set it, so a per-candidate branch failure (a
 	// separate function with no access to it) never flips the run to failed.
 	var termErr error
+	// Declared above the defer so the completion hook can read what the run measured;
+	// everything below assigns into it.
+	var run runOutcome
 	defer func() {
 		// A panic unwinds through this defer with termErr still nil; recover so a
 		// crashed run is marked failed rather than mislabeled completed, and one
@@ -133,6 +136,10 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		// of the run must not push a distribution into a run the hub is about to
 		// evict (see deregisterHistogram).
 		s.deregisterHistogram(id, hist)
+		// Route the run's output to Engine B on its own goroutine (see autoPromote for
+		// why it is one). Promotion is never allowed to change how the run ended.
+		run.succeeded = termErr == nil
+		go s.autoPromote(goal, run)
 		s.hub.Publish(id, Event{Type: "loop_complete"})
 		s.hub.Complete(id)
 	}()
@@ -157,6 +164,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 	// columns for the whole run.
 	obj.EntityKeyColumn = goal.EntityKeyColumn
 	obj.TimeColumn = goal.TimeColumn
+	run.objective = obj
 	log.Printf("orchestrator: hypothesis loop %q: objective: %s %s %s", id, obj.Aggregation, obj.Label, obj.Direction)
 
 	introspect, err := s.sandbox.Introspect(ctx, IntrospectRequest{DataSourceRef: goal.DataSourceRef})
@@ -194,6 +202,7 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		s.branchFailure(ctx, id, nil, errNonNumericValue)
 		return
 	}
+	run.baseline, run.baselineSet = baseline, true
 	rootRowCount, _ := sandboxclient.RowCount(baseResp)
 	log.Printf("orchestrator: hypothesis loop %q: root baseline: %.4f (row_count: %d)", id, baseline, rootRowCount)
 

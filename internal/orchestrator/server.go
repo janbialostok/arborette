@@ -50,6 +50,7 @@ type claudeClient interface {
 	RepairInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema llm.SandboxSchema, node llm.TreeContext, prior llm.Proposal, validationErr string) (llm.Proposal, error)
 	IntrospectDocumentFields(ctx context.Context, goalText, sample string) ([]domain.TargetField, error)
 	Extract(ctx context.Context, pdf []byte, field domain.TargetField, method string) (string, float64, error)
+	ClassifyGoalIntent(ctx context.Context, goal llm.GoalIntentInput) (llm.GoalIntentResult, error)
 }
 
 // chatStreamer is the streaming Claude the agent-preview endpoint drives. It is
@@ -61,8 +62,10 @@ type chatStreamer interface {
 }
 
 // graphRepo is the graph surface the handlers and the loop need: the triplet
-// writes the loop persists, plus the extraction reads and resolution writes the
-// review surface drives.
+// writes the loop persists, the extraction reads and resolution writes the
+// review surface drives, and the causal reads and corrections the router routes on --
+// the finding lookup behind an explicit verify, the eligible-findings pool
+// auto-promotion ranks, and the analyst's edge correction.
 type graphRepo interface {
 	CreateState(ctx context.Context, s domain.State) error
 	CreateIntervention(ctx context.Context, i domain.Intervention) error
@@ -74,6 +77,26 @@ type graphRepo interface {
 	UpdateOutcomeVerification(ctx context.Context, outcomeID string, status domain.VerificationStatus, confidence float64) error
 	CorrectOutcome(ctx context.Context, outcomeID string, value map[string]any, provenance *domain.ProvenanceLocator, status domain.VerificationStatus, confidence float64) error
 	GetCausalGraph(ctx context.Context, goalID, datasourceRef string) (domain.CausalGraph, bool, error)
+	GetIntervention(ctx context.Context, id string) (domain.Intervention, error)
+	ListEligibleFindings(ctx context.Context, goalID string) ([]graph.CausalTriplet, error)
+	CorrectCausalEdge(ctx context.Context, goalID, datasourceRef string, correction domain.EdgeCorrection) (int, []string, error)
+}
+
+// causalVerificationStore is the causal-verification surface the router reads and
+// invalidates: the analyst-facing listing, and the staleness marking a graph
+// correction triggers. The records themselves are written by the Verifier.
+type causalVerificationStore interface {
+	ListForGoal(ctx context.Context, goalID string) ([]store.CausalVerification, error)
+	MarkStale(ctx context.Context, goalID string, columns []string) ([]string, error)
+}
+
+// graphLocker is the cross-process single-flight over a (goal, data-source) key --
+// the same Postgres advisory lock discovery runs behind. A correction is a
+// read-modify-write of the whole edge set, so it has to hold that lock too: two
+// interleaved corrections would each copy forward the version they read and one
+// analyst's edit would silently vanish.
+type graphLocker interface {
+	TryAcquireDiscoveryLock(ctx context.Context, goalID, datasourceRef string) (release func(), acquired bool, err error)
 }
 
 type sandboxExecutor interface {
@@ -87,6 +110,7 @@ type goalStore interface {
 	RegisterDataSourceRef(ctx context.Context, ref string) error
 	Get(ctx context.Context, optimizationFunctionID string) (store.Goal, error)
 	List(ctx context.Context) ([]store.Goal, error)
+	SetClaimError(ctx context.Context, optimizationFunctionID, reason string) error
 }
 
 // runStore is the run-lifecycle surface the loop and the objectives list need.
@@ -128,6 +152,19 @@ type heuristicsService interface {
 	Trace(ctx context.Context, metaHeuristicID string) ([]graph.CausalTriplet, error)
 }
 
+// RouterConfig bundles the knobs that govern when verification runs: whether
+// autonomous auto-promotion is on at all (the operator kill switch), how many
+// findings it promotes and at what shrinkage level it ranks them, and how many stale
+// records one graph correction may re-dispatch. They travel as one value because
+// they are one policy, and because four bare ints and bools in a positional
+// constructor is a slot-swap waiting to happen.
+type RouterConfig struct {
+	AutoPromoteEnabled    bool
+	AutoPromoteTopN       int
+	AutoPromoteShrinkageK int
+	StaleReverifyCap      int
+}
+
 // Server is the HTTP surface of the orchestrator, holding its collaborators.
 // histograms holds the confidence distribution of each in-flight run, keyed by
 // goal like the hub; see registerHistogram for why that state is in-memory and
@@ -137,6 +174,8 @@ type Server struct {
 	goals               goalStore
 	runs                runStore
 	queue               verificationQueue
+	causalVerifications causalVerificationStore
+	graphLock           graphLocker
 	audits              auditStore
 	objects             objectStore
 	heur                heuristicsService
@@ -147,6 +186,7 @@ type Server struct {
 	jobs                JobLauncher
 	verifierJobs        JobLauncher
 	identity            Identity
+	router              RouterConfig
 	localImportDir      string
 	sleepCycleJobName   string
 	internalAuthToken   string
@@ -154,6 +194,8 @@ type Server struct {
 	blockingLoopTimeout time.Duration
 	verificationPoll    time.Duration
 	keepaliveInterval   time.Duration
+	correctionLockWait  time.Duration
+	correctionLockPoll  time.Duration
 
 	histMu     sync.Mutex
 	histograms map[string]*confidenceHistogram
@@ -166,6 +208,8 @@ func NewServer(
 	goals goalStore,
 	runs runStore,
 	queue verificationQueue,
+	causalVerifications causalVerificationStore,
+	graphLock graphLocker,
 	audits auditStore,
 	objects objectStore,
 	heur heuristicsService,
@@ -176,6 +220,7 @@ func NewServer(
 	jobs JobLauncher,
 	verifierJobs JobLauncher,
 	identity Identity,
+	router RouterConfig,
 	localImportDir, sleepCycleJobName, internalAuthToken string,
 	hitlThreshold float64,
 	blockingLoopTimeout time.Duration,
@@ -185,6 +230,9 @@ func NewServer(
 		goals:               goals,
 		runs:                runs,
 		queue:               queue,
+		causalVerifications: causalVerifications,
+		graphLock:           graphLock,
+		router:              router,
 		audits:              audits,
 		objects:             objects,
 		heur:                heur,
@@ -202,6 +250,8 @@ func NewServer(
 		blockingLoopTimeout: blockingLoopTimeout,
 		verificationPoll:    defaultVerificationPoll,
 		keepaliveInterval:   defaultKeepaliveInterval,
+		correctionLockWait:  defaultCorrectionLockWait,
+		correctionLockPoll:  defaultCorrectionLockPoll,
 		histograms:          map[string]*confidenceHistogram{},
 	}
 }
@@ -223,6 +273,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /goals/{id}/outcomes", s.handleListOutcomes)
 	mux.HandleFunc("GET /goals/{id}/outcomes/{outcomeID}/excerpt", s.handleOutcomeExcerpt)
 	mux.HandleFunc("GET /goals/{id}/causal-graph", s.handleCausalGraph)
+	mux.HandleFunc("POST /goals/{id}/causal-graph/corrections", s.handleCausalCorrection)
+	mux.HandleFunc("POST /goals/{id}/findings/{interventionID}/verify", s.handleVerifyFinding)
+	mux.HandleFunc("GET /goals/{id}/causal-verifications", s.handleListCausalVerifications)
 	mux.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
 	mux.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)
 	mux.Handle("POST /internal/audit", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleAudit)))

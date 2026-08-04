@@ -5,17 +5,20 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 
+	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/service"
 )
 
-// runner runs the Verifier's two dispatch kinds for a (goal, data-source) pair. It is
-// a narrow local interface so the serve surface tests with a fake; the wired binary
-// passes a *Worker, whose RunDiscovery and VerifyOne are both reentrant across calls.
+// runner runs the Verifier's three dispatch kinds for a (goal, data-source) pair. It
+// is a narrow local interface so the serve surface tests with a fake; the wired binary
+// passes a *Worker, whose runners are all reentrant across calls.
 type runner interface {
 	RunDiscovery(ctx context.Context, goalID, datasourceRef string) error
 	VerifyOne(ctx context.Context, goalID, interventionID, datasourceRef string, budgeted bool) error
+	VerifyClaim(ctx context.Context, goalID, datasourceRef string) error
 }
 
 // Server is the serve-mode HTTP surface of the Verifier. It mirrors the Sleep-Cycle
@@ -52,21 +55,39 @@ func (s *Server) Routes() http.Handler {
 
 // verificationRequest is the dispatch body. Kind discriminates the dispatch kind:
 // "discovery" ensures the causal graph; "verify" runs one finding's atomic
-// verification (InterventionID names the finding; Budgeted flags a budget-charged
-// dispatch).
+// verification (InterventionID names the finding); "claim" constructs, measures, and
+// verifies the goal's own stored claim.
+//
+// Budgeted is a string, not a bool, because the orchestrator dispatches through a
+// launcher whose contract is a map of string pairs marshalled verbatim -- so the
+// field arrives as the JSON string "true", and a bool here would reject every real
+// dispatch while every fake-launcher test passed.
 type verificationRequest struct {
 	GoalID         string `json:"goal_id"`
 	DatasourceRef  string `json:"datasource_ref"`
 	Kind           string `json:"kind"`
 	InterventionID string `json:"intervention_id,omitempty"`
-	Budgeted       bool   `json:"budgeted,omitempty"`
+	Budgeted       string `json:"budgeted,omitempty"`
 }
 
-// Dispatch kinds. An unknown kind is rejected with 422 so a later kind slots in
-// without breaking the contract.
+// budgeted parses the budget-charged flag off the wire. An absent value is not
+// budgeted (the analyst-initiated default); anything unparseable is a malformed
+// request rather than a silent fall to false, since misreading it would charge or
+// spare the wrong dispatch.
+func (r verificationRequest) budgeted() (bool, error) {
+	if r.Budgeted == "" {
+		return false, nil
+	}
+	return strconv.ParseBool(r.Budgeted)
+}
+
+// Dispatch kinds, aliased from the domain so this routing switch and the
+// orchestrator's launcher args resolve to one declaration. An unknown kind is
+// rejected with 422 so a later kind slots in without breaking the contract.
 const (
-	kindDiscovery = "discovery"
-	kindVerify    = "verify"
+	kindDiscovery = domain.DispatchDiscovery
+	kindVerify    = domain.DispatchVerify
+	kindClaim     = domain.DispatchClaim
 )
 
 // handleVerification accepts a discovery or verify dispatch and runs it
@@ -97,6 +118,8 @@ func (s *Server) handleVerification(w http.ResponseWriter, r *http.Request) {
 		s.dispatchDiscovery(w, req)
 	case kindVerify:
 		s.dispatchVerify(w, req)
+	case kindClaim:
+		s.dispatchClaim(w, req)
 	default:
 		service.WriteErr(w, http.StatusUnprocessableEntity, "unsupported verification kind")
 	}
@@ -132,10 +155,15 @@ func (s *Server) dispatchVerify(w http.ResponseWriter, req verificationRequest) 
 		service.WriteErr(w, http.StatusBadRequest, "intervention_id is required for a verify dispatch")
 		return
 	}
+	budgeted, err := req.budgeted()
+	if err != nil {
+		service.WriteErr(w, http.StatusBadRequest, "budgeted must be a boolean")
+		return
+	}
 
 	go func() {
 		log.Printf("verifier: verification started for goal %q intervention %q", req.GoalID, req.InterventionID)
-		if err := s.runner.VerifyOne(context.Background(), req.GoalID, req.InterventionID, req.DatasourceRef, req.Budgeted); err != nil {
+		if err := s.runner.VerifyOne(context.Background(), req.GoalID, req.InterventionID, req.DatasourceRef, budgeted); err != nil {
 			log.Printf("verifier: verification for goal %q intervention %q failed: %v", req.GoalID, req.InterventionID, err)
 			return
 		}
@@ -144,6 +172,24 @@ func (s *Server) dispatchVerify(w http.ResponseWriter, req verificationRequest) 
 
 	service.WriteJSON(w, http.StatusAccepted, map[string]any{
 		"goal_id": req.GoalID, "intervention_id": req.InterventionID, "datasource_ref": req.DatasourceRef,
+	})
+}
+
+// dispatchClaim runs the goal's stored claim asynchronously. It carries no
+// intervention id -- the claim is reified into one -- and no budget flag: the primary
+// constructed-claim verification is analyst-initiated and exempt by construction.
+func (s *Server) dispatchClaim(w http.ResponseWriter, req verificationRequest) {
+	go func() {
+		log.Printf("verifier: claim verification started for goal %q", req.GoalID)
+		if err := s.runner.VerifyClaim(context.Background(), req.GoalID, req.DatasourceRef); err != nil {
+			log.Printf("verifier: claim verification for goal %q failed: %v", req.GoalID, err)
+			return
+		}
+		log.Printf("verifier: claim verification for goal %q complete", req.GoalID)
+	}()
+
+	service.WriteJSON(w, http.StatusAccepted, map[string]any{
+		"goal_id": req.GoalID, "datasource_ref": req.DatasourceRef,
 	})
 }
 

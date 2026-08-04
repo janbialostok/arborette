@@ -129,3 +129,74 @@ func TestObservationalReadFilterExcludesCausal(t *testing.T) {
 		t.Fatalf("trace must return both epistemic sources, got %v", sources)
 	}
 }
+
+// TestCausalEvidenceForHeuristics is the batched read that labels served heuristics:
+// it walks each heuristic's ABSTRACTED_FROM links to the interventions it generalized
+// and returns the strongest surviving causal edge behind each. Every part of it is
+// silent when wrong -- a reversed arrow, a broken supersession filter, or a wrong
+// label all return "no evidence", which the caller cannot tell from a healthy answer
+// about an unverified heuristic.
+func TestCausalEvidenceForHeuristics(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, ctx)
+	goalID := testutil.NewID(t)
+
+	// A heuristic abstracted from two verified findings: the stronger one is what it
+	// must be served with, so a weakly-confirmed component cannot understate the rest.
+	weak, _ := seedCausalTriplet(t, ctx, repo, goalID)
+	strong, _ := seedCausalTriplet(t, ctx, repo, goalID)
+	// A second heuristic whose only causal edge is retracted, and a third with none.
+	retracted, _ := seedCausalTriplet(t, ctx, repo, goalID)
+	plain, _ := seedCausalTriplet(t, ctx, repo, goalID)
+
+	verify := func(interventionID string, confidence float64) {
+		t.Helper()
+		if err := repo.WriteCausalVerification(ctx, interventionID, 1,
+			domain.Outcome{GoalID: goalID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{"e": confidence}},
+			domain.ProducedEdge{EffectSize: confidence, Confidence: confidence, EpistemicSource: domain.EpistemicCausalInferred},
+		); err != nil {
+			t.Fatalf("write causal verification: %v", err)
+		}
+	}
+	verify(weak, 0.7)
+	verify(strong, 0.95)
+	verify(retracted, 0.9)
+	if err := repo.SupersedePriorCausalOutcomes(ctx, retracted, 1); err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+
+	verified, retractedMH, plainMH := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	for id, from := range map[string][]string{
+		verified:    {weak, strong},
+		retractedMH: {retracted},
+		plainMH:     {plain},
+	} {
+		if err := repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: id, GoalID: goalID, Definition: "d"}, from); err != nil {
+			t.Fatalf("create meta-heuristic %q: %v", id, err)
+		}
+	}
+
+	evidence, err := repo.CausalEvidenceForHeuristics(ctx, []string{verified, retractedMH, plainMH})
+	if err != nil {
+		t.Fatalf("causal evidence for heuristics: %v", err)
+	}
+	got, ok := evidence[verified]
+	if !ok {
+		t.Fatalf("a heuristic with live causal evidence returned none: %+v", evidence)
+	}
+	if got.Confidence != 0.95 || got.InterventionID != strong {
+		t.Fatalf("evidence = %+v, want the strongest surviving edge (%q at 0.95)", got, strong)
+	}
+	if _, ok := evidence[retractedMH]; ok {
+		t.Fatalf("a retracted causal edge is still served as evidence")
+	}
+	if _, ok := evidence[plainMH]; ok {
+		t.Fatalf("an observational-only heuristic was labelled causal")
+	}
+
+	// An empty request must not query at all -- an unbounded IN would match the whole
+	// corpus.
+	if out, err := repo.CausalEvidenceForHeuristics(ctx, nil); err != nil || len(out) != 0 {
+		t.Fatalf("empty request = %v (err %v), want an empty map", out, err)
+	}
+}

@@ -149,6 +149,11 @@ type SandboxConfig struct {
 // InternalAuthToken is the shared secret guarding the internal write surfaces
 // this service exposes to the other services (a secret with no default; empty
 // disables the guard). SleepCycleConfig documents why both sides read one variable.
+//
+// The router knobs govern when causal verification runs; orchestrator.RouterConfig
+// documents what each one gates. AutoPromoteShrinkageK defaults to the Sleep Cycle's
+// support floor because the orchestrator holds none of its own -- the hypothesis loop
+// deliberately does not prune on support, so there is nothing here to derive one from.
 type OrchestratorConfig struct {
 	Port                    string
 	SandboxURL              string
@@ -160,6 +165,10 @@ type OrchestratorConfig struct {
 	InternalAuthToken       string
 	HITLConfidenceThreshold float64
 	BlockingLoopTimeout     time.Duration
+	AutoPromoteEnabled      bool
+	AutoPromoteTopN         int
+	AutoPromoteShrinkageK   int
+	StaleReverifyCap        int
 }
 
 // MCPConfig drives the MCP Server, arborette's read-side interface for
@@ -408,6 +417,10 @@ func Load() (Config, error) {
 			InternalAuthToken:       os.Getenv("INTERNAL_AUTH_TOKEN"),
 			HITLConfidenceThreshold: floatEnv("HITL_CONFIDENCE_THRESHOLD", 0.8),
 			BlockingLoopTimeout:     time.Duration(intEnv("HITL_BLOCKING_LOOP_TIMEOUT_MINUTES", 1440)) * time.Minute,
+			AutoPromoteEnabled:      boolEnv("ORCHESTRATOR_AUTOPROMOTE_ENABLED", true),
+			AutoPromoteTopN:         intEnv("ORCHESTRATOR_AUTOPROMOTE_TOP_N", 5),
+			AutoPromoteShrinkageK:   intEnv("ORCHESTRATOR_AUTOPROMOTE_SHRINKAGE_K", 30),
+			StaleReverifyCap:        intEnv("ORCHESTRATOR_STALE_REVERIFY_CAP", 10),
 		},
 		MCP: MCPConfig{
 			Port:               env("MCP_PORT", "8082"),

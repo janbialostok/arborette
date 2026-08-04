@@ -84,6 +84,16 @@
   one is required) reads as correct. Have doubles that stand in for a store return
   `ctx.Err()` when the context is done — the moment they do, a test asserting the
   wrong thing fails loudly rather than passing for the wrong reason.
+- Work that outlives the function under test needs guarded doubles and `-race`. A
+  completed hypothesis run hands its output to auto-promotion on its own goroutine,
+  launched from `runLoop`'s deferred closure, so it is still running when `runLoop`
+  returns and the test reads its assertions. Every double that goroutine touches
+  (`fakeAudits`, `fakeLauncher`, the graph repo) must therefore be mutex-guarded and
+  read through an accessor rather than by touching the field. `make test` does **not**
+  pass `-race`, so a race here is invisible to the declared gate — run
+  `go test -race ./internal/orchestrator` directly when touching promotion, the run
+  lifecycle, or any double they share.
+
 - Scripted-response test doubles (`fakeSandbox`, `fakeClaude`) return a nil error /
   empty success once their scripted slice is exhausted. A test for a bounded retry
   loop must therefore script one failure per attempt **plus** the initial one
@@ -106,7 +116,9 @@
   409 guard). `StubLauncher` (logs, audits, runs nothing) is only the fallback
   when that env var is unset. `sleepcycle-serve` is a long-lived compose service,
   so a worker code change needs `docker compose up -d --build sleepcycle-serve`
-  to take effect there. To run the one-shot worker from the host instead, use the
+  to take effect there — the same applies to `verifier-serve` (:8085), which
+  `make up` also starts and which every completed Phase-1 run reaches through
+  auto-promotion. To run the one-shot worker from the host instead, use the
   same overrides as the HTTP smoke-test plus
   `ORCHESTRATOR_URL=http://localhost:8080` (it reaches the audit table only
   through that API) and `-goal <optimization_function_id>`; it exits when the run

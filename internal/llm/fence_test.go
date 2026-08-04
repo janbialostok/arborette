@@ -87,6 +87,13 @@ func TestAllFencedClientMethodsFenceUntrustedInput(t *testing.T) {
 		}},
 		{"AbstractMetaHeuristic/objectiveLabel", func(c *client) { c.AbstractMetaHeuristic(ctx, "goal", seg) }},
 		{"RepairMetaHeuristic/priorDefinition", func(c *client) { c.RepairMetaHeuristic(ctx, "goal", seg, Abstraction{Definition: payload}, "err") }},
+		{"ClassifyGoalIntent/goalText", func(c *client) {
+			c.ClassifyGoalIntent(ctx, GoalIntentInput{GoalText: payload, Schema: schema})
+		}},
+		{"ClassifyGoalIntent/distinctValue", func(c *client) {
+			poisoned := SandboxSchema{Columns: []SandboxColumn{{Name: "tier", Type: "VARCHAR", DistinctValues: []string{payload}}}}
+			c.ClassifyGoalIntent(ctx, GoalIntentInput{GoalText: "goal", Schema: poisoned})
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

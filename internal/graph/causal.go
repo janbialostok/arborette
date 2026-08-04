@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -49,15 +50,7 @@ func (r *Neo4jRepository) GetCausalEvidence(ctx context.Context, interventionID 
 		if err != nil {
 			return nil, err
 		}
-		effect, _ := rel.Props["effect_size"].(float64)
-		confidence, _ := rel.Props["confidence"].(float64)
-		version, _ := rel.Props["graph_version"].(int64)
-		return CausalEvidence{
-			InterventionID: interventionID,
-			EffectSize:     effect,
-			Confidence:     confidence,
-			GraphVersion:   int(version),
-		}, nil
+		return causalEvidenceFromRelationship(interventionID, rel), nil
 	})
 	if err != nil {
 		return CausalEvidence{}, false, fmt.Errorf("get causal evidence for %q: %w", interventionID, err)
@@ -66,6 +59,78 @@ func (r *Neo4jRepository) GetCausalEvidence(ctx context.Context, interventionID 
 		return CausalEvidence{}, false, nil
 	}
 	return res.(CausalEvidence), true, nil
+}
+
+// CausalEvidenceForHeuristics returns the strongest live causal evidence behind each
+// of the given Meta-Heuristics, keyed by heuristic id and absent for those with none.
+// It walks each heuristic's ABSTRACTED_FROM links to the Interventions it generalized
+// and reads their non-superseded causal_inferred edges, so a consumer can say which
+// served heuristics rest on a verified effect and how strongly.
+//
+// It is one query rather than a lookup per traced intervention: a search returns up
+// to the caller's top-k heuristics, each abstracted from several triplets, and a
+// per-intervention read would put that product of round trips on every search. Like
+// the single-intervention lookup, it is exempt from the observational-only collection
+// filter by design -- it reads nothing but causal edges.
+func (r *Neo4jRepository) CausalEvidenceForHeuristics(ctx context.Context, metaHeuristicIDs []string) (map[string]CausalEvidence, error) {
+	if len(metaHeuristicIDs) == 0 {
+		return map[string]CausalEvidence{}, nil
+	}
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (m:"+labelMetaHeuristic+")-[:"+domain.AbstractedFrom+"]->(i:"+labelIntervention+")"+
+				"-[e:"+domain.Produced+"]->(:"+labelOutcome+") "+
+				"WHERE m.id IN $ids AND e.epistemic_source = $source AND coalesce(e.superseded, false) = false "+
+				"RETURN m.id AS mid, i.id AS iid, e",
+			map[string]any{"ids": metaHeuristicIDs, "source": string(domain.EpistemicCausalInferred)},
+		)
+		if err != nil {
+			return nil, err
+		}
+		recs, err := result.Collect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]CausalEvidence, len(recs))
+		for _, rec := range recs {
+			mid, _ := rec.Get("mid")
+			heuristicID, ok := mid.(string)
+			if !ok {
+				continue
+			}
+			rel, err := recordRelationship(rec, "e")
+			if err != nil {
+				return nil, err
+			}
+			iid, _ := rec.Get("iid")
+			interventionID, _ := iid.(string)
+			evidence := causalEvidenceFromRelationship(interventionID, rel)
+			// A heuristic generalizes several findings; the strongest surviving one is
+			// what it is served with, so a single weakly-confirmed component cannot
+			// understate evidence the others carry.
+			if prior, seen := out[heuristicID]; seen && prior.Confidence >= evidence.Confidence {
+				continue
+			}
+			out[heuristicID] = evidence
+		}
+		return out, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get causal evidence for heuristics: %w", err)
+	}
+	return res.(map[string]CausalEvidence), nil
+}
+
+func causalEvidenceFromRelationship(interventionID string, rel neo4j.Relationship) CausalEvidence {
+	effect, _ := rel.Props["effect_size"].(float64)
+	confidence, _ := rel.Props["confidence"].(float64)
+	version, _ := rel.Props["graph_version"].(int64)
+	return CausalEvidence{
+		InterventionID: interventionID,
+		EffectSize:     effect,
+		Confidence:     confidence,
+		GraphVersion:   int(version),
+	}
 }
 
 func dataColumnID(goalID, datasourceRef, name string) string {
@@ -240,6 +305,165 @@ func (r *Neo4jRepository) UpsertCausalEdges(ctx context.Context, edges []domain.
 		_, err = result.Consume(ctx)
 		return nil, err
 	})
+}
+
+// ErrUnknownCausalColumn reports a correction naming a column the goal's discovered
+// graph does not have, and ErrNoSuchCausalEdge a flip or delete naming a pair the
+// graph has no edge between. Callers map both to an analyst-fixable status rather
+// than a fault: the columns and edges are the ones discovery selected, and naming
+// another is a correctable mistake, not a broken graph.
+//
+// Reporting the second is what keeps a correction honest. A flip that matched
+// nothing would otherwise commit a new version and answer 200, telling the analyst
+// their domain knowledge was applied when nothing changed.
+var (
+	ErrUnknownCausalColumn = errors.New("column is not in the goal's causal graph")
+	ErrNoSuchCausalEdge    = errors.New("the goal's causal graph has no edge between these columns")
+)
+
+// CorrectCausalEdge applies one analyst correction and serves it as a new graph
+// version, returning that version.
+//
+// It copies the whole edge set forward rather than editing one edge in place, because
+// CAUSES edges are version-keyed and GetCausalGraph reads them at exactly the meta's
+// version: bumping the meta alone would strand every uncorrected edge at the old
+// version and leave verification adjusting against an empty graph. So the corrected
+// set is written whole at version+1, with the meta committed last — a crash mid-copy
+// leaves the previous version served, the same commit-marker invariant discovery
+// relies on.
+//
+// A deleted edge is durable by omission, with no tombstone: discovery early-returns
+// whenever a committed meta exists and only ever writes its initial version, so
+// nothing can re-add the edge at the version being served. Analyst provenance is
+// durable the same way — the copy preserves each edge's provenance, so a later
+// correction carries an earlier analyst's edits forward with it.
+//
+// The caller serializes concurrent corrections for a (goal, data-source) pair: this
+// is a read-modify-write, and two interleaved ones would each copy forward the
+// version they read, silently dropping one analyst's edit.
+//
+// It returns the new version and the graph's own spelling of the two corrected
+// columns, which is what the caller must use to invalidate verifications — the
+// analyst's spelling would not match the stored adjustment sets.
+func (r *Neo4jRepository) CorrectCausalEdge(ctx context.Context, goalID, datasourceRef string, correction domain.EdgeCorrection) (int, []string, error) {
+	current, ok, err := r.GetCausalGraph(ctx, goalID, datasourceRef)
+	if err != nil {
+		return 0, nil, err
+	}
+	if !ok {
+		return 0, nil, ErrNotFound
+	}
+	// Resolve the analyst's spelling to the graph's own before anything downstream
+	// touches it. A column name reaches three case-sensitive consumers — the SHA-256
+	// DataColumn id an edge write MATCHes on, the lexicographic pair ordering, and
+	// the caller's jsonb adjustment-set overlap — so accepting a name
+	// case-insensitively and then passing it through raw would write an edge nothing
+	// binds, compare against a transposed pair, and invalidate nothing, all while
+	// reporting success.
+	known := map[string]string{}
+	for _, c := range current.Columns {
+		known[strings.ToLower(c.Name)] = c.Name
+	}
+	resolved := make([]string, 0, 2)
+	for _, name := range []string{correction.From, correction.To} {
+		actual, ok := known[strings.ToLower(name)]
+		if !ok {
+			return 0, nil, fmt.Errorf("%q: %w", name, ErrUnknownCausalColumn)
+		}
+		resolved = append(resolved, actual)
+	}
+	correction.From, correction.To = resolved[0], resolved[1]
+
+	version := current.Meta.Version + 1
+	edges, matched := applyCorrection(current.Edges, correction, domain.CausalEdge{
+		GoalID: goalID, DatasourceRef: datasourceRef, Version: version,
+	})
+	// A flip or delete that matched no edge changes nothing, so committing a version
+	// for it would report an edit that never happened. An add is the one op that is
+	// meaningful without a match.
+	if !matched && correction.Op != domain.CorrectionAdd {
+		return 0, nil, fmt.Errorf("%q and %q: %w", correction.From, correction.To, ErrNoSuchCausalEdge)
+	}
+	// Clear any torn write at the target version first. The upserts MERGE, so a
+	// crashed earlier attempt that wrote an edge this correction now omits would
+	// survive and be served the moment the meta commits — the one way a deleted edge
+	// could come back. Safe as pre-write cleanup for the same reason discovery's is:
+	// the served meta is still at the previous version, so nothing committed is lost.
+	if err := r.deleteCausalEdgesAtVersion(ctx, goalID, datasourceRef, version); err != nil {
+		return 0, nil, err
+	}
+	if err := r.UpsertCausalEdges(ctx, edges); err != nil {
+		return 0, nil, err
+	}
+	meta := current.Meta
+	meta.Version = version
+	if err := r.UpsertCausalGraphMeta(ctx, meta); err != nil {
+		return 0, nil, err
+	}
+	return version, resolved, nil
+}
+
+// applyCorrection returns the corrected edge set at the new version — every edge
+// copied forward with its own provenance intact, the corrected one re-oriented or
+// omitted, and an added edge appended — plus whether the correction matched an
+// existing edge. An analyst-corrected edge is stamped analyst/tested at full
+// confidence: the analyst is asserting it, so it must not stay fail-closed and leave
+// the effect unidentifiable.
+//
+// The correction's columns must already carry the graph's own spelling, since the
+// canonical pair is ordered by byte comparison and the appended edge's columns become
+// a MERGE key.
+func applyCorrection(current []domain.CausalEdge, correction domain.EdgeCorrection, added domain.CausalEdge) ([]domain.CausalEdge, bool) {
+	colA, colB := domain.CanonicalColumnPair(correction.From, correction.To)
+	edges := make([]domain.CausalEdge, 0, len(current)+1)
+	matched := false
+	for _, e := range current {
+		e.Version = added.Version
+		if e.ColA != colA || e.ColB != colB {
+			edges = append(edges, e)
+			continue
+		}
+		matched = true
+		if correction.Op == domain.CorrectionDelete {
+			continue
+		}
+		edges = append(edges, analystEdge(e, correction))
+	}
+	// An add naming a pair the skeleton never produced has nothing to copy forward,
+	// so the edge is appended; an add on a pair that already exists is a
+	// re-orientation of it, which the loop above already applied.
+	if !matched && correction.Op == domain.CorrectionAdd {
+		added.ColA, added.ColB = colA, colB
+		edges = append(edges, analystEdge(added, correction))
+	}
+	return edges, matched
+}
+
+// deleteCausalEdgesAtVersion removes a (goal, data-source) pair's CAUSES edges at one
+// version, leaving its DataColumn nodes and every other version intact. It is the
+// edge-only counterpart to DeleteCausalGraphVersion, which detaches the columns and
+// so would take every version's edges with them.
+func (r *Neo4jRepository) deleteCausalEdgesAtVersion(ctx context.Context, goalID, datasourceRef string, version int) error {
+	return r.writeOp(ctx, "delete causal edges at version", func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH ()-[e:"+domain.RelationCauses+" {goal_id: $goalID, datasource_ref: $datasourceRef, version: $version}]->() DELETE e",
+			map[string]any{"goalID": goalID, "datasourceRef": datasourceRef, "version": version},
+		)
+		if err != nil {
+			return nil, err
+		}
+		_, err = result.Consume(ctx)
+		return nil, err
+	})
+}
+
+// analystEdge stamps one edge with the analyst's correction.
+func analystEdge(e domain.CausalEdge, correction domain.EdgeCorrection) domain.CausalEdge {
+	e.Direction = correction.CorrectedDirection()
+	e.Provenance = domain.ProvenanceAnalyst
+	e.Status = domain.EdgeTested
+	e.Confidence = 1.0
+	return e
 }
 
 // UpsertCausalGraphMeta writes the CausalGraphMeta node — the commit marker written

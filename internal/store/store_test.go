@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -597,6 +598,92 @@ func TestGoalRegistryWindowBindings(t *testing.T) {
 		t.Fatalf("unbound goal must read empty bindings, got entity=%q time=%q", got.EntityKeyColumn, got.TimeColumn)
 	}
 }
+
+// TestGoalRegistryTrackAndClaim round-trips the routing track and the extracted
+// claim: a verify-track goal reads back the claim document byte-identically (the
+// Verifier decodes exactly what intake validated), a goal registered with no track
+// falls to explore rather than an empty string, and SetClaimError records the
+// cannot-construct reason the Verifier reports at dispatch time.
+func TestGoalRegistryTrackAndClaim(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	registry := store.NewGoalRegistry(p)
+
+	claim, err := json.Marshal(domain.ClaimSpec{
+		Filters:   []domain.Constraint{{Field: "tier", Op: domain.Equal, Operand: &domain.LiteralValue{String: strPtr("gold")}}},
+		Direction: domain.Maximize,
+	})
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	verifyID := testutil.NewID(t)
+	if err := registry.Insert(ctx, store.Goal{
+		OptimizationFunctionID: verifyID,
+		GoalText:               "do gold-tier accounts spend more?",
+		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
+		DataSourceRef:          "s3://arborette/data.csv",
+		Track:                  store.TrackVerify,
+		Claim:                  claim,
+	}); err != nil {
+		t.Fatalf("insert verify goal: %v", err)
+	}
+	got, err := registry.Get(ctx, verifyID)
+	if err != nil {
+		t.Fatalf("get verify goal: %v", err)
+	}
+	if got.Track != store.TrackVerify {
+		t.Fatalf("track = %q, want verify", got.Track)
+	}
+	var decoded domain.ClaimSpec
+	if err := json.Unmarshal(got.Claim, &decoded); err != nil {
+		t.Fatalf("stored claim does not decode: %v (%s)", err, got.Claim)
+	}
+	if len(decoded.Filters) != 1 || decoded.Filters[0].Field != "tier" || decoded.Direction != domain.Maximize {
+		t.Fatalf("claim round-trip mismatch: %+v", decoded)
+	}
+	if got.ClaimError != "" {
+		t.Fatalf("a constructed claim carries no error, got %q", got.ClaimError)
+	}
+
+	// A goal inserted with no track defaults to explore: the column list is explicit,
+	// so the SQL DEFAULT never fires and Insert has to supply it.
+	exploreID := seedGoal(t, ctx, p)
+	got, err = registry.Get(ctx, exploreID)
+	if err != nil {
+		t.Fatalf("get default-track goal: %v", err)
+	}
+	if got.Track != store.TrackExplore {
+		t.Fatalf("track = %q, want the explore default", got.Track)
+	}
+	if got.Claim != nil {
+		t.Fatalf("an explore goal carries no claim, got %s", got.Claim)
+	}
+
+	const reason = "the claim names filter columns that are not in the data source: region"
+	if err := registry.SetClaimError(ctx, exploreID, reason); err != nil {
+		t.Fatalf("set claim error: %v", err)
+	}
+	got, err = registry.Get(ctx, exploreID)
+	if err != nil {
+		t.Fatalf("get after set claim error: %v", err)
+	}
+	if got.ClaimError != reason {
+		t.Fatalf("claim error = %q, want the recorded reason", got.ClaimError)
+	}
+
+	goals, err := registry.List(ctx)
+	if err != nil {
+		t.Fatalf("list goals: %v", err)
+	}
+	for _, g := range goals {
+		if g.Track == "" {
+			t.Fatalf("goal %q listed with an empty track", g.OptimizationFunctionID)
+		}
+	}
+}
+
+func strPtr(s string) *string { return &s }
 
 // seedGoal inserts a minimal registered goal a run row can reference, returning
 // its id.

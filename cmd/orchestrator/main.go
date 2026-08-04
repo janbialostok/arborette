@@ -95,8 +95,9 @@ func main() {
 	}
 
 	// The verifier launcher is selected the same way (its differently-pathed endpoint
-	// reuses the HTTPLauncher unchanged). It is held for the verifier-dispatch path a
-	// later shell adds; this shell only wires it.
+	// reuses the HTTPLauncher unchanged), and carries every router dispatch: the
+	// explicit verify affordance, auto-promotion, and correction-triggered
+	// re-verification.
 	var verifierLauncher orchestrator.JobLauncher
 	if url := cfg.Orchestrator.VerifierWorkerURL; url != "" {
 		verifierLauncher = orchestrator.NewHTTPLauncher(url, cfg.Orchestrator.InternalAuthToken, nil)
@@ -106,10 +107,22 @@ func main() {
 		log.Printf("orchestrator: wired stub verifier launcher (no verifier URL configured)")
 	}
 
+	// The verification records are read here and written by the Verifier, so the
+	// accounting knobs it enforces are its own; this store only lists and invalidates.
+	causalVerifications := store.NewCausalVerifications(pool, cfg.Verifier.LeaseTTL,
+		cfg.Verifier.InflightCap, cfg.Verifier.VerificationBudget)
+
 	srv := orchestrator.NewServer(
-		repo, goals, runs, queue, audits, objects, heur, claude, chat, sandbox,
+		repo, goals, runs, queue, causalVerifications, store.NewAdvisoryLock(pool),
+		audits, objects, heur, claude, chat, sandbox,
 		orchestrator.NewHub(), launcher, verifierLauncher,
 		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID},
+		orchestrator.RouterConfig{
+			AutoPromoteEnabled:    cfg.Orchestrator.AutoPromoteEnabled,
+			AutoPromoteTopN:       cfg.Orchestrator.AutoPromoteTopN,
+			AutoPromoteShrinkageK: cfg.Orchestrator.AutoPromoteShrinkageK,
+			StaleReverifyCap:      cfg.Orchestrator.StaleReverifyCap,
+		},
 		cfg.Orchestrator.LocalImportDir, cfg.Orchestrator.SleepCycleJobName,
 		cfg.Orchestrator.InternalAuthToken,
 		cfg.Orchestrator.HITLConfidenceThreshold, cfg.Orchestrator.BlockingLoopTimeout,

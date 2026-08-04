@@ -39,6 +39,9 @@ type fakeSubmitter struct {
 	err           error
 	gotGoal       string
 	gotImportPath string
+	verifyErr     error
+	gotGoalID     string
+	gotFindingID  string
 }
 
 func (f *fakeSubmitter) SubmitGoal(_ context.Context, goal, importPath string) (string, error) {
@@ -46,13 +49,36 @@ func (f *fakeSubmitter) SubmitGoal(_ context.Context, goal, importPath string) (
 	return f.optID, f.err
 }
 
+func (f *fakeSubmitter) VerifyFinding(_ context.Context, goalID, findingID string) error {
+	f.gotGoalID, f.gotFindingID = goalID, findingID
+	return f.verifyErr
+}
+
+// fakeEvidence stands in for the causal-evidence lookup that labels served
+// heuristics, keyed by Meta-Heuristic id.
+type fakeEvidence struct {
+	evidence map[string]graph.CausalEvidence
+	err      error
+	gotIDs   []string
+}
+
+func (f *fakeEvidence) CausalEvidenceForHeuristics(_ context.Context, ids []string) (map[string]graph.CausalEvidence, error) {
+	f.gotIDs = ids
+	return f.evidence, f.err
+}
+
 // connectTools registers the tools on a server backed by the given fakes and
 // returns an in-memory client session wired to it.
-func connectTools(t *testing.T, heur heuristicsQuerier, goals goalSubmitter) *mcp.ClientSession {
+func connectTools(t *testing.T, heur heuristicsQuerier, orch orchestratorProxy) *mcp.ClientSession {
+	return connectToolsEvidence(t, heur, &fakeEvidence{}, orch)
+}
+
+// connectToolsEvidence is connectTools with an explicit evidence reader.
+func connectToolsEvidence(t *testing.T, heur heuristicsQuerier, evidence evidenceReader, orch orchestratorProxy) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 	srv := mcp.NewServer(&mcp.Implementation{Name: "arborette-mcp", Version: "test"}, nil)
-	RegisterTools(srv, heur, goals)
+	RegisterTools(srv, heur, evidence, orch)
 
 	t1, t2 := mcp.NewInMemoryTransports()
 	if _, err := srv.Connect(ctx, t1, nil); err != nil {
@@ -331,4 +357,170 @@ func TestSubmitAnalystGoalMasksNonOrchestratorError(t *testing.T) {
 	if !ok || tc.Text != "internal error" {
 		t.Fatalf("error content = %+v, want masked \"internal error\" (no internal address leak)", res.Content[0])
 	}
+}
+
+// TestGetOptimizedHeuristicsLabelsCausalEvidence: a heuristic backed by a live
+// causal_inferred edge is served as causal_inferred with its refutation confidence
+// and the caveat, and one with none reads as observational with neither. The caveat is
+// mandatory on the causal label -- the inference is conditional on the discovered
+// model, and serving it bare would present it as established causation.
+func TestGetOptimizedHeuristicsLabelsCausalEvidence(t *testing.T) {
+	heur := &fakeQuerier{matches: []heuristics.Match{
+		{MetaHeuristic: domain.MetaHeuristic{ID: "mh-causal", Definition: "verified"}},
+		{MetaHeuristic: domain.MetaHeuristic{ID: "mh-plain", Definition: "correlational"}},
+	}}
+	evidence := &fakeEvidence{evidence: map[string]graph.CausalEvidence{
+		"mh-causal": {InterventionID: "i-1", EffectSize: 0.3, Confidence: 0.92, GraphVersion: 2},
+	}}
+	cs := connectToolsEvidence(t, heur, evidence, &fakeSubmitter{})
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "get_optimized_heuristics",
+		Arguments: map[string]any{"operational_state": "hot shard"},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("call tool: err=%v result=%+v", err, res.Content)
+	}
+	var out getOptimizedHeuristicsOutput
+	decodeOutput(t, res, &out)
+	if len(out.Heuristics) != 2 {
+		t.Fatalf("returned %d heuristics, want 2", len(out.Heuristics))
+	}
+	if len(evidence.gotIDs) != 2 {
+		t.Fatalf("evidence lookup got %v, want both ids in one batched read", evidence.gotIDs)
+	}
+
+	causal, plain := out.Heuristics[0], out.Heuristics[1]
+	if causal.EpistemicSource != string(domain.EpistemicCausalInferred) {
+		t.Fatalf("epistemic_source = %q, want causal_inferred", causal.EpistemicSource)
+	}
+	if causal.RefutationConfidence == nil || *causal.RefutationConfidence != 0.92 {
+		t.Fatalf("refutation confidence = %v, want 0.92", causal.RefutationConfidence)
+	}
+	if causal.Caveat != domain.CausalInferredCaveat {
+		t.Fatalf("caveat = %q, want the causal-inference caveat", causal.Caveat)
+	}
+	if plain.EpistemicSource != string(domain.EpistemicObservational) {
+		t.Fatalf("unverified heuristic = %q, want observational", plain.EpistemicSource)
+	}
+	if plain.RefutationConfidence != nil || plain.Caveat != "" {
+		t.Fatalf("an unverified heuristic carries no confidence or caveat: %+v", plain)
+	}
+}
+
+// TestGetOptimizedHeuristicsDegradesWithoutEvidence: the evidence lookup only labels
+// the results, so its failure serves them unlabelled (which reads as observational,
+// the safe default) rather than failing the search.
+func TestGetOptimizedHeuristicsDegradesWithoutEvidence(t *testing.T) {
+	heur := &fakeQuerier{matches: []heuristics.Match{
+		{MetaHeuristic: domain.MetaHeuristic{ID: "mh-1", Definition: "scale reads"}},
+	}}
+	cs := connectToolsEvidence(t, heur, &fakeEvidence{err: errors.New("neo4j unreachable")}, &fakeSubmitter{})
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "get_optimized_heuristics",
+		Arguments: map[string]any{"operational_state": "hot shard"},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("an evidence failure must not fail the search: err=%v result=%+v", err, res.Content)
+	}
+	var out getOptimizedHeuristicsOutput
+	decodeOutput(t, res, &out)
+	if len(out.Heuristics) != 1 || out.Heuristics[0].EpistemicSource != string(domain.EpistemicObservational) {
+		t.Fatalf("heuristics = %+v, want one served as observational", out.Heuristics)
+	}
+}
+
+// TestTraceCausalChainLabelsEdges: a trace deliberately returns both the observational
+// finding and the causal Outcome attached to it, so each triplet carries the label
+// that distinguishes them -- and an edge with no recorded value reads as observational.
+func TestTraceCausalChainLabelsEdges(t *testing.T) {
+	heur := &fakeQuerier{triplets: []graph.CausalTriplet{
+		{Intervention: domain.Intervention{ID: "i-1"}, Outcome: domain.Outcome{ID: "o-1"}, EpistemicSource: domain.EpistemicCausalInferred},
+		{Intervention: domain.Intervention{ID: "i-1"}, Outcome: domain.Outcome{ID: "o-2"}, EpistemicSource: domain.EpistemicObservational},
+		{Intervention: domain.Intervention{ID: "i-2"}, Outcome: domain.Outcome{ID: "o-3"}},
+	}}
+	cs := connectTools(t, heur, &fakeSubmitter{})
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "trace_causal_chain",
+		Arguments: map[string]any{"meta_heuristic_id": "mh-1"},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("call tool: err=%v result=%+v", err, res.Content)
+	}
+	var out traceCausalChainOutput
+	decodeOutput(t, res, &out)
+	if len(out.Triplets) != 3 {
+		t.Fatalf("returned %d triplets, want 3", len(out.Triplets))
+	}
+	if out.Triplets[0].EpistemicSource != string(domain.EpistemicCausalInferred) ||
+		out.Triplets[0].Caveat != domain.CausalInferredCaveat {
+		t.Fatalf("causal triplet = %+v, want labelled with the caveat", out.Triplets[0])
+	}
+	for _, tr := range out.Triplets[1:] {
+		if tr.EpistemicSource != string(domain.EpistemicObservational) || tr.Caveat != "" {
+			t.Fatalf("observational triplet = %+v, want the unqualified label", tr)
+		}
+	}
+}
+
+// TestVerifyFindingProxies: the tool proxies to the orchestrator and answers with the
+// dispatch, and masks anything that is not the orchestrator's own analyst-safe message
+// -- a transport error names the internal service address.
+func TestVerifyFindingProxies(t *testing.T) {
+	orch := &fakeSubmitter{}
+	cs := connectTools(t, &fakeQuerier{}, orch)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "verify_finding",
+		Arguments: map[string]any{"goal_id": "goal-1", "finding_id": "i-1"},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("call tool: err=%v result=%+v", err, res.Content)
+	}
+	if orch.gotGoalID != "goal-1" || orch.gotFindingID != "i-1" {
+		t.Fatalf("proxied (%q, %q), want (goal-1, i-1)", orch.gotGoalID, orch.gotFindingID)
+	}
+	var out verifyFindingOutput
+	decodeOutput(t, res, &out)
+	if !out.Dispatched || out.Detail == "" {
+		t.Fatalf("output = %+v, want a dispatch confirmation", out)
+	}
+}
+
+func TestVerifyFindingSurfacesAndMasksErrors(t *testing.T) {
+	t.Run("orchestrator message is surfaced", func(t *testing.T) {
+		orch := &fakeSubmitter{verifyErr: &orchestratorclient.OrchestratorError{Status: http.StatusNotFound, Message: "finding not found"}}
+		cs := connectTools(t, &fakeQuerier{}, orch)
+
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "verify_finding",
+			Arguments: map[string]any{"goal_id": "goal-1", "finding_id": "nope"},
+		})
+		if err != nil {
+			t.Fatalf("an orchestrator rejection must be an IsError result: %v", err)
+		}
+		tc, ok := res.Content[0].(*mcp.TextContent)
+		if !res.IsError || !ok || tc.Text != "finding not found" {
+			t.Fatalf("content = %+v, want the orchestrator's own message", res.Content[0])
+		}
+	})
+
+	t.Run("transport error is masked", func(t *testing.T) {
+		orch := &fakeSubmitter{verifyErr: errors.New("dial tcp orchestrator:8080: connection refused")}
+		cs := connectTools(t, &fakeQuerier{}, orch)
+
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "verify_finding",
+			Arguments: map[string]any{"goal_id": "goal-1", "finding_id": "i-1"},
+		})
+		if err != nil {
+			t.Fatalf("a transport failure must be an IsError result: %v", err)
+		}
+		tc, ok := res.Content[0].(*mcp.TextContent)
+		if !res.IsError || !ok || tc.Text != "internal error" {
+			t.Fatalf("content = %+v, want masked \"internal error\"", res.Content[0])
+		}
+	})
 }

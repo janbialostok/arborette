@@ -194,6 +194,12 @@ func (f *fakeAnalyzer) Analyze(_ context.Context, req sandboxclient.AnalyzeReque
 	}
 }
 
+// Execute is unused by discovery, which never measures an objective aggregate; it
+// exists so this double satisfies the analyzer surface the claim path widened.
+func (f *fakeAnalyzer) Execute(_ context.Context, _ sandboxclient.ExecuteRequest) (sandboxclient.ExecuteResponse, error) {
+	return sandboxclient.ExecuteResponse{}, nil
+}
+
 func (f *fakeAnalyzer) contingency(req sandboxclient.AnalyzeRequest) sandboxclient.AnalyzeResponse {
 	cuts := make([][]float64, len(req.Columns))
 	for i, c := range req.Columns {

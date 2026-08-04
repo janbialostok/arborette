@@ -60,7 +60,7 @@ func newBeamPolicy(atoms []atom, cfg Config, baseline float64, direction domain.
 
 // delta is the frontier's ranking key.
 func (p *beamPolicy) delta(m Measurement) float64 {
-	return directionalDelta(m.Value, p.baseline, p.direction)
+	return domain.DirectionalDelta(m.Value, p.baseline, p.direction)
 }
 
 func (p *beamPolicy) level1() []*Node {

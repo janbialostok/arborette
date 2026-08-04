@@ -50,6 +50,7 @@ type Client interface {
 	RepairMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment, prior Abstraction, validationErr string) (Abstraction, error)
 	OrientCausalEdges(ctx context.Context, goalText string, columns []ColumnSemantics, edges []OrientEdge) ([]OrientDecision, error)
 	RepairOrientCausalEdges(ctx context.Context, goalText string, columns []ColumnSemantics, edges []OrientEdge, prior []OrientDecision, validationErr string) ([]OrientDecision, error)
+	ClassifyGoalIntent(ctx context.Context, goal GoalIntentInput) (GoalIntentResult, error)
 }
 
 // NewClient builds an LLM client from configuration. The LLM_PROVIDER env

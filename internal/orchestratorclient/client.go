@@ -17,6 +17,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/arborette/arborette/internal/service"
@@ -139,6 +140,19 @@ func (c *Client) SubmitGoal(ctx context.Context, goal, importPath string) (strin
 		return "", err
 	}
 	return out.OptimizationFunctionID, nil
+}
+
+// VerifyFinding asks the Orchestrator to causally verify one observational finding.
+// Dispatch is asynchronous -- the endpoint answers 202 and the result arrives on the
+// goal's SSE channel and in the audit trail -- so this reports only that the request
+// was accepted.
+func (c *Client) VerifyFinding(ctx context.Context, goalID, findingID string) error {
+	path := goalsPath + "/" + url.PathEscape(goalID) + "/findings/" + url.PathEscape(findingID) + "/verify"
+	req, err := c.newRequest(ctx, path, "application/json", nil)
+	if err != nil {
+		return err
+	}
+	return c.do(req, http.StatusAccepted, nil)
 }
 
 // newRequest builds a POST carrying body under contentType, stamped with the

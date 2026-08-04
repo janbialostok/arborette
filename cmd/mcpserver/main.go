@@ -66,7 +66,7 @@ func main() {
 	orchClient := orchestratorclient.NewClient(cfg.MCP.OrchestratorURL, "",
 		&http.Client{Timeout: goalSubmitTimeout})
 	srv := mcp.NewServer(&mcp.Implementation{Name: "arborette-mcp", Version: "0.1.0"}, nil)
-	mcpserver.RegisterTools(srv, queries, orchClient)
+	mcpserver.RegisterTools(srv, queries, repo, orchClient)
 
 	// A configured public URL is the operator declaring this server internet-
 	// reachable, and this process is the only one that sees that declaration and

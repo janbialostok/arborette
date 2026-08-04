@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +17,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/arborette/arborette/internal/datasource"
+	"github.com/arborette/arborette/internal/domain"
+	"github.com/arborette/arborette/internal/llm"
 	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
@@ -264,6 +267,8 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	intent := s.classifyIntent(ctx, goal, schema)
+
 	optID := uuid.NewString()
 	if err := s.goals.Insert(ctx, store.Goal{
 		OptimizationFunctionID: optID,
@@ -274,6 +279,9 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		EpochMode:              review.epochMode,
 		EntityKeyColumn:        entityKey,
 		TimeColumn:             timeColumn,
+		Track:                  intent.track,
+		Claim:                  intent.claim,
+		ClaimError:             intent.claimError,
 	}); err != nil {
 		log.Printf("orchestrator: insert goal: %v", err)
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")
@@ -283,11 +291,96 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	if err := s.recordAudit(ctx, "goal_submit", "goal", map[string]any{
 		"optimization_function_id": optID,
 		"data_source_ref":          ref,
+		"track":                    intent.track,
+		"rationale":                intent.rationale,
 	}); err != nil {
 		log.Printf("orchestrator: append audit: %v", err)
 	}
+	s.reportIntent(ctx, optID, intent)
 
 	service.WriteJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+}
+
+// goalIntent is the classified routing decision as the goal row records it: the
+// track, the canonical JSON of the validated claim (nil unless the verify track
+// produced a claim that grounds in the schema), and the cannot-construct reason when
+// it did not.
+//
+// rationale is the model's stated reasoning and failure is why the classifier could
+// not answer at all; they are separate fields rather than one because they read
+// differently to an analyst -- a rationale explains a routing decision, a failure
+// explains its absence -- and a single field would put a parse error under a key
+// labelled "rationale".
+type goalIntent struct {
+	track      string
+	claim      []byte
+	claimError string
+	rationale  string
+	failure    string
+	auditEvent string
+}
+
+// classifyIntent asks Claude which track the goal belongs to and, on the verify
+// track, validates the extracted claim against the introspected schema with the same
+// deterministic column and value checks a Phase-1 proposal passes.
+//
+// It never fails registration. A classification fault falls open to the explore
+// track: the classifier is an accelerator, and a goal that cannot be classified is
+// still a goal worth running observationally. A claim that fails validation is the
+// distinct cannot-construct outcome — the goal registers on the verify track with no
+// claim and the validation reason recorded, which says the claim could not be built
+// rather than that it was tested and found unsupported.
+func (s *Server) classifyIntent(ctx context.Context, goal string, schema llm.SandboxSchema) goalIntent {
+	result, err := s.claude.ClassifyGoalIntent(ctx, llm.GoalIntentInput{GoalText: goal, Schema: schema})
+	if err != nil {
+		log.Printf("orchestrator: classify goal intent: %v", err)
+		return goalIntent{track: store.TrackExplore, auditEvent: "goal_intent_classification_failed", failure: err.Error()}
+	}
+	if result.Track != store.TrackVerify || result.Claim == nil {
+		return goalIntent{track: store.TrackExplore, rationale: result.Rationale}
+	}
+
+	if reason := domain.ClaimGroundingError(result.Claim.Filters, columnNames(schema), columnValues(schema)); reason != "" {
+		return goalIntent{
+			track:      store.TrackVerify,
+			claimError: reason,
+			rationale:  result.Rationale,
+			auditEvent: "goal_claim_construction_failed",
+		}
+	}
+	encoded, err := json.Marshal(result.Claim)
+	if err != nil {
+		log.Printf("orchestrator: encode goal claim: %v", err)
+		return goalIntent{track: store.TrackExplore, auditEvent: "goal_intent_classification_failed", failure: err.Error()}
+	}
+	return goalIntent{track: store.TrackVerify, claim: encoded, rationale: result.Rationale}
+}
+
+// reportIntent records the classification outcomes worth a trail: a fallen-open
+// classification and a claim that could not be constructed. The SSE frame is
+// published live-only -- a goal has no stream at registration, and creating hub
+// state for a run that does not exist would leak it.
+func (s *Server) reportIntent(ctx context.Context, optID string, intent goalIntent) {
+	if intent.auditEvent == "" {
+		return
+	}
+	// A cannot-construct goal reports the validation reason; a fallen-open
+	// classification reports why the classifier could not answer.
+	reason := intent.claimError
+	if reason == "" {
+		reason = intent.failure
+	}
+	detail := map[string]any{
+		"optimization_function_id": optID,
+		"track":                    intent.track,
+		"reason":                   reason,
+	}
+	if err := s.recordAudit(ctx, intent.auditEvent, "goal", detail); err != nil {
+		log.Printf("orchestrator: append audit: %v", err)
+	}
+	if intent.claimError != "" {
+		s.hub.PublishLive(optID, Event{Type: domain.ClaimConstructionFailed, Payload: map[string]any{"reason": intent.claimError}})
+	}
 }
 
 // submitDocumentGoal completes registration for a document source: it derives the
@@ -335,10 +428,18 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 
 // goalListItemDTO is the web-UI projection of a goal plus its latest run status
 // (or a synthetic "no run").
+//
+// Track and ClaimError are the goal's routing outcome, not its run's. They are on the
+// read path because otherwise nothing can read them: a verify-track goal whose claim
+// could not be built records the reason at registration, and a reason no client can
+// fetch tells the analyst nothing. ClaimError is omitempty, so an ordinary goal's
+// projection is unchanged.
 type goalListItemDTO struct {
 	OptimizationFunctionID string    `json:"optimization_function_id"`
 	GoalText               string    `json:"goal_text"`
 	CreatedAt              time.Time `json:"created_at"`
+	Track                  string    `json:"track"`
+	ClaimError             string    `json:"claim_error,omitempty"`
 	Status                 string    `json:"status"`
 	FailureReason          string    `json:"failure_reason,omitempty"`
 }
@@ -372,6 +473,8 @@ func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
 			OptimizationFunctionID: g.OptimizationFunctionID,
 			GoalText:               g.GoalText,
 			CreatedAt:              g.CreatedAt,
+			Track:                  g.Track,
+			ClaimError:             g.ClaimError,
 			Status:                 "no run",
 		}
 		if run, ok := latest[g.OptimizationFunctionID]; ok {

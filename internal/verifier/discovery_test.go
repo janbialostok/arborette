@@ -157,6 +157,10 @@ func (e erroringAnalyzer) Introspect(ctx context.Context, req sandboxclient.Intr
 	return e.inner.Introspect(ctx, req)
 }
 
+func (e erroringAnalyzer) Execute(ctx context.Context, req sandboxclient.ExecuteRequest) (sandboxclient.ExecuteResponse, error) {
+	return e.inner.Execute(ctx, req)
+}
+
 func (e erroringAnalyzer) Analyze(ctx context.Context, req sandboxclient.AnalyzeRequest) (sandboxclient.AnalyzeResponse, error) {
 	for _, c := range req.Columns {
 		if c.Name == e.failColumn {

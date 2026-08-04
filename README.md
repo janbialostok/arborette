@@ -20,10 +20,15 @@ your customers already churns most, and how much worse that slice is than the wh
 
 ## What it does not do (yet)
 
-- **V1 is observational.** It records `P(Outcome | Segment)` — a correlation, measured exactly as
-  the data reports it. It does **not** claim the segment *causes* the outcome. Do-calculus and
-  physically-executed interventions are the V2 direction (see [Roadmap](#roadmap)), and V1's
-  epistemic-provenance tagging exists so V2 can land on the same graph additively.
+- **Discovery is observational; verification is inferred, not experimental.** Phase 1 and Phase 2
+  record `P(Outcome | Segment)` — a correlation, measured exactly as the data reports it. A finding
+  promoted to Engine B gets a second number: its effect recomputed with backdoor adjustment over a
+  discovered causal graph, then stress-tested by a refutation battery. That is a causal *inference*,
+  conditional on the discovered graph and its no-latent-confounder assumption — never established
+  causation, which is why every served edge carries its `epistemic_source` and an inferred one
+  carries a caveat alongside it.
+- **No intervention is ever physically executed.** Adjustment is computed from the same observational
+  rows the correlation came from. Running experiments against a live system stays a roadmap item.
 - **`Intervention` is a name, not an action.** The word is retained across the data model, the
   graph triplets, and the REST surface, but in V1 an `Intervention` node is a reified *read-only
   data-segment definition* — a filter — and nothing is ever enacted.
@@ -87,10 +92,14 @@ wedged dependency would hang the work indefinitely.
 Four things to know before writing an SSE client, none of them guessable from the wire:
 
 - **Frames are unnamed.** The server emits `data: <json>` with no `event:` line, so the discriminator
-  is the JSON payload's own `type` — `triplet`, `branch_failure`, `confidence_distribution`, or a
-  terminal `loop_complete`. A `confidence_distribution` frame is a whole snapshot superseding the
-  last rather than a delta, and it is not a liveness signal: resolving a verification republishes one
-  onto the goal's stream from outside any run. An
+  is the JSON payload's own `type`. A run emits `triplet`, `branch_failure`,
+  `confidence_distribution`, and a terminal `loop_complete`; the router and causal verification
+  publish onto the same goal-keyed stream from outside any run (`verification`,
+  `causal_verification_dispatched`, `auto_promotion_complete`, `causal_graph_corrected`,
+  `claim_construction_failed`), so a client must default-arm its switch rather than exhaust it. A
+  `confidence_distribution` frame is a whole snapshot superseding the last rather than a delta, and
+  it is not a liveness signal: resolving a verification republishes one onto the goal's stream from
+  outside any run. An
   `addEventListener('triplet', …)` handler would never fire. Note `type` alone is not quite enough:
   a `triplet` from a tabular goal and one from a document goal carry different payloads, and the
   overlap is the dangerous part — both have a `value`, a number on one path and a string on the
@@ -151,9 +160,35 @@ performed, and that must not decide whether the goal publishes anything at all. 
 back zero macro-segments can still publish Meta-Heuristics; a run publishes nothing when no
 candidate clears selection, or when every selected one fails to abstract.
 
+### Engine B — causal verification
+
+Phases 1 and 2 answer *which segments correlate with the objective*. Engine B answers *which of those
+correlations survives adjustment for what else the data explains*, and it is reached three ways.
+
+Intake classifies every registered goal onto a track. A goal that asserts a specific claim registers
+as `verify` and its claim is measured and reified as an ordinary observational finding, which is then
+verified like any other. A completed Phase-1 run auto-promotes its strongest findings, ranked by a
+support-shrunk delta so a large effect on six rows does not outrank a smaller one on six hundred. And
+an analyst or agent can request one on demand, through the REST route or the MCP tool.
+
+Verifying a finding means recomputing its effect with **backdoor adjustment** over a causal graph the
+Verifier discovers by conditional-independence testing, then running a **refutation battery** —
+placebo treatments, subsample stability, an injected random confounder — and keeping the verdict only
+if enough of the battery agrees. The result is one of `causally_verified`, `confounded`, or
+`not_identifiable`, the last meaning the graph offers no admissible adjustment set rather than that
+the effect is absent.
+
+Two policies keep this honest. Autonomous promotion is **charged against a per-goal budget**, while a
+human's or agent's request is exempt — automation can never spend the turn an analyst was going to
+take, and the concurrency cap reserves a slot so it cannot crowd one out either. And because the
+adjustment is only as good as the graph, an analyst can **correct an edge**: the correction is served
+as a new graph version with the prior one left intact, and every verification whose adjustment set
+touched a corrected column is marked stale and re-verified against the new version.
+
 ### The services
 
-Three long-running services, three one-shot binaries, all Go, all under `cmd/`:
+Seven Go binaries under `cmd/`. Three are always-on services, two run either as a one-shot job or
+in `-serve` mode behind an HTTP launcher, and two are init one-shots:
 
 - **`orchestrator`** — the REST API, the Phase-1 loop, the SSE stream, the goal registry, and the
   only holder of audit-table credentials, which is why the Sleep-Cycle Worker records through its
@@ -163,7 +198,11 @@ Three long-running services, three one-shot binaries, all Go, all under `cmd/`:
   connection.
 - **`mcpserver`** — the read-side MCP interface over Streamable HTTP, proxying goal registration to
   the Orchestrator rather than writing anything itself.
-- **`sleepcycle`** — the Phase-2 worker. `-goal <optimization_function_id>`, one cycle, then exit.
+- **`sleepcycle`** — the Phase-2 worker. `-goal <optimization_function_id>` runs one cycle and
+  exits; `-serve` is the always-on variant the Orchestrator's launcher dispatches to.
+- **`verifier`** — Engine B. Discovers the causal graph by constraint-based conditional-independence
+  testing, computes backdoor-adjusted effects for promoted findings, and runs the refutation battery.
+  `-goal <id> -datasource <ref>` for one discovery, or `-serve` for the always-on variant.
 - **`migrate`** — applies (`up`, the default) or rolls back (`down`) the Postgres migrations as the
   owner role.
 - **`dbbootstrap`** — idempotently provisions the runtime LOGIN roles before migrations run.
@@ -276,6 +315,13 @@ Matrix to the real columns with Claude, **dry-runs the fitted objective against 
 persists the goal — returning 201 with `{"optimization_function_id": "<uuid>"}`. That id is what
 every later step consumes: `{id}` in the loop and stream routes, and `GOAL=` for `make sleep-cycle`.
 
+Registration also classifies the goal's **track**. A goal phrased as a hypothesis to test registers
+as `verify`, with the claim extracted and grounded against the real schema; anything else registers
+as `explore` and runs discovery as before. Classification never fails registration — a classifier
+fault falls open to `explore`. A verify-track claim that will not ground reports its reason in the
+goal's `claim_error`, which is how you tell "the claim could not be built" from "the claim was
+tested and not supported"; `GET /goals` serves both `track` and `claim_error`.
+
 Registration does **not** start Phase 1. It also fails *here* rather than at run time if the goal
 cannot be fitted to the data — an objective that does not compile against the schema comes back as
 a 4xx with the reason, after the system has already tried to repair it. One failure at this step is
@@ -311,10 +357,12 @@ The trigger returns 202 and the loop runs detached, so confirm it finished befor
 
 ### 4. Run Phase 2
 
-**`make sleep-cycle GOAL=<id>` is the only way to execute a Sleep Cycle against the local stack.**
-The REST route `POST /goals/{id}/sleep-cycle` and the web UI button both log, audit, return 202, and
-run nothing: that path is designed to dispatch a real job runner in a deployed environment, and no
-such runner exists locally.
+`POST /goals/{id}/sleep-cycle` and the web UI button both really run a cycle locally: Compose points
+`SLEEPCYCLE_WORKER_URL` at the always-on `sleepcycle-serve` service, which accepts the run
+asynchronously (202, one per goal — a second while one is in flight is a 409). `make sleep-cycle
+GOAL=<id>` runs the same worker as a one-shot job instead, and is what you want after editing worker
+code, since it passes `--build`; `sleepcycle-serve` otherwise keeps serving a stale image until
+`docker compose up -d --build sleepcycle-serve`.
 
 Before running it, **lower the support floor**. The bundled sample has 20 data rows and
 `SLEEPCYCLE_SEARCH_MIN_SUPPORT` defaults to 30, an absolute matched-row count no segment of 20 rows
@@ -355,8 +403,7 @@ Little of this walkthrough actually requires curl. The web UI's landing page is 
 form, `/goals` lists registered objectives with their run status, and `/heuristics` browses what was
 published. A goal page carries three tabs, mirrored into `?tab=` so any of them is linkable: **Run**
 follows the live stream, **Verify** works the review queue against the source excerpts each value
-was read from, and **Preview agent** chats with the accumulated graph. Only step 4 is Make-only, for
-the reason given there.
+was read from, and **Preview agent** chats with the accumulated graph.
 
 ### Working on the web UI
 
@@ -374,17 +421,19 @@ the backend up with `make up`, but drive the frontend through `make web-dev`.
 | `sandbox` | 8081 | DuckDB / extraction execution. |
 | `mcpserver` | 8082 | MCP over Streamable HTTP. |
 | `web` | 8083 | Next.js UI. `WEBUI_PORT` picks the host port; the container is fixed at 8083. |
+| `sleepcycle-serve` | 8084 | The Phase-2 worker the REST trigger dispatches to. |
+| `verifier-serve` | 8085 | Engine B: discovery, adjustment, refutation. |
 | `neo4j` | 7474, 7687 | HTTP browser, Bolt. |
 | `postgres` | 5432 | pgvector image. |
 | `minio` | 9000, 9001 | S3 API, console. |
 | `ollama` | 11434 | Embedding sidecar. |
 
-Twelve Compose services in all: the eight above, three init one-shots, and the profile-gated
-`sleepcycle` job.
+Fifteen Compose services in all: the ten above, three init one-shots, and the profile-gated
+`sleepcycle` and `verifier` one-shot jobs.
 
 ### Make targets
 
-Nine targets:
+Ten targets:
 
 | Target | Purpose |
 |---|---|
@@ -393,13 +442,14 @@ Nine targets:
 | `up` | `docker compose up -d --build`. |
 | `down` | `docker compose down`. |
 | `sleep-cycle` | Runs one Sleep Cycle: `make sleep-cycle GOAL=<optimization_function_id>`. |
+| `discover` | Runs one causal-discovery sweep: `make discover GOAL=<id> DATASOURCE=<ref>`. |
 | `migrate-up` / `migrate-down` | Applies or rolls back migrations from the host. |
 | `web-dev` | Next dev server on `:3000` against `ORCHESTRATOR_URL`. |
 | `web-build` | `npm ci && npm run build` in `web/`. |
 
 ### HTTP API
 
-The Orchestrator's thirteen routes:
+The Orchestrator's eighteen routes:
 
 | Method and path | Purpose |
 |---|---|
@@ -408,30 +458,39 @@ The Orchestrator's thirteen routes:
 | `POST /goals/{id}/hypothesis-loop` | Trigger Phase 1. |
 | `GET /goals/{id}/stream` | SSE progress for a goal's run. |
 | `POST /goals/{id}/chat` | One turn of the agent preview, streamed back as SSE. The browser holds the transcript and posts it each turn. Returns 503 until the MCP connector is configured — see `MCP_PUBLIC_URL` in `.env.example`. |
-| `POST /goals/{id}/sleep-cycle` | Trigger Phase 2. **Locally a stub: logs, audits, returns 202, runs nothing** — use `make sleep-cycle`. |
+| `POST /goals/{id}/sleep-cycle` | Trigger Phase 2 (202, async, one run per goal — a second while one is in flight is a 409). |
 | `GET /goals/{id}/verifications` | The human-review queue for a goal (`status=pending\|resolved` narrows it), plus the goal's effective threshold and epoch mode. |
 | `POST /goals/{id}/verifications/{outcomeID}` | Submit a review: `{"action":"confirm"\|"correct"\|"reject","corrected_value":"…"}`. 409 if the outcome was already resolved. |
 | `GET /goals/{id}/outcomes` | Every extracted value for a goal, not just the queued ones, so any result can be pulled up for review. |
 | `GET /goals/{id}/outcomes/{outcomeID}/excerpt` | The source text behind an extracted value — the located span, or the whole document when the value cannot be pinpointed in it. |
+| `GET /goals/{id}/causal-graph` | The goal's discovered causal graph — edges with their provenance, direction, and test status. |
+| `POST /goals/{id}/causal-graph/corrections` | Apply one analyst edge correction (`{"op":"flip"\|"delete"\|"add","from":…,"to":…,"direction":…}`), served as a new graph version. Verifications whose adjustment set touched the corrected columns are marked stale and re-dispatched under `ORCHESTRATOR_STALE_REVERIFY_CAP`. 409 while a concurrent correction or discovery holds the goal's graph lock. |
+| `POST /goals/{id}/findings/{interventionID}/verify` | Dispatch one observational finding for causal verification. 202; the verdict arrives minutes later on the goal's stream and in `GET /goals/{id}/causal-verifications`. Analyst-initiated, so exempt from the auto-promotion budget. A finding belonging to another goal is a 404. |
+| `GET /goals/{id}/causal-verifications` | The goal's causal-verification records, newest first: naive and adjusted effect, adjustment set, refutation score, and staleness. Distinct from `/verifications`, which answers "did a human confirm this extracted value" rather than "does the data support this as a causal effect". |
 | `GET /heuristics/search` | Semantic search over published Meta-Heuristics (`q` required; `k` defaults 10, clamped at 100). |
 | `GET /heuristics/{id}/trace` | Trace a Meta-Heuristic back to its supporting triplets. |
-| `POST /internal/audit` | The internal audit-write API other services record through — the one route that checks a bearer token, when `INTERNAL_AUTH_TOKEN` is set. |
+| `POST /internal/audit` | The internal audit-write API other services record through. |
+| `POST /internal/verification-events` | The channel the Verifier republishes run transitions through onto a goal's SSE stream. Both `/internal` routes check a bearer token, when `INTERNAL_AUTH_TOKEN` is set. |
 
 The Sandbox exposes three routes, all called by other services rather than by an analyst:
 `POST /introspect`, `POST /execute`, and `POST /document/text`.
 
 ### MCP tools
 
-Three tools, registered at startup and served over Streamable HTTP on `:8082`:
+Four tools, registered at startup and served over Streamable HTTP on `:8082`:
 
 | Tool | Purpose |
 |---|---|
 | `get_optimized_heuristics` | Return the Meta-Heuristics most relevant to an operational-state description, ranked by semantic similarity. |
 | `trace_causal_chain` | Trace a Meta-Heuristic back to the State/Intervention/Outcome triplets that support it. |
 | `submit_analyst_goal` | Register an analyst optimization goal against a data source on the import mount, proxied to the Orchestrator. |
+| `verify_finding` | Request causal verification of one observational finding: its effect is recomputed adjusted for the confounders in the discovered causal graph, then stress-tested. Dispatch is asynchronous — poll `trace_causal_chain` for the verified effect. |
 
-MCP is read-side consumption plus goal registration: a pure-MCP consumer can register a goal but
-**cannot trigger either phase**: advancing a goal through discovery is a human-driven REST action.
+An MCP consumer can register a goal and request verification of a finding, but **cannot trigger
+either discovery phase** — advancing a goal through Phase 1 or Phase 2 stays a human-driven REST
+action. Both read tools carry each result's `epistemic_source`, and a causally inferred effect rides
+with its caveat, so an agent can weight verified knowledge above correlation rather than having to
+infer the distinction from the payload shape.
 
 ### Configuration
 
@@ -469,6 +528,17 @@ Sleep-Cycle tuning:
 | `SLEEPCYCLE_SEARCH_MIN_SUPPORT` | 30 | Absolute matched-row floor. Reaches four stages — see [Phase 2](#phase-2--sleep-cycle). |
 | `SLEEPCYCLE_SEARCH_MIN_LIFT` | 0.05 | Relative improvement over `S*` required for write-back. |
 | `SLEEPCYCLE_MAX_PUBLICATIONS` | 20 | How many segments one run abstracts into Meta-Heuristics. Selection runs after the search, which is why the name carries no `SEARCH_` segment. |
+
+Causal verification — when Engine B runs:
+
+| Variable | Default | What it gates |
+|---|---|---|
+| `ORCHESTRATOR_AUTOPROMOTE_ENABLED` | `true` | Operator kill switch over autonomous promotion. It deliberately does **not** gate a verify-track goal's own claim — that claim is what the analyst asked to have tested. |
+| `ORCHESTRATOR_AUTOPROMOTE_TOP_N` | 5 | How many of a completed run's findings are promoted for verification. |
+| `ORCHESTRATOR_AUTOPROMOTE_SHRINKAGE_K` | 30 | Support level at which the promotion ranking's shrinkage weight reaches one half. The hypothesis loop holds no support floor of its own, so this defaults to the Sleep Cycle's rather than deriving one. |
+| `ORCHESTRATOR_STALE_REVERIFY_CAP` | 10 | How many stale verifications one graph correction may re-dispatch. |
+| `VERIFIER_WORKER_URL` | — | Selects the Verifier launcher, as `SLEEPCYCLE_WORKER_URL` does for Phase 2. Compose points it at `verifier-serve`. |
+| `VERIFIER_DISCOVERY_ALPHA` / `_FDR` / `_MAX_COND_SET` / `_BINS` / `_COLUMN_CAP` / `_MAX_TESTS` | 0.05 / `bh` / 2 / 4 / 50 / 20000 | The PC sweep's significance level, multiple-testing correction, conditioning-set size, discretization bins, column cap, and total-test guard. |
 
 Human review of extracted values:
 
@@ -521,26 +591,21 @@ coverage. Enumerating atoms from the schema directly (enum values as-is, quantil
 removes that cap, and inverts the LLM from proposer to **critic**: one call to flag leakage,
 tautological, and post-outcome columns that support and lift gates cannot catch by construction.
 
-V2 proper turns the observational engine into one that can *prove* causality. A **Control Plane
-Router** dispatches each evaluation by intent to one of two engines: **Engine A** is V1 unchanged —
-fast observational discovery writing correlation edges — while **Engine B** executes physical
-interventions in isolated ephemeral sandboxes and writes do-calculus causal edges, using A\* guided
-by existing Meta-Heuristics to choose which expensive experiment to run first. The Sleep Cycle's
-search policy swaps from the level-wise beam to **UCT-MCTS** for the resulting mixed graph, scoring
-paths validated by a causal edge far above merely correlated ones.
-
-None of this is a rewrite. V1 already tags every empirical edge with its epistemic provenance and
-reserves the interventional values, so V2 lands as new writers, a router, and a new policy behind
-the existing search seam.
+What remains open is the half of Engine B that needs a live system to act on. **Physically executed
+interventions** — running the experiment in an isolated ephemeral sandbox and writing a do-calculus
+edge, rather than adjusting the observational rows — would replace inference with evidence, and
+**A\* guided by existing Meta-Heuristics** would choose which expensive experiment to run first. The
+Sleep Cycle's search policy then swaps from the level-wise beam to **UCT-MCTS** over the resulting
+mixed graph, scoring paths validated by a causal edge far above merely correlated ones.
 
 ## Repository layout
 
-- **`cmd/`** — the six binaries described under [The services](#the-services).
-- **`internal/`** — eighteen packages, in five groups:
+- **`cmd/`** — the seven binaries described under [The services](#the-services).
+- **`internal/`** — nineteen packages, in five groups:
   - *Infrastructure seams*, each the single place its dependency is touched so it can be swapped
     behind an interface: `store` (Postgres and migrations), `graph` (Neo4j), `objectstore`
     (S3/MinIO), `datasource`, `embedding`.
-  - *Service packages*: `orchestrator`, `sandbox`, `mcpserver`, `sleepcycle`.
+  - *Service packages*: `orchestrator`, `sandbox`, `mcpserver`, `sleepcycle`, `verifier`.
   - *Clients*: `sandboxclient` and `orchestratorclient`, one per service other services call.
   - *Shared query seams*: `objective`, which pins a matrix to one measurement, and `heuristics`,
     which both the REST handler and the MCP tool call so the two cannot diverge.

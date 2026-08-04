@@ -21,12 +21,15 @@ import (
 	"github.com/arborette/arborette/internal/store"
 )
 
-// analyzer is the sandbox surface discovery drives: schema introspection (column
-// types and low-cardinality values, the input to type routing and column selection)
-// plus the two /analyze kinds. Backed by *sandboxclient.Client.
+// analyzer is the sandbox surface the Verifier drives: schema introspection (column
+// types and low-cardinality values, the input to type routing and column selection),
+// the two /analyze kinds, and /execute -- the claim reification needs the goal's
+// unfiltered global baseline, and the /analyze effect kinds only ever answer with a
+// segment and its complement. Backed by *sandboxclient.Client.
 type analyzer interface {
 	Introspect(ctx context.Context, req sandboxclient.IntrospectRequest) (sandboxclient.IntrospectResponse, error)
 	Analyze(ctx context.Context, req sandboxclient.AnalyzeRequest) (sandboxclient.AnalyzeResponse, error)
+	Execute(ctx context.Context, req sandboxclient.ExecuteRequest) (sandboxclient.ExecuteResponse, error)
 }
 
 // orienter is the one batched LLM orientation call (plus its repair sibling) the
@@ -36,12 +39,14 @@ type orienter interface {
 	RepairOrientCausalEdges(ctx context.Context, goalText string, columns []llm.ColumnSemantics, edges []llm.OrientEdge, prior []llm.OrientDecision, validationErr string) ([]llm.OrientDecision, error)
 }
 
-// graphWriter is the graph surface both Verifier stages need: discovery's committed
+// graphWriter is the graph surface every Verifier stage needs: discovery's committed
 // read (for the single-flight recheck and the endpoint), version-scoped cleanup, the
 // three upserts written columns→edges→meta (meta last, the commit marker), and the
-// eligible-findings read; plus verification's finding read (GetIntervention, the
+// eligible-findings read; verification's finding read (GetIntervention, the
 // segment-predicate source), the exempt causal-evidence read, and the two causal
-// Outcome writers (confirming and retracting). Kept one interface rather than a
+// Outcome writers (confirming and retracting); plus the triplet writers a directly
+// constructed claim is reified through, which are the same writers Phase 1 and the
+// Sleep Cycle persist their findings with. Kept one interface rather than a
 // second graph seam; *graph.Neo4jRepository satisfies the whole surface.
 type graphWriter interface {
 	GetCausalGraph(ctx context.Context, goalID, datasourceRef string) (domain.CausalGraph, bool, error)
@@ -54,6 +59,11 @@ type graphWriter interface {
 	GetCausalEvidence(ctx context.Context, interventionID string) (graph.CausalEvidence, bool, error)
 	WriteCausalVerification(ctx context.Context, interventionID string, version int, outcome domain.Outcome, edge domain.ProducedEdge) error
 	SupersedePriorCausalOutcomes(ctx context.Context, interventionID string, version int) error
+	CreateState(ctx context.Context, s domain.State) error
+	CreateIntervention(ctx context.Context, i domain.Intervention) error
+	CreateOutcome(ctx context.Context, o domain.Outcome) error
+	CreatePreConditionFor(ctx context.Context, stateID, interventionID string) error
+	CreateProduced(ctx context.Context, interventionID, outcomeID string, edge domain.ProducedEdge) error
 }
 
 // locker is the cross-process single-flight: a Postgres advisory lock on the (goal,
@@ -132,8 +142,10 @@ func NewWorker(a analyzer, g graphWriter, o orienter, lk locker, goals goalReade
 
 // discoveryVersion is the version an initial discovery always writes. It is fixed so
 // a crashed run's re-run MERGEs over the same (goal, data-source, 1) keys
-// idempotently rather than allocating a second partial graph; version increments
-// belong to the analyst-correction/re-discovery path of a later shell.
+// idempotently rather than allocating a second partial graph. Higher versions belong
+// to analyst corrections alone, which is what makes an analyst's edits durable: a
+// re-run of discovery can only ever rewrite version 1, while the corrected graph is
+// served from above it.
 const discoveryVersion = 1
 
 // RunDiscovery ensures a committed causal graph exists for the (goal, data-source)

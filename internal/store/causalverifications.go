@@ -155,6 +155,14 @@ func (c *CausalVerifications) DispatchAccept(ctx context.Context, rec CausalVeri
 // enforceLimits checks the in-flight cap (all dispatches) and, for a budgeted
 // dispatch, the per-goal budget, both counted in the dispatch transaction with the
 // budget read from goal_registry so it cannot be raced by a stale value.
+//
+// A budgeted dispatch is held one slot below the cap so autonomous work can never
+// fill it completely. Without that reservation the exemption is only half real: an
+// analyst-initiated dispatch is spared the budget but still loses the slot race, and
+// it loses it systematically rather than occasionally -- a verify-track goal's own
+// claim has to be introspected, measured and reified before it asks for a slot, while
+// the promotions launched alongside it ask immediately, so the one verification the
+// analyst actually requested is the one most likely to be refused.
 func (c *CausalVerifications) enforceLimits(ctx context.Context, tx pgx.Tx, rec CausalVerification) error {
 	var pending int
 	if err := tx.QueryRow(ctx,
@@ -162,7 +170,7 @@ func (c *CausalVerifications) enforceLimits(ctx context.Context, tx pgx.Tx, rec 
 		rec.GoalID, CausalStatusPending).Scan(&pending); err != nil {
 		return fmt.Errorf("count in-flight verifications: %w", err)
 	}
-	if pending >= c.inflightCap {
+	if pending >= c.inflightSlots(rec.Budgeted) {
 		return ErrInflightCapReached
 	}
 	if !rec.Budgeted {
@@ -184,6 +192,18 @@ func (c *CausalVerifications) enforceLimits(ctx context.Context, tx pgx.Tx, rec 
 		return ErrBudgetExhausted
 	}
 	return nil
+}
+
+// inflightSlots is how many concurrent verifications a dispatch may find already in
+// flight. An exempt dispatch gets the whole cap; a budgeted one gets one less, which
+// is the reservation. A cap of 1 leaves budgeted dispatches no slots at all, which is
+// the honest reading of "one at a time, reserved for the analyst" rather than a
+// special case worth smoothing over.
+func (c *CausalVerifications) inflightSlots(budgeted bool) int {
+	if !budgeted {
+		return c.inflightCap
+	}
+	return c.inflightCap - 1
 }
 
 // Heartbeat renews a leased record's deadline mid-run. The status='pending' guard
@@ -235,23 +255,54 @@ func (c *CausalVerifications) ReapExpired(ctx context.Context) (int, error) {
 }
 
 // MarkStale flags a goal's completed verifications whose adjustment set touches a
-// column, so a graph correction can trigger their re-verification. A bumped graph
-// version makes the re-verification a new key rather than a duplicate.
-func (c *CausalVerifications) MarkStale(ctx context.Context, goalID string, columns []string) error {
+// column, so a graph correction can trigger their re-verification, and returns the
+// interventions it flagged. A bumped graph version makes each re-verification a new
+// key rather than a duplicate.
+//
+// Returning the ids it actually flagged is what scopes a correction to its own
+// invalidations. Nothing ever clears the flag, so re-reading the goal's stale records
+// instead would hand every later correction the whole history to re-dispatch —
+// burning the staleness cap on work already done and overstating what this correction
+// invalidated.
+//
+// The columns must carry the graph's own spelling: adjustment_set holds the column
+// names discovery wrote, and ?| is a byte-exact jsonb overlap test.
+func (c *CausalVerifications) MarkStale(ctx context.Context, goalID string, columns []string) ([]string, error) {
 	if len(columns) == 0 {
-		return nil
+		return nil, nil
 	}
 	// The adjustment_set jsonb is an array of column names; ?| tests array/string
 	// overlap. Only completed (non-pending, non-failed) records are marked.
-	_, err := c.pool.Exec(ctx,
-		"UPDATE causal_verifications SET stale = true, updated_at = now() "+
-			"WHERE goal_id = $1 AND status NOT IN ($2, $3) AND adjustment_set ?| $4",
+	// DISTINCT matters: the table is unique on (goal, intervention, graph version), so
+	// one intervention holds a completed record per version it was verified at, and a
+	// bare RETURNING would hand back the same finding once per version -- each copy
+	// consuming a slot of the caller's re-verification cap and inflating the count it
+	// reports. The ORDER BY keeps which findings survive that cap reproducible.
+	rows, err := c.pool.Query(ctx,
+		"WITH flagged AS ("+
+			"UPDATE causal_verifications SET stale = true, updated_at = now() "+
+			"WHERE goal_id = $1 AND status NOT IN ($2, $3) AND adjustment_set ?| $4 "+
+			"RETURNING intervention_id) "+
+			"SELECT DISTINCT intervention_id FROM flagged ORDER BY intervention_id",
 		goalID, CausalStatusPending, CausalStatusFailed, columns,
 	)
 	if err != nil {
-		return fmt.Errorf("mark stale verifications for %q: %w", goalID, err)
+		return nil, fmt.Errorf("mark stale verifications for %q: %w", goalID, err)
 	}
-	return nil
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan stale verification: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stale verifications: %w", err)
+	}
+	return ids, nil
 }
 
 // ListForGoal returns a goal's verification records, newest first, powering the

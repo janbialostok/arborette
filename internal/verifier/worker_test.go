@@ -51,6 +51,17 @@ type fakeGraph struct {
 	writtenEdge        domain.ProducedEdge
 	supersedes         int
 	supersededVersion  int
+
+	// The triplet writes a reified claim persists, recorded so a test can assert the
+	// nodes and the deterministic ids it minted.
+	states        []domain.State
+	interventions []domain.Intervention
+	outcomes      []domain.Outcome
+	preConditions [][2]string
+	// produced records the edge's endpoints alongside its properties: the endpoints are
+	// what make a reified triplet coherent, so a test asserting deterministic ids must
+	// be able to see which pair the edge actually linked.
+	produced []producedEdge
 }
 
 func (f *fakeGraph) GetCausalGraph(context.Context, string, string) (domain.CausalGraph, bool, error) {
@@ -103,6 +114,33 @@ func (f *fakeGraph) SupersedePriorCausalOutcomes(_ context.Context, _ string, ve
 	f.supersedes++
 	f.supersededVersion = version
 	return nil
+}
+func (f *fakeGraph) CreateState(_ context.Context, s domain.State) error {
+	f.states = append(f.states, s)
+	return nil
+}
+func (f *fakeGraph) CreateIntervention(_ context.Context, i domain.Intervention) error {
+	f.interventions = append(f.interventions, i)
+	return nil
+}
+func (f *fakeGraph) CreateOutcome(_ context.Context, o domain.Outcome) error {
+	f.outcomes = append(f.outcomes, o)
+	return nil
+}
+func (f *fakeGraph) CreatePreConditionFor(_ context.Context, stateID, interventionID string) error {
+	f.preConditions = append(f.preConditions, [2]string{stateID, interventionID})
+	return nil
+}
+func (f *fakeGraph) CreateProduced(_ context.Context, interventionID, outcomeID string, edge domain.ProducedEdge) error {
+	f.produced = append(f.produced, producedEdge{interventionID: interventionID, outcomeID: outcomeID, edge: edge})
+	return nil
+}
+
+// producedEdge is one recorded PRODUCED write: the pair it linked and its properties.
+type producedEdge struct {
+	interventionID string
+	outcomeID      string
+	edge           domain.ProducedEdge
 }
 
 type fakeGoalReader struct{ goal store.Goal }

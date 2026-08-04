@@ -263,3 +263,134 @@ func TestCausalVerificationsGrants(t *testing.T) {
 		t.Fatalf("service UPDATE via complete: held=%v err=%v", held, err)
 	}
 }
+
+// TestCausalVerificationsMarkStale exercises the invalidation path a graph correction
+// drives, through the orchestrator's own role. It covers the
+// jsonb overlap predicate and the 0014 grant against real Postgres, both of which fail
+// silently in production — the caller logs and reports "redispatched: 0" — so a
+// missing grant or a binding mismatch would otherwise look like "nothing to
+// invalidate".
+func TestCausalVerificationsMarkStale(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	service := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	orch := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	goalID := seedGoal(t, ctx, orch)
+
+	writer := store.NewCausalVerifications(service, time.Minute, 8, 20)
+	// Two completed records adjusting on different columns, plus one still in flight.
+	touched, other, inflight := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	for id, adjust := range map[string][]string{touched: {"Z", "X"}, other: {"unrelated"}} {
+		rec, accepted, err := writer.DispatchAccept(ctx, dispatchRec(t, goalID, id, 1, false))
+		if err != nil || !accepted {
+			t.Fatalf("dispatch %q: accepted=%v err=%v", id, accepted, err)
+		}
+		if held, err := writer.Complete(ctx, rec.ID, store.CausalStatusCausallyVerified, nil, nil, adjust, nil, nil); err != nil || !held {
+			t.Fatalf("complete %q: held=%v err=%v", id, held, err)
+		}
+	}
+	if _, accepted, err := writer.DispatchAccept(ctx, dispatchRec(t, goalID, inflight, 1, false)); err != nil || !accepted {
+		t.Fatalf("dispatch in-flight: accepted=%v err=%v", accepted, err)
+	}
+
+	// The orchestrator role is the one that marks stale, so run it through that pool:
+	// this is what proves 0014's grant.
+	reader := store.NewCausalVerifications(orch, time.Minute, 8, 20)
+	flagged, err := reader.MarkStale(ctx, goalID, []string{"Z", "Y"})
+	if err != nil {
+		t.Fatalf("mark stale as the orchestrator role: %v", err)
+	}
+	if len(flagged) != 1 || flagged[0] != touched {
+		t.Fatalf("flagged = %v, want only the record adjusting on Z", flagged)
+	}
+
+	records, err := reader.ListForGoal(ctx, goalID)
+	if err != nil {
+		t.Fatalf("list as the orchestrator role: %v", err)
+	}
+	stale := map[string]bool{}
+	for _, rec := range records {
+		stale[rec.InterventionID] = rec.Stale
+	}
+	if !stale[touched] {
+		t.Fatalf("the record adjusting on a corrected column was not flagged")
+	}
+	if stale[other] || stale[inflight] {
+		t.Fatalf("stale spread beyond the overlapping completed record: %v", stale)
+	}
+
+	// A second correction must return only what it flags, not the goal's accumulated
+	// stale history -- otherwise every later correction re-dispatches earlier work.
+	again, err := reader.MarkStale(ctx, goalID, []string{"unrelated"})
+	if err != nil {
+		t.Fatalf("second mark stale: %v", err)
+	}
+	if len(again) != 1 || again[0] != other {
+		t.Fatalf("second correction flagged %v, want only its own record", again)
+	}
+
+	// One finding verified at several graph versions holds one completed record per
+	// version, and the caller spends a slot of its re-dispatch cap per id it gets back.
+	// Without the DISTINCT the same intervention would come back once per version,
+	// truncating the fan-out and inflating the count the analyst is shown.
+	multi := testutil.NewID(t)
+	for _, version := range []int{1, 2} {
+		rec, accepted, err := writer.DispatchAccept(ctx, dispatchRec(t, goalID, multi, version, false))
+		if err != nil || !accepted {
+			t.Fatalf("dispatch %q at version %d: accepted=%v err=%v", multi, version, accepted, err)
+		}
+		if held, err := writer.Complete(ctx, rec.ID, store.CausalStatusCausallyVerified, nil, nil, []string{"W"}, nil, nil); err != nil || !held {
+			t.Fatalf("complete %q at version %d: held=%v err=%v", multi, version, held, err)
+		}
+	}
+	deduped, err := reader.MarkStale(ctx, goalID, []string{"W"})
+	if err != nil {
+		t.Fatalf("mark stale across versions: %v", err)
+	}
+	if len(deduped) != 1 || deduped[0] != multi {
+		t.Fatalf("flagged %v, want the intervention once despite two verified versions", deduped)
+	}
+
+	// The orchestrator reads and invalidates but never creates: record creation stays
+	// the Verifier's, so the charge-at-accept accounting has exactly one writer.
+	if _, _, err := reader.DispatchAccept(ctx, dispatchRec(t, goalID, testutil.NewID(t), 2, false)); err == nil {
+		t.Fatalf("the orchestrator role must not be able to insert a verification record")
+	}
+}
+
+// TestCausalVerificationsReservesASlotForExemptDispatches: autonomous promotion must
+// not be able to fill the in-flight cap, or the budget exemption is only half real --
+// an analyst-initiated verification would be spared the budget and then lose the slot
+// race anyway. A verify goal's own claim loses that race systematically, because it is
+// introspected, measured and reified before it asks for a slot while the promotions
+// dispatched alongside it ask immediately.
+func TestCausalVerificationsReservesASlotForExemptDispatches(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	orch := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	goalID := seedGoal(t, ctx, orch)
+
+	const cap = 3
+	writer := store.NewCausalVerifications(p, time.Minute, cap, 20)
+
+	// Autonomous promotion fills what it is allowed to: one slot short of the cap.
+	for i := 0; i < cap-1; i++ {
+		if _, accepted, err := writer.DispatchAccept(ctx, dispatchRec(t, goalID, testutil.NewID(t), 1, true)); err != nil || !accepted {
+			t.Fatalf("budgeted dispatch %d: accepted=%v err=%v", i, accepted, err)
+		}
+	}
+	// The next autonomous one is refused even though the cap itself is not reached.
+	_, _, err := writer.DispatchAccept(ctx, dispatchRec(t, goalID, testutil.NewID(t), 1, true))
+	if !errors.Is(err, store.ErrInflightCapReached) {
+		t.Fatalf("budgeted dispatch past the reservation: err=%v, want ErrInflightCapReached", err)
+	}
+	// The reserved slot is still there for the analyst's own.
+	if _, accepted, err := writer.DispatchAccept(ctx, dispatchRec(t, goalID, testutil.NewID(t), 1, false)); err != nil || !accepted {
+		t.Fatalf("exempt dispatch into the reserved slot: accepted=%v err=%v", accepted, err)
+	}
+	// And the cap still binds it.
+	if _, _, err := writer.DispatchAccept(ctx, dispatchRec(t, goalID, testutil.NewID(t), 1, false)); !errors.Is(err, store.ErrInflightCapReached) {
+		t.Fatalf("exempt dispatch past the cap: err=%v, want ErrInflightCapReached", err)
+	}
+}

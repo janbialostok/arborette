@@ -360,3 +360,115 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Where**: `web/components/HeuristicBrowser.tsx` (scope `<select>`)
 - **Why**: The scope selector renders every goal as a native `<select>` option; with many goals that's a long, clunky list to scroll. A typed autocomplete/combobox (filter-as-you-type over goal text, keyboard-navigable, accessible) keeps selection fast as the goal count grows, and matches how analysts think about goals (by phrase, not position).
 - **Noted**: 2026-08-03
+
+### Correction-triggered staleness cannot invalidate what an added confounder breaks
+
+- **Type**: plan
+- **Category**: reliability
+- **Where**: `internal/orchestrator/corrections.go` (`reverifyStale`), `internal/store/causalverifications.go` (`MarkStale`), incidence data in `internal/verifier/adjust.go` (`adjustmentColumns`)
+- **Why**: `MarkStale` flags records whose *existing* `adjustment_set` names a corrected column, but an added confounder invalidates exactly the records whose adjustment set **lacks** it — that missing column is why they were wrong. So `add` (R7's flagship op, "add a known confounder edge the tests missed") and any `flip` that *creates* a new parent of a treatment column mark nothing stale and re-dispatch nothing, while the affected findings keep serving `causal_inferred` edges computed without the confounder. Only `delete` and parent-removing flips are caught. The fix needs the corrected edge's incidence with each record's treatment columns (re-derived from its intervention's filters), not set overlap — a new derivation plus a graph read per candidate record, which is why it was deferred rather than patched.
+- **Noted**: 2026-08-04
+
+### Extract the shared observational-triplet writer used by the Verifier and the Sleep Cycle
+
+- **Type**: plan
+- **Category**: refactor
+- **Where**: `internal/verifier/claim.go` (`reifyClaim`), `internal/sleepcycle/writeback.go` (`writeSegment`), destination likely `internal/graph`
+- **Why**: The two are near-verbatim copies: same baseline `State` property map, same `Intervention` keys, same `Outcome` shape, same five-write ordering, same `EffectSize = value − baseline, Confidence 1.0, EpistemicObservational` edge — differing only in role constants and the provenance flag. The ordering is load-bearing and documented in only one of them: a zero-row Cypher `MATCH` is not an error, so an edge write against a node that failed to write silently links nothing. A sixth write or a changed edge semantic must now land in two packages, and a miss is invisible because `adjust.go`, `promote.go`, and `sleepcycle/publish.go` all read these property maps by key. The id half of this duplication was already consolidated into `domain.CanonicalFilters`/`DerivedID`; this is the write half. Deferred because extracting it modifies shipped Sleep-Cycle write-back code and its tests.
+- **Noted**: 2026-08-04
+
+### Chain Neo4j bookmarks across the multi-session graph read-modify-writes
+
+- **Type**: plan
+- **Category**: reliability
+- **Where**: `internal/graph/neo4j.go` (`read`/`write` session construction), affecting `CorrectCausalEdge` and the Verifier's discovery `persist` (columns→edges→meta)
+- **Why**: Every multi-step graph write spans several independent sessions built with a bare `neo4j.SessionConfig{AccessMode: …}` — no `Bookmarks`, no `BookmarkManager` — and the driver guarantees read-your-own-writes only *within* one session. Inert today (single `neo4j:5` container, direct `bolt://` URI, so every session lands on the same instance), but against a `neo4j://` routing URI or a cluster, `CorrectCausalEdge`'s copy-forward could read a pre-correction edge set and silently drop an earlier analyst's edit — the exact failure its advisory lock exists to prevent — and could commit a version-bumped meta on a member that has not applied the edge writes, so `GetCausalGraph` serves a version with no edges. The Postgres advisory lock serializes writers but cannot order Neo4j sessions. Fix is repo-level: thread `session.LastBookmarks()` or a repository-scoped `BookmarkManager` through the read→write chain.
+- **Noted**: 2026-08-04
+
+### Bound causal-graph version growth from repeated corrections
+
+- **Type**: plan
+- **Category**: performance
+- **Where**: `internal/graph/causal.go` (`CorrectCausalEdge`), `internal/orchestrator/corrections.go`
+- **Why**: Each accepted correction copies the entire edge set forward at `version+1` and nothing ever reclaims the prior version: `deleteCausalEdgesAtVersion` only clears torn writes at the *target* version, and `DeleteCausalGraphVersion` is reached solely from discovery, which early-returns once a meta exists. So every correction permanently adds `|E|` `CAUSES` relationships (plus a `causal_verifications` row per re-dispatch, since the version bump defeats coalescing). Alternating flips (`A→B`, then `B→A`) are always "matched" and so always accepted, giving an unbounded growth path on an unauthenticated endpoint; on a 100-edge graph, 10k corrections is a million relationships. Copy-forward is the plan's deliberate mechanism (it is what makes a deleted edge durable without a tombstone), so the fix is a retention policy — delete `version-1`'s edges once the new meta commits, or cap retained versions — not a change to the write shape.
+- **Noted**: 2026-08-04
+
+### Subsample refutation is broken for every finding with a non-empty adjustment set
+
+- **Type**: direct
+- **Category**: reliability
+- **Where**: `internal/sandbox/compile.go` (~line 1243, the `AnalyzeSampledEffect` inner scan)
+- **Why**: The inner scan appends `USING SAMPLE …` to the table function and only then appends `WHERE`, producing `FROM read_csv(…) USING SAMPLE 70.0000% (reservoir) WHERE "Z" IS NOT NULL` — which DuckDB rejects with `Parser Error: syntax error at or near "WHERE"`. `nullPreds` is populated once per `req.Adjust` entry, so the `WHERE` clause exists **exactly when the adjustment set is non-empty**: the K=20 subsample stability refutation therefore fails for precisely the confounded findings causal verification exists to test, while Z-less findings pass, which is why every run on the seed data looked healthy. The verification surfaces as `failed: internal error` and is then lease-reaped, so the analyst sees no verdict at all rather than a refutation score. Observed live 2026-08-04 on `causal-demo.csv` after adding a `Z→A` confounder edge to a verify-track goal. Committed in `c0f1809` (shell 07), independent of the router change. Fix is a subquery or a `WHERE`-before-`USING SAMPLE` reordering, plus a compile test that pins a sampled effect with a non-empty adjustment set — the existing analyze tests only cover the Z-less shape.
+- **Noted**: 2026-08-04
+
+### Extract a Pin-and-bind helper so a windowed objective cannot lose its window columns
+
+- **Type**: direct
+- **Category**: refactor
+- **Where**: `internal/verifier/claim.go`, `internal/verifier/adjust.go`, `internal/sleepcycle/worker.go`, `internal/orchestrator/hypothesis.go` (two sites)
+- **Why**: `objective.Pin(goal.EvaluationMatrix)` followed by two manual assignments of `EntityKeyColumn`/`TimeColumn` from the goal row is repeated at five sites across three packages — twice inside `internal/verifier` alone. The bindings live on the goal rather than the matrix, so `Pin` cannot see them, and a caller that forgets the two lines gets a windowed objective that compiles against nothing and fails at the sandbox rather than at the type checker. A `Pin`-adjacent helper taking `(matrix, entityKey, timeColumn)` makes the next dispatch kind correct by construction.
+- **Noted**: 2026-08-04
+
+### Settle one trust rule for the dispatched datasource_ref across Verifier dispatch kinds
+
+- **Type**: plan
+- **Category**: reliability
+- **Where**: `internal/verifier/claim.go` (`VerifyClaim`), `internal/verifier/verify.go` (`VerifyOne`), `internal/verifier/worker.go` (`discover`)
+- **Why**: `VerifyClaim` overwrites the wire `datasourceRef` with the goal row's and documents the override as load-bearing ("measuring a goal's claim against another goal's data would persist a finding on this goal's graph that describes neither"). Its two sibling dispatch paths take the wire ref at face value and use it for graph-version resolution, introspection, and every persisted `DataColumn`/`CausalEdge`/`CausalGraphMeta` key — `discover` even loads the same goal row and could compare. Either the argument holds for all three (in which case the override belongs where the goal is loaded, once) or for none; as written a reader cannot tell which rule a next dispatch kind should follow.
+- **Noted**: 2026-08-04
+
+### Type the goal Track and group NewServer's collaborators into a struct
+
+- **Type**: plan
+- **Category**: refactor
+- **Where**: `internal/domain/claim.go`, `internal/store/goalregistry.go`, `internal/llm/classify.go`, `internal/orchestrator/server.go`, `cmd/orchestrator/main.go`
+- **Why**: Two convention gaps the router change widened. `Track` is an untyped string while every other cross-boundary enum `domain` owns is a defined string type (`TargetDirection`, `VerificationStatus`, `EpistemicSource`, `EdgeDirection`) and `store` follows suit with `EpochMode` — so a field whose whole purpose is routing carries no type-level signal about its constant set. And `NewServer` now takes 22 positional parameters including two adjacent `JobLauncher` values: swapping them in `main.go` compiles cleanly and silently routes sleep-cycle jobs to the Verifier and back. `RouterConfig` and `server_test.go`'s `testServer` already apply the remedy one level down; production wiring is the only place still exposed.
+- **Noted**: 2026-08-04
+
+### Compose the claim filter-shape prompt from filterShapeGuide instead of restating it
+
+- **Type**: direct
+- **Category**: reliability
+- **Where**: `internal/llm/classify.go` (`claimShapeGuide`, `classifyGoalIntentSystem`), `internal/llm/client.go` (`filterShapeGuide`, `interventionTreeSystem`)
+- **Why**: `claimShapeGuide` restates `filterShapeGuide` almost word for word — the `{"field","op","value"}` shape sentence and the whole per-column-type operator/value sentence — and the column-grounding clause duplicates `interventionTreeSystem`'s. Both prompts feed the same shared `filterWire` decoder, which `decodeClaimFilters` documents as the reason for sharing ("a second decoder here would let the two drift apart"); the decoder is shared but the prose that grounds it is now forked, so an operator or value-encoding change updates one prompt and leaves the other describing the old contract to the same model.
+- **Noted**: 2026-08-04
+
+### Promote canonical_filter and value to domain.Prop constants
+
+- **Type**: direct
+- **Category**: reliability
+- **Where**: `internal/domain/domain.go` (`Prop*` block), `internal/verifier/claim.go`, `internal/sleepcycle/writeback.go`, `internal/sleepcycle/abstract.go`, `internal/sleepcycle/search.go`
+- **Why**: The `Prop*` block exists so a node property key crossing a service boundary is a compile error to misspell, and `PropClaimDerived` was just added to it. The adjacent keys in the very same property maps — `"canonical_filter"` and `"value"` — stay bare literals, now written from six sites and, since the claim reification, from a second service. The claim triplet and the sleep-cycle triplet agree only by coincidence of typing, and a drift degrades silently rather than failing.
+- **Noted**: 2026-08-04
+
+### Align auto-promotion's eligibility gate with publication's
+
+- **Type**: plan
+- **Category**: reliability
+- **Where**: `internal/orchestrator/promote.go` (`rankFindings`), `internal/sleepcycle/publish.go` (`candidatesFromFindings`)
+- **Why**: `domain.ShrunkScore` was hoisted so "publication selection and verification auto-promotion must agree on which findings are the strongest". The two callers still diverge on which findings are rankable at all: publication drops anything failing `objective.Improves(baseline, value, direction)` and anything under `MinSupport`, while promotion drops only `support <= 0` and undecodable filters. A goal producing fewer than `AutoPromoteTopN` improving segments therefore spends verification budget on segments that move the objective the wrong way — ones publication would never surface. The surrounding loop is structurally identical in both, which makes the divergence easy to miss on inspection.
+- **Noted**: 2026-08-04
+
+### Close the remaining router coverage gaps (config sentinels, body cap, claim-decode asymmetry)
+
+- **Type**: direct
+- **Category**: testing
+- **Where**: `internal/orchestrator/promote.go` (`topN`), `internal/orchestrator/corrections.go`, `internal/store/goalregistry.go`, `internal/verifier/claim.go`
+- **Why**: Four unpinned behaviours. `topN` treats `n < 0` as unlimited and `n == 0` as nothing, mirrored by `reverifyStale`'s `limit >= 0` guard, and both values come straight from unclamped operator env (`ORCHESTRATOR_AUTOPROMOTE_TOP_N`, `ORCHESTRATOR_STALE_REVERIFY_CAP`) with only positive values ever tested — a mutation swapping the sentinels goes undetected. `Insert`'s `claim_error` parameter is never read back through the real registry. The correction endpoint's `MaxBytesReader` can be deleted with the suite green, on a route that takes no credential. And an undecodable stored claim is a hard dispatch error in `VerifyClaim` but a logged "absent" in `decodeClaim`, with neither behaviour tested, so it is unclear which is intended.
+- **Noted**: 2026-08-04
+
+### Goal-intent classification is unreliable enough that verify-track goals often silently become explore
+
+- **Type**: investigate
+- **Category**: reliability
+- **Where**: `internal/llm/classify.go` (`decodeGoalIntent`, `classifyGoalIntentSystem`), `internal/orchestrator/submit.go` (`classifyIntent`)
+- **Why**: Observed live 2026-08-04: registering the *same* verify-track goal text three times against `causal-demo.csv` produced verify only once. One attempt failed with `parse claim filters: invalid character 'p' looking for beginning of value` (the model emitted prose in the JSON-encoded `claim_filters` string), another returned verify with an empty `claim_filters` — both are hard errors that fall open to explore, which is the deliberate design but is indistinguishable to the analyst from "your goal was not a claim". Separately, an ungrounded claim (naming a missing column or value) reliably comes back as verify-with-empty-filters rather than as ungrounded filters, so the cannot-construct outcome and its `claim_error` almost never fire at intake — the Verifier's dispatch-time re-validation is the path that actually reaches it. Worth measuring the classifier's verify-recall before adding a repair round-trip or reporting the fall-open more loudly.
+- **Noted**: 2026-08-04
+
+### Rename the verifyGoal() test helper — it returns an explore-track goal
+
+- **Type**: direct
+- **Category**: testing
+- **Where**: `internal/orchestrator/causalverify_test.go` (declaration), with call sites in `corrections_test.go` and `promote_test.go`
+- **Why**: The name refers to the causal *verification* surface the helper was written for, not the routing track, but to anyone working on the router it reads as "a verify-track goal" — and it returns `Track: store.TrackExplore`. That produced a vacuous test in this session: a case asserting the claimless-verify-track promotion fallback used it without setting `Track`, so the branch under test was never entered and the mutation that should have killed the test survived; only re-running the mutation caught it. `verifyTrackGoal(t, field)` in `promote_test.go` is the helper that actually sets the track. A track-neutral name (`registeredGoal()`) removes the trap; ~a dozen mechanical call sites.
+- **Noted**: 2026-08-04

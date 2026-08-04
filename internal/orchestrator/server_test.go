@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +35,8 @@ type fakeGoals struct {
 	insertErr     error
 	list          []store.Goal
 	listErr       error
+	claimErrors   []string
+	claimErrorErr error
 }
 
 func (f *fakeGoals) Insert(_ context.Context, g store.Goal) error {
@@ -55,6 +58,13 @@ func (f *fakeGoals) Get(_ context.Context, _ string) (store.Goal, error) {
 }
 func (f *fakeGoals) List(_ context.Context) ([]store.Goal, error) {
 	return f.list, f.listErr
+}
+func (f *fakeGoals) SetClaimError(_ context.Context, _, reason string) error {
+	if f.claimErrorErr != nil {
+		return f.claimErrorErr
+	}
+	f.claimErrors = append(f.claimErrors, reason)
+	return nil
 }
 
 // setStatusCall records one SetStatus invocation, including the caller's context
@@ -230,7 +240,13 @@ func (q *fakeQueue) ListForGoal(_ context.Context, goalID string, status store.Q
 	return out, nil
 }
 
-type fakeAudits struct{ records []store.AuditRecord }
+// fakeAudits is guarded because auto-promotion audits from its own goroutine, which
+// outlives the run that spawned it -- a test reading the records right after runLoop
+// returns is concurrent with that write.
+type fakeAudits struct {
+	mu   sync.Mutex
+	recs []store.AuditRecord
+}
 
 func (f *fakeAudits) Append(ctx context.Context, r store.AuditRecord) error {
 	// A real pool fails a write on a cancelled context, so this does too --
@@ -238,8 +254,16 @@ func (f *fakeAudits) Append(ctx context.Context, r store.AuditRecord) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	f.records = append(f.records, r)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recs = append(f.recs, r)
 	return nil
+}
+
+func (f *fakeAudits) records() []store.AuditRecord {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]store.AuditRecord(nil), f.recs...)
 }
 
 type fakeObjects struct {
@@ -308,6 +332,10 @@ type fakeClaude struct {
 	extractErr        error
 	extractCalls      int
 	gotMethods        []string
+	intent            llm.GoalIntentResult
+	intentErr         error
+	intentCalls       int
+	gotIntentSchema   llm.SandboxSchema
 }
 
 func (f *fakeClaude) GenerateEvaluationMatrix(_ context.Context, _ string, schema llm.SandboxSchema, windowed bool) (domain.EvaluationMatrix, error) {
@@ -339,6 +367,20 @@ func (f *fakeClaude) IntrospectDocumentFields(_ context.Context, _, sample strin
 	f.gotSample = sample
 	return f.fields, f.fieldsErr
 }
+func (f *fakeClaude) ClassifyGoalIntent(_ context.Context, goal llm.GoalIntentInput) (llm.GoalIntentResult, error) {
+	f.intentCalls++
+	f.gotIntentSchema = goal.Schema
+	if f.intentErr != nil {
+		return llm.GoalIntentResult{}, f.intentErr
+	}
+	// An unset intent is the explore track, the default a classification that names no
+	// claim produces.
+	if f.intent.Track == "" {
+		return llm.GoalIntentResult{Track: llm.TrackExplore}, nil
+	}
+	return f.intent, nil
+}
+
 func (f *fakeClaude) Extract(_ context.Context, _ []byte, _ domain.TargetField, method string) (string, float64, error) {
 	f.extractCalls++
 	f.gotMethods = append(f.gotMethods, method)
@@ -390,6 +432,21 @@ type fakeRepo struct {
 	verifyErr      error
 	values         []valueCall
 	valueErr       error
+
+	// The causal surface the router reads and corrects: the findings auto-promotion
+	// ranks, the intervention an explicit verify looks up, and the corrections an
+	// analyst applies (recorded, with the served version they produced).
+	causalGraph       domain.CausalGraph
+	hasCausalGraph    bool
+	causalGraphErr    error
+	interventionsByID map[string]domain.Intervention
+	interventionErr   error
+	findings          []graph.CausalTriplet
+	findingsErr       error
+	corrections       []domain.EdgeCorrection
+	correctErr        error
+	correctedVersion  int
+	resolvedColumns   []string
 }
 
 func (f *fakeRepo) CreateState(_ context.Context, s domain.State) error {
@@ -456,7 +513,40 @@ func (f *fakeRepo) CorrectOutcome(_ context.Context, outcomeID string, value map
 }
 
 func (f *fakeRepo) GetCausalGraph(_ context.Context, _, _ string) (domain.CausalGraph, bool, error) {
-	return domain.CausalGraph{}, false, nil
+	return f.causalGraph, f.hasCausalGraph, f.causalGraphErr
+}
+
+func (f *fakeRepo) GetIntervention(_ context.Context, id string) (domain.Intervention, error) {
+	if f.interventionErr != nil {
+		return domain.Intervention{}, f.interventionErr
+	}
+	i, ok := f.interventionsByID[id]
+	if !ok {
+		return domain.Intervention{}, graph.ErrNotFound
+	}
+	return i, nil
+}
+
+func (f *fakeRepo) ListEligibleFindings(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
+	return f.findings, f.findingsErr
+}
+
+// CorrectCausalEdge answers with the graph's own spelling of the corrected columns,
+// as the real repository does -- resolvedColumns lets a test prove the caller
+// invalidates with those rather than with the analyst's.
+func (f *fakeRepo) CorrectCausalEdge(_ context.Context, _, _ string, correction domain.EdgeCorrection) (int, []string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.corrections = append(f.corrections, correction)
+	if f.correctErr != nil {
+		return 0, nil, f.correctErr
+	}
+	f.correctedVersion++
+	resolved := f.resolvedColumns
+	if resolved == nil {
+		resolved = []string{correction.From, correction.To}
+	}
+	return f.correctedVersion, resolved, nil
 }
 
 // polls reports how many times the blocking gate read an outcome's status.
@@ -534,15 +624,115 @@ func (f *fakeSandbox) Execute(_ context.Context, req ExecuteRequest) (ExecuteRes
 }
 
 type fakeLauncher struct {
-	jobName string
-	args    map[string]string
-	err     error
+	mu       sync.Mutex
+	jobName  string
+	args     map[string]string
+	launches []map[string]string
+	err      error
+	failFor  map[string]error
+	// onLaunch runs after a successful launch. It exists to simulate a client that
+	// hangs up while the dispatch is in flight, which is the only window in which a
+	// handler's post-dispatch bookkeeping can be lost to the request context.
+	onLaunch func()
 }
 
-func (f *fakeLauncher) Launch(_ context.Context, jobName string, args map[string]string) error {
+// Launch honours the context so a handler that dispatches on an already-cancelled
+// one cannot look correct here, and failFor lets a test fail a chosen dispatch while
+// the rest succeed -- the only way to drive per-dispatch failure isolation, which a
+// single all-or-nothing err cannot reach.
+func (f *fakeLauncher) Launch(ctx context.Context, jobName string, args map[string]string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failFor != nil {
+		if err := f.failFor[args["intervention_id"]]; err != nil {
+			return err
+		}
+	}
 	f.jobName = jobName
 	f.args = args
+	f.launches = append(f.launches, args)
+	if f.onLaunch != nil {
+		f.onLaunch()
+	}
 	return f.err
+}
+
+// dispatches returns the launches recorded so far, read under the lock because
+// auto-promotion runs on its own goroutine.
+func (f *fakeLauncher) dispatches() []map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]string(nil), f.launches...)
+}
+
+// fakeCausalVerifications is an in-memory causal-verification store: the listing the
+// analyst surface reads, and the staleness marking a correction applies. MarkStale
+// flags every record whose adjustment set touches a corrected column, mirroring the
+// store's own jsonb overlap test.
+type fakeCausalVerifications struct {
+	records     []store.CausalVerification
+	listErr     error
+	markErr     error
+	markedCols  []string
+	markedCalls int
+}
+
+func (f *fakeCausalVerifications) ListForGoal(_ context.Context, _ string) ([]store.CausalVerification, error) {
+	return f.records, f.listErr
+}
+
+// MarkStale mirrors the store's byte-exact jsonb overlap and, like it, returns only
+// the interventions this call flagged -- never the goal's whole stale history.
+func (f *fakeCausalVerifications) MarkStale(ctx context.Context, _ string, columns []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.markedCalls++
+	f.markedCols = columns
+	if f.markErr != nil {
+		return nil, f.markErr
+	}
+	var flagged []string
+	for i, rec := range f.records {
+		if rec.Status == store.CausalStatusPending || rec.Status == store.CausalStatusFailed {
+			continue
+		}
+		for _, col := range columns {
+			if slices.Contains(rec.AdjustmentSet, col) {
+				f.records[i].Stale = true
+				flagged = append(flagged, rec.InterventionID)
+				break
+			}
+		}
+	}
+	return flagged, nil
+}
+
+// fakeGraphLock stands in for the (goal, data-source) advisory lock, recording
+// acquisitions so a test can assert a correction ran under it -- and refusing them so
+// the contended path is deterministic.
+type fakeGraphLock struct {
+	acquired bool
+	// acquireAfter grants the lock once calls reaches it, so a test can exercise the
+	// poll loop rather than only its two terminal answers.
+	acquireAfter int
+	err          error
+	calls        int
+	released     int
+}
+
+func (f *fakeGraphLock) TryAcquireDiscoveryLock(context.Context, string, string) (func(), bool, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, false, f.err
+	}
+	if !f.acquired && (f.acquireAfter == 0 || f.calls < f.acquireAfter) {
+		return nil, false, nil
+	}
+	return func() { f.released++ }, true, nil
 }
 
 // fakeChat stands in for the streaming Claude, recording what the handler passed.
@@ -574,16 +764,31 @@ const testHITLThreshold = 0.8
 // than one per construction site -- and no test can silently pass a positional
 // argument into the wrong slot of a long positional call.
 type testServer struct {
-	repo              graphRepo
-	queue             verificationQueue
-	goals             goalStore
-	audits            auditStore
-	objects           objectStore
-	heur              heuristicsService
-	claude            claudeClient
-	sandbox           sandboxExecutor
-	localImportDir    string
-	internalAuthToken string
+	repo                graphRepo
+	queue               verificationQueue
+	goals               goalStore
+	audits              auditStore
+	objects             objectStore
+	heur                heuristicsService
+	claude              claudeClient
+	sandbox             sandboxExecutor
+	causalVerifications causalVerificationStore
+	graphLock           graphLocker
+	verifierJobs        JobLauncher
+	router              *RouterConfig
+	localImportDir      string
+	internalAuthToken   string
+}
+
+// defaultRouter is the shipped router policy, so a test that does not vary the knobs
+// exercises the same gating production runs under.
+func defaultRouter() RouterConfig {
+	return RouterConfig{
+		AutoPromoteEnabled:    true,
+		AutoPromoteTopN:       5,
+		AutoPromoteShrinkageK: 30,
+		StaleReverifyCap:      10,
+	}
 }
 
 // build wires the server, defaulting every collaborator the caller left unset and
@@ -596,18 +801,26 @@ func (ts testServer) build() *Server {
 		}
 		return set
 	}
+	router := defaultRouter()
+	if ts.router != nil {
+		router = *ts.router
+	}
 	srv := NewServer(
 		ts.repo,
 		orElse(ts.goals, &fakeGoals{}).(goalStore),
 		&fakeRuns{},
 		orElse(ts.queue, newFakeQueue()).(verificationQueue),
+		orElse(ts.causalVerifications, &fakeCausalVerifications{}).(causalVerificationStore),
+		orElse(ts.graphLock, &fakeGraphLock{acquired: true}).(graphLocker),
 		orElse(ts.audits, &fakeAudits{}).(auditStore),
 		orElse(ts.objects, &fakeObjects{}).(objectStore),
 		orElse(ts.heur, &fakeHeur{}).(heuristicsService),
 		orElse(ts.claude, &fakeClaude{}).(claudeClient),
 		&fakeChat{},
 		orElse(ts.sandbox, &fakeSandbox{}).(sandboxExecutor),
-		NewHub(), StubLauncher{}, StubLauncher{}, StubIdentity{ID: "analyst-test"},
+		NewHub(), StubLauncher{},
+		orElse(ts.verifierJobs, StubLauncher{}).(JobLauncher),
+		StubIdentity{ID: "analyst-test"}, router,
 		ts.localImportDir, "arborette-sleepcycle", ts.internalAuthToken,
 		testHITLThreshold, time.Minute,
 	)
@@ -736,8 +949,8 @@ func TestSubmitGoalSuccess(t *testing.T) {
 	if goals.inserted == nil || goals.inserted.OptimizationFunctionID != resp.OptimizationFunctionID {
 		t.Fatalf("goal not persisted with the returned id: %+v", goals.inserted)
 	}
-	if len(audits.records) != 1 || audits.records[0].Actor != "analyst-test" {
-		t.Fatalf("expected one audit record stamped with the stub identity: %+v", audits.records)
+	if len(audits.records()) != 1 || audits.records()[0].Actor != "analyst-test" {
+		t.Fatalf("expected one audit record stamped with the stub identity: %+v", audits.records())
 	}
 	// The introspected schema is fitted to the objective, not the goal text alone.
 	if len(claude.gotSchema.Columns) != 1 || claude.gotSchema.Columns[0].Name != "revenue" {

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/service"
 )
 
@@ -39,6 +40,18 @@ func (s *Server) handleVerificationEvent(w http.ResponseWriter, r *http.Request)
 	action, _ := req.Event["type"].(string)
 	if action == "" {
 		action = "verification_event"
+	}
+	// A claim the Verifier could not construct is the one event that also changes
+	// durable goal state: registration validated the claim against the schema, and a
+	// re-validation failure at dispatch time has no run to fail, so the reason is
+	// recorded on the goal itself. A write failure is logged, not fatal -- the audit
+	// append below is still the durable trail, and refusing the whole delivery would
+	// cost the analyst the SSE frame too.
+	if action == domain.ClaimConstructionFailed {
+		reason, _ := req.Event["reason"].(string)
+		if err := s.goals.SetClaimError(r.Context(), req.GoalID, reason); err != nil {
+			log.Printf("orchestrator: set claim error for %q: %v", req.GoalID, err)
+		}
 	}
 	if err := s.recordAudit(r.Context(), action, "causal_verification", req.Event); err != nil {
 		log.Printf("orchestrator: append verification audit: %v", err)

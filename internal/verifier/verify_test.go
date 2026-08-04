@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/rand"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -113,6 +114,27 @@ func (e *effectAnalyzer) Analyze(_ context.Context, req sandboxclient.AnalyzeReq
 	return sandboxclient.AnalyzeResponse{Kind: req.Kind, Strata: out}, nil
 }
 
+// Execute measures a plain filtered aggregate, the /execute surface the claim
+// reification uses for the goal's unfiltered global baseline. It is deliberately the
+// mean over the whole dataset rather than a segment complement -- the point of the
+// separate call is that the two are different numbers.
+func (e *effectAnalyzer) Execute(_ context.Context, req sandboxclient.ExecuteRequest) (sandboxclient.ExecuteResponse, error) {
+	var sum float64
+	var n int64
+	for _, r := range e.rows {
+		if !matchConstraints(r, req.Filters) {
+			continue
+		}
+		sum += numVal(r, req.ValueExpression.Column)
+		n++
+	}
+	value := map[string]any{}
+	if n > 0 {
+		value[req.ObjectiveLabel] = sum / float64(n)
+	}
+	return sandboxclient.ExecuteResponse{Value: value}, nil
+}
+
 func (e *effectAnalyzer) subsample(rows []groundtruth.Row, fraction float64) []groundtruth.Row {
 	out := make([]groundtruth.Row, 0, int(float64(len(rows))*fraction)+1)
 	for _, r := range rows {
@@ -173,10 +195,15 @@ func matchOne(r groundtruth.Row, c domain.Constraint) bool {
 // fakeVerifications is the leased-record seam for the VerifyOne unit tests, returning
 // programmed dispatch/complete outcomes and counting heartbeats.
 type fakeVerifications struct {
+	// mu guards heartbeats alone: the lease heartbeat is the one call this double
+	// takes from a goroutine the worker owns, which outlives no test but does run
+	// concurrently with the run under assertion.
+	mu             sync.Mutex
 	accepted       bool
 	dispatchErr    error
 	completeHeld   bool
 	dispatchCalls  int
+	dispatched     []store.CausalVerification
 	heartbeats     int
 	completeCalls  int
 	completeStatus string
@@ -189,6 +216,7 @@ type fakeVerifications struct {
 
 func (f *fakeVerifications) DispatchAccept(_ context.Context, rec store.CausalVerification) (store.CausalVerification, bool, error) {
 	f.dispatchCalls++
+	f.dispatched = append(f.dispatched, rec)
 	if f.dispatchErr != nil {
 		return store.CausalVerification{}, false, f.dispatchErr
 	}
@@ -197,8 +225,16 @@ func (f *fakeVerifications) DispatchAccept(_ context.Context, rec store.CausalVe
 }
 
 func (f *fakeVerifications) Heartbeat(_ context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.heartbeats++
 	return nil
+}
+
+func (f *fakeVerifications) heartbeatCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.heartbeats
 }
 
 func (f *fakeVerifications) Complete(_ context.Context, _, status string, naive, adjusted *float64, adjustmentSet []string, refScore, confidence *float64) (bool, error) {
@@ -395,6 +431,10 @@ func (s slowAnalyzer) Analyze(ctx context.Context, req sandboxclient.AnalyzeRequ
 	time.Sleep(s.delay)
 	return s.inner.Analyze(ctx, req)
 }
+func (s slowAnalyzer) Execute(ctx context.Context, req sandboxclient.ExecuteRequest) (sandboxclient.ExecuteResponse, error) {
+	time.Sleep(s.delay)
+	return s.inner.Execute(ctx, req)
+}
 
 // TestVerifyOneHeartbeatRenewsLease: a run whose analyze calls outlast the heartbeat
 // interval renews the lease at least once before completing.
@@ -408,7 +448,7 @@ func TestVerifyOneHeartbeatRenewsLease(t *testing.T) {
 	if err := w.VerifyOne(context.Background(), "goal", "i", "ref", true); err != nil {
 		t.Fatalf("VerifyOne: %v", err)
 	}
-	if v.heartbeats == 0 {
+	if v.heartbeatCount() == 0 {
 		t.Fatal("a slow run must renew the lease at least once")
 	}
 }

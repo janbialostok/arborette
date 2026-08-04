@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/arborette/arborette/internal/orchestrator"
 )
 
 // fakeRunner records dispatches and can block one run in-flight so the duplicate
@@ -15,6 +17,8 @@ type fakeRunner struct {
 	block       chan struct{}
 	calls       chan struct{}
 	verifyCalls chan struct{}
+	claimCalls  chan struct{}
+	budgeted    chan bool
 }
 
 func (f *fakeRunner) RunDiscovery(context.Context, string, string) error {
@@ -27,9 +31,19 @@ func (f *fakeRunner) RunDiscovery(context.Context, string, string) error {
 	return nil
 }
 
-func (f *fakeRunner) VerifyOne(context.Context, string, string, string, bool) error {
+func (f *fakeRunner) VerifyOne(_ context.Context, _, _, _ string, budgeted bool) error {
+	if f.budgeted != nil {
+		f.budgeted <- budgeted
+	}
 	if f.verifyCalls != nil {
 		f.verifyCalls <- struct{}{}
+	}
+	return nil
+}
+
+func (f *fakeRunner) VerifyClaim(context.Context, string, string) error {
+	if f.claimCalls != nil {
+		f.claimCalls <- struct{}{}
 	}
 	return nil
 }
@@ -96,4 +110,77 @@ func TestVerifierServeVerifyDispatch(t *testing.T) {
 		}
 		<-runner.verifyCalls
 	}
+}
+
+// TestVerifierServeClaimDispatch: a claim dispatch carries no intervention id (the
+// Verifier reifies one from the stored claim) and is accepted asynchronously.
+func TestVerifierServeClaimDispatch(t *testing.T) {
+	runner := &fakeRunner{claimCalls: make(chan struct{}, 1)}
+	srv := NewServer(runner, 1<<20)
+
+	if code := postVerification(srv, `{"goal_id":"g","datasource_ref":"r","kind":"claim"}`).Code; code != http.StatusAccepted {
+		t.Fatalf("claim dispatch status = %d, want 202", code)
+	}
+	<-runner.claimCalls
+}
+
+// TestVerifierServeBudgetedFlag: the budget flag arrives as the JSON string the
+// launcher's string-pair contract produces, and an unparseable one is a 400 rather
+// than a silent fall to unbudgeted -- misreading it would charge or spare the wrong
+// dispatch.
+func TestVerifierServeBudgetedFlag(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"budgeted", `{"goal_id":"g","datasource_ref":"r","kind":"verify","intervention_id":"i1","budgeted":"true"}`, true},
+		{"exempt", `{"goal_id":"g","datasource_ref":"r","kind":"verify","intervention_id":"i1","budgeted":"false"}`, false},
+		{"absent", `{"goal_id":"g","datasource_ref":"r","kind":"verify","intervention_id":"i1"}`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			runner := &fakeRunner{budgeted: make(chan bool, 1)}
+			srv := NewServer(runner, 1<<20)
+			if code := postVerification(srv, c.body).Code; code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202", code)
+			}
+			if got := <-runner.budgeted; got != c.want {
+				t.Fatalf("budgeted = %v, want %v", got, c.want)
+			}
+		})
+	}
+
+	srv := NewServer(&fakeRunner{}, 1<<20)
+	malformed := `{"goal_id":"g","datasource_ref":"r","kind":"verify","intervention_id":"i1","budgeted":"yes please"}`
+	if code := postVerification(srv, malformed).Code; code != http.StatusBadRequest {
+		t.Fatalf("malformed budgeted status = %d, want 400", code)
+	}
+}
+
+// TestVerifierServeAcceptsLauncherBody drives the serve surface with a body the
+// orchestrator's own launcher produced, rather than one this test hand-wrote. The
+// launcher marshals a map of string pairs verbatim, so every field crosses as a JSON
+// string -- a mismatch there is invisible to a fake-launcher unit test on either side
+// and would 400 every real dispatch.
+func TestVerifierServeAcceptsLauncherBody(t *testing.T) {
+	runner := &fakeRunner{verifyCalls: make(chan struct{}, 1), budgeted: make(chan bool, 1)}
+	backend := httptest.NewServer(NewServer(runner, 1<<20).Routes())
+	defer backend.Close()
+
+	launcher := orchestrator.NewHTTPLauncher(backend.URL+"/verifications", "", nil)
+	err := launcher.Launch(context.Background(), "arborette-verifier", map[string]string{
+		"kind":            "verify",
+		"goal_id":         "g",
+		"intervention_id": "i1",
+		"datasource_ref":  "r",
+		"budgeted":        "true",
+	})
+	if err != nil {
+		t.Fatalf("launcher-produced dispatch was rejected: %v", err)
+	}
+	if got := <-runner.budgeted; !got {
+		t.Fatalf("budgeted = false, want true from the launcher body")
+	}
+	<-runner.verifyCalls
 }

@@ -20,6 +20,13 @@ const (
 	EpochBlocking    EpochMode = "blocking"
 )
 
+// Goal tracks, aliased from the domain: the classifier produces these values and
+// this package persists them, so one declaration owns the spelling.
+const (
+	TrackExplore = domain.TrackExplore
+	TrackVerify  = domain.TrackVerify
+)
+
 // Goal is a registered optimization goal as persisted in goal_registry. A goal
 // carries exactly one objective form: a tabular goal has an EvaluationMatrix
 // (TargetFields empty); a document goal has TargetFields (a zero-value matrix).
@@ -27,6 +34,13 @@ const (
 // EntityKeyColumn and TimeColumn are the window bindings a windowed/entity-relative
 // objective compiles against; both empty when the goal has a plain aggregate
 // objective. They are always both set or both empty (validated at registration).
+//
+// Track is the routing track intake assigned. Claim is the raw jsonb of the
+// validated domain.ClaimSpec on the verify track, and nil on the explore track or
+// when the claim could not be constructed -- in which case ClaimError carries the
+// validation reason. Claim stays a raw []byte rather than a decoded struct so a
+// reader that only routes on Track never pays to decode it, and so the stored
+// document is handed to the Verifier byte-identical to what intake validated.
 type Goal struct {
 	OptimizationFunctionID string
 	GoalText               string
@@ -37,6 +51,9 @@ type Goal struct {
 	EpochMode              EpochMode
 	EntityKeyColumn        string
 	TimeColumn             string
+	Track                  string
+	Claim                  []byte
+	ClaimError             string
 	CreatedAt              time.Time
 }
 
@@ -60,7 +77,8 @@ func NewGoalRegistry(pool *Pool) *GoalRegistry {
 // store's NULL-scan convention.
 const goalColumns = "optimization_function_id, goal_text, evaluation_matrix, datasource_ref, " +
 	"target_fields, confidence_threshold, epoch_mode, " +
-	"coalesce(entity_key_column, ''), coalesce(time_column, ''), created_at"
+	"coalesce(entity_key_column, ''), coalesce(time_column, ''), " +
+	"track, claim, coalesce(claim_error, ''), created_at"
 
 // Insert persists a registered goal. A document goal writes a NULL
 // evaluation_matrix and populated target_fields; a tabular goal does the reverse.
@@ -83,19 +101,49 @@ func (g *GoalRegistry) Insert(ctx context.Context, goal Goal) error {
 	if epochMode == "" {
 		epochMode = EpochSpeculative
 	}
+	// The column list is explicit, so the column's SQL DEFAULT never fires: an unset
+	// track has to be defaulted here or a goal registered by a path that runs no
+	// classification (a document goal) would persist an empty track.
+	track := goal.Track
+	if track == "" {
+		track = TrackExplore
+	}
 	// An unbound window binding writes SQL NULL (not an empty string), so a windowed
 	// goal is cheaply distinguishable by its non-NULL columns.
 	entityKey := nullableText(goal.EntityKeyColumn)
 	timeColumn := nullableText(goal.TimeColumn)
 	_, err = g.pool.Exec(ctx,
 		"INSERT INTO goal_registry "+
-			"(optimization_function_id, goal_text, evaluation_matrix, datasource_ref, target_fields, confidence_threshold, epoch_mode, entity_key_column, time_column) "+
-			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+			"(optimization_function_id, goal_text, evaluation_matrix, datasource_ref, target_fields, confidence_threshold, epoch_mode, entity_key_column, time_column, track, claim, claim_error) "+
+			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
 		goal.OptimizationFunctionID, goal.GoalText, matrix, goal.DataSourceRef, targetFields,
 		goal.ConfidenceThreshold, epochMode, entityKey, timeColumn,
+		track, goal.Claim, nullableText(goal.ClaimError),
 	)
 	if err != nil {
 		return fmt.Errorf("insert goal: %w", err)
+	}
+	return nil
+}
+
+// SetClaimError records why a verify-track goal's claim could not be constructed.
+// It is the write behind the Verifier's re-validation failure report: the claim is
+// re-checked against the introspected schema at dispatch time, and a failure there
+// has no run to fail, so the goal row is where the analyst learns the reason.
+// A goal id that matches no row is reported as an error rather than a silent
+// success: the caller's only handling is to log, and an unrecorded reason that looks
+// like a recorded one leaves the analyst with a claimless verify goal and no
+// explanation anywhere.
+func (g *GoalRegistry) SetClaimError(ctx context.Context, optimizationFunctionID, reason string) error {
+	tag, err := g.pool.Exec(ctx,
+		"UPDATE goal_registry SET claim_error = $1 WHERE optimization_function_id = $2",
+		nullableText(reason), optimizationFunctionID,
+	)
+	if err != nil {
+		return fmt.Errorf("set claim error for %q: %w", optimizationFunctionID, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("set claim error for %q: no such goal", optimizationFunctionID)
 	}
 	return nil
 }
@@ -137,7 +185,8 @@ func (g *GoalRegistry) Get(ctx context.Context, optimizationFunctionID string) (
 		"SELECT "+goalColumns+" FROM goal_registry WHERE optimization_function_id = $1",
 		optimizationFunctionID,
 	).Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix, &goal.DataSourceRef, &targetFields,
-		&goal.ConfidenceThreshold, &goal.EpochMode, &goal.EntityKeyColumn, &goal.TimeColumn, &goal.CreatedAt)
+		&goal.ConfidenceThreshold, &goal.EpochMode, &goal.EntityKeyColumn, &goal.TimeColumn,
+		&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt)
 	if err != nil {
 		return Goal{}, fmt.Errorf("get goal %q: %w", optimizationFunctionID, err)
 	}
@@ -165,7 +214,8 @@ func (g *GoalRegistry) List(ctx context.Context) ([]Goal, error) {
 		var matrix, targetFields []byte
 		if err := rows.Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix,
 			&goal.DataSourceRef, &targetFields, &goal.ConfidenceThreshold, &goal.EpochMode,
-			&goal.EntityKeyColumn, &goal.TimeColumn, &goal.CreatedAt); err != nil {
+			&goal.EntityKeyColumn, &goal.TimeColumn,
+			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan goal row: %w", err)
 		}
 		if err := decodeGoalObjective(&goal, matrix, targetFields); err != nil {

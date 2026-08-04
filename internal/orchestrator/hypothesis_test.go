@@ -279,7 +279,7 @@ func TestRunLoopZeroRowSegmentIsNonFatal(t *testing.T) {
 		t.Fatalf("a zero-row segment must not write a triplet, got %d", len(repo.outcomes))
 	}
 	var zeroRow, branchFail int
-	for _, r := range audits.records {
+	for _, r := range audits.records() {
 		switch r.Action {
 		case "hypothesis_zero_row_segment":
 			zeroRow++
@@ -288,7 +288,7 @@ func TestRunLoopZeroRowSegmentIsNonFatal(t *testing.T) {
 		}
 	}
 	if zeroRow != 1 {
-		t.Fatalf("expected one hypothesis_zero_row_segment audit, got %d: %+v", zeroRow, audits.records)
+		t.Fatalf("expected one hypothesis_zero_row_segment audit, got %d: %+v", zeroRow, audits.records())
 	}
 	if branchFail != 0 {
 		t.Fatalf("a zero-row segment must not be recorded as a branch failure, got %d", branchFail)
@@ -442,7 +442,7 @@ func TestRunLoopZeroRowReproposalIsBounded(t *testing.T) {
 		t.Fatalf("the zero-row re-proposal budget is 1; got %d re-proposals", claude.treeRepairCalls)
 	}
 	zeroRow := 0
-	for _, r := range audits.records {
+	for _, r := range audits.records() {
 		if r.Action == "hypothesis_zero_row_segment" {
 			zeroRow++
 		}
@@ -523,13 +523,13 @@ func TestRunLoopTerminalOnMissingAggregation(t *testing.T) {
 		t.Fatalf("expected no execute calls, got %d", sandbox.execCalls)
 	}
 	found := false
-	for _, r := range audits.records {
+	for _, r := range audits.records() {
 		if r.Action == "hypothesis_branch_failure" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected a hypothesis_branch_failure audit, got %+v", audits.records)
+		t.Fatalf("expected a hypothesis_branch_failure audit, got %+v", audits.records())
 	}
 }
 
@@ -591,13 +591,13 @@ func TestRunLoopDropsUncorrectableCandidatesAndCompletes(t *testing.T) {
 		t.Fatalf("expected %d repair attempts before dropping, got %d", maxProposalRepairs, claude.treeRepairCalls)
 	}
 	found := false
-	for _, r := range audits.records {
+	for _, r := range audits.records() {
 		if r.Action == "hypothesis_branch_failure" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected a hypothesis_branch_failure audit for the dropped candidates: %+v", audits.records)
+		t.Fatalf("expected a hypothesis_branch_failure audit for the dropped candidates: %+v", audits.records())
 	}
 	assertOneStatus(t, runs, store.RunCompleted, "")
 }
@@ -666,13 +666,13 @@ func TestRunLoopRootRepairErrorIsNonTerminal(t *testing.T) {
 		t.Fatalf("expected one repair attempt before the transport error, got %d", claude.treeRepairCalls)
 	}
 	found := false
-	for _, r := range audits.records {
+	for _, r := range audits.records() {
 		if r.Action == "hypothesis_branch_failure" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected a hypothesis_branch_failure audit for the failed repair: %+v", audits.records)
+		t.Fatalf("expected a hypothesis_branch_failure audit for the failed repair: %+v", audits.records())
 	}
 	assertOneStatus(t, runs, store.RunCompleted, "")
 }
@@ -761,13 +761,13 @@ func TestRunLoopChildRepairErrorIsNonTerminal(t *testing.T) {
 		t.Fatalf("expected one child repair attempt, got %d", claude.treeRepairCalls)
 	}
 	found := false
-	for _, r := range audits.records {
+	for _, r := range audits.records() {
 		if r.Action == "hypothesis_branch_failure" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected a hypothesis_branch_failure audit for the failed child repair: %+v", audits.records)
+		t.Fatalf("expected a hypothesis_branch_failure audit for the failed child repair: %+v", audits.records())
 	}
 	assertOneStatus(t, runs, store.RunCompleted, "")
 }

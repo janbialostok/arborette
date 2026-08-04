@@ -49,6 +49,39 @@ const (
 	DirectionUnknown    EdgeDirection = "unknown"
 )
 
+// EdgeCorrectionOp is what an analyst's correction does to the discovered graph:
+// re-orient an edge the statistics produced, remove one the data suggested but the
+// analyst knows is not there, or add a known edge (typically a confounder) the tests
+// missed.
+type EdgeCorrectionOp string
+
+const (
+	CorrectionFlip   EdgeCorrectionOp = "flip"
+	CorrectionDelete EdgeCorrectionOp = "delete"
+	CorrectionAdd    EdgeCorrectionOp = "add"
+)
+
+// EdgeCorrection is one analyst edit to a goal's causal graph, naming the edge by its
+// two columns. From and To are read as cause→effect for flip and add, so an analyst
+// states the correction the way they think about it rather than in the canonical
+// pair's terms; Direction overrides that when set, which is how an edge is returned
+// to undirected. Delete ignores both.
+type EdgeCorrection struct {
+	Op        EdgeCorrectionOp
+	From      string
+	To        string
+	Direction EdgeDirection
+}
+
+// CorrectedDirection is the direction a correction asserts: the explicit one when the
+// analyst gave it, otherwise the one From→To encodes over the canonical pair.
+func (c EdgeCorrection) CorrectedDirection() EdgeDirection {
+	if c.Direction != "" {
+		return c.Direction
+	}
+	return DirectionForCause(c.From, c.To)
+}
+
 // DataColumn is a node in the discovered causal graph: one column of a (goal,
 // datasource) pair. ID is the synthesized deterministic id the graph MERGEs on
 // (the id-unique constraint cannot enforce a composite key); the composite parts

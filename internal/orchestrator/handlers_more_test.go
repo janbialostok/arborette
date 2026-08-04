@@ -39,10 +39,10 @@ func TestHandleAudit(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("valid audit status = %d, want 201", rec.Code)
 	}
-	if len(audits.records) != 1 {
-		t.Fatalf("expected one appended record, got %d", len(audits.records))
+	if len(audits.records()) != 1 {
+		t.Fatalf("expected one appended record, got %d", len(audits.records()))
 	}
-	got := audits.records[0]
+	got := audits.records()[0]
 	if got.Action != "sleep_cycle_done" || got.EventType != "job" || got.Actor != "analyst-test" {
 		t.Fatalf("record not stamped/populated as expected: %+v", got)
 	}
@@ -76,15 +76,15 @@ func TestInternalAuditRequiresTheSharedSecret(t *testing.T) {
 	if rec := post("Bearer wrong"); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong-token status = %d, want 401", rec.Code)
 	}
-	if len(audits.records) != 0 {
-		t.Fatalf("a rejected request must not reach the audit table, got %+v", audits.records)
+	if len(audits.records()) != 0 {
+		t.Fatalf("a rejected request must not reach the audit table, got %+v", audits.records())
 	}
 
 	if rec := post("Bearer " + token); rec.Code != http.StatusCreated {
 		t.Fatalf("authenticated status = %d, want 201", rec.Code)
 	}
-	if len(audits.records) != 1 {
-		t.Fatalf("expected the authenticated write to land, got %d record(s)", len(audits.records))
+	if len(audits.records()) != 1 {
+		t.Fatalf("expected the authenticated write to land, got %d record(s)", len(audits.records()))
 	}
 
 	// The guard stays scoped to the one internal route; see Routes for why.
@@ -165,8 +165,8 @@ func TestTriggerSleepCycle(t *testing.T) {
 		if launcher.jobName != "arborette-sleepcycle" || launcher.args["optimization_function_id"] != "g1" {
 			t.Fatalf("job not launched with the expected name/args: %q %v", launcher.jobName, launcher.args)
 		}
-		if len(audits.records) != 1 || audits.records[0].Action != "sleep_cycle_trigger" {
-			t.Fatalf("expected a sleep_cycle_trigger audit record: %+v", audits.records)
+		if len(audits.records()) != 1 || audits.records()[0].Action != "sleep_cycle_trigger" {
+			t.Fatalf("expected a sleep_cycle_trigger audit record: %+v", audits.records())
 		}
 	})
 
