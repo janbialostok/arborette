@@ -144,6 +144,15 @@ func wireWorker(ctx context.Context, cfg config.Config) (*sleepcycle.Worker, fun
 			MinSupport:      cfg.SleepCycle.MinSupport,
 			MinLift:         cfg.SleepCycle.MinLift,
 			MaxPublications: cfg.SleepCycle.MaxPublications,
+
+			Policy:                cfg.SleepCycle.Policy,
+			SchemaAtoms:           cfg.SleepCycle.SchemaAtoms,
+			UCTExploration:        cfg.SleepCycle.UCTExploration,
+			CausalMultiplierScale: cfg.SleepCycle.CausalMultiplierScale,
+			GroundingFraction:     cfg.SleepCycle.GroundingFraction,
+			RetrievalK:            cfg.SleepCycle.RetrievalK,
+			QuantileBins:          cfg.SleepCycle.QuantileBins,
+			CrossGoalGrounding:    cfg.SleepCycle.CrossGoalGrounding,
 		},
 	)
 	if err != nil {

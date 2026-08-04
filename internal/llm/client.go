@@ -51,6 +51,8 @@ type Client interface {
 	OrientCausalEdges(ctx context.Context, goalText string, columns []ColumnSemantics, edges []OrientEdge) ([]OrientDecision, error)
 	RepairOrientCausalEdges(ctx context.Context, goalText string, columns []ColumnSemantics, edges []OrientEdge, prior []OrientDecision, validationErr string) ([]OrientDecision, error)
 	ClassifyGoalIntent(ctx context.Context, goal GoalIntentInput) (GoalIntentResult, error)
+	CritiqueAtoms(ctx context.Context, goalText string, schema SandboxSchema) (AtomCritique, error)
+	GroundHeuristic(ctx context.Context, definition string, terms []OntologyTerm, schema SandboxSchema) ([]domain.Constraint, error)
 }
 
 // NewClient builds an LLM client from configuration. The LLM_PROVIDER env
@@ -288,6 +290,28 @@ func decodeProposal(body string) (Proposal, error) {
 		proposal.Candidates = append(proposal.Candidates, CandidateIntervention{Filters: filters})
 	}
 	return proposal, nil
+}
+
+// decodeFilterConjunction parses a JSON-encoded array of filter objects into a
+// typed conjunction. Every call whose output carries filters as a plain string
+// rather than a schema'd array — claim extraction, heuristic grounding — decodes
+// through it, so the shape the prompts describe and the shape the code accepts
+// cannot drift apart. An empty array decodes to an empty conjunction; what that
+// means is the caller's to decide.
+func decodeFilterConjunction(raw string) ([]domain.Constraint, error) {
+	var wire []filterWire
+	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
+		return nil, err
+	}
+	filters := make([]domain.Constraint, 0, len(wire))
+	for _, fw := range wire {
+		f, err := fw.toConstraint()
+		if err != nil {
+			return nil, err
+		}
+		filters = append(filters, f)
+	}
+	return filters, nil
 }
 
 func (f filterWire) toConstraint() (domain.Constraint, error) {

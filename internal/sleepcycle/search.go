@@ -4,8 +4,10 @@ import (
 	"context"
 	"log"
 	"slices"
+	"strconv"
 	"strings"
 
+	"github.com/arborette/arborette/internal/datasource"
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/objective"
@@ -26,11 +28,17 @@ type atom struct {
 
 // Node is one candidate macro-segment: a set of atoms identified by canonical
 // key, in ascending rank order, plus the conjoined filter they compile to.
+//
+// proposedBy names the Meta-Heuristic a policy adopted this conjunction from, and
+// is empty for a candidate the search built by conjoining atoms. It is carried to
+// the derived Intervention so a trace of the winner shows which prior knowledge
+// produced it.
 type Node struct {
-	keys      []string
-	ranks     []int
-	filters   []domain.Constraint
-	canonical string
+	keys       []string
+	ranks      []int
+	filters    []domain.Constraint
+	canonical  string
+	proposedBy string
 }
 
 // Order is the node's conjunction order — how many atoms it conjoins.
@@ -56,6 +64,15 @@ type Measurement struct {
 // inside Select would let Done report false and the following Select find
 // nothing. The driver defends against that anyway by treating an ok=false Select
 // as equivalent to Done.
+//
+// Candidate invariant, binding on every implementation: no generated candidate
+// conjoins two predicates sharing a (field, op) pair. Such a conjunction is either
+// redundant (the tighter bound subsumes the looser) or empty (two equalities on
+// one column), so measuring it spends budget on a segment that says nothing about
+// interaction — which is the only thing this search exists to find. A policy that
+// generates conjunctions atom by atom holds it with conflictsWithNode; one that
+// adopts a whole conjunction from elsewhere holds it with duplicateFieldOp, before
+// the candidate ever reaches Select.
 type SearchPolicy interface {
 	// Select returns the next unmeasured candidate; ok is false when none remain.
 	Select() (node *Node, ok bool)
@@ -99,7 +116,7 @@ type searchOutcome struct {
 func (o searchOutcome) winners(minSupport int64) []measuredNode {
 	var out []measuredNode
 	for _, m := range o.measured {
-		if m.node.Order() >= 2 && !m.measurement.Failed && m.measurement.Support >= minSupport {
+		if m.node.Order() >= 2 && !belowFloor(m.measurement, minSupport) {
 			out = append(out, m)
 		}
 	}
@@ -135,11 +152,216 @@ func buildAtoms(findings []graph.CausalTriplet) ([]atom, error) {
 	for _, a := range byKey {
 		atoms = append(atoms, *a)
 	}
+	return rankAtoms(atoms), nil
+}
+
+// buildSchemaAtoms derives an atom vocabulary from the data source's own schema
+// rather than from what Phase 1 happened to surface: one equality atom per
+// distinct value of a low-cardinality column, and a pair of threshold atoms (at or
+// below, above) per interior quantile cut of a numeric one. bins is the cut count
+// the introspection was asked for; below 2 no threshold atoms are derived, which
+// is also when the schema carries no cuts to derive them from.
+//
+// The atoms carry no source ids, deliberately. An enumerated predicate is not a
+// measured finding, so attaching Phase-1 provenance to it would link a winner
+// built from it to evidence that never existed; a winner built only from schema
+// atoms is abstracted from its own derived triplet alone, which the provenance
+// path already handles.
+//
+// Ranks are left unassigned: the caller merges this vocabulary with the
+// findings-derived one and ranks the union, so ranking here would be overwritten.
+func buildSchemaAtoms(schema sandboxclient.Schema, bins int) ([]atom, error) {
+	var atoms []atom
+	for _, col := range schema.Columns {
+		predicates := valuePredicates(col)
+		if bins >= 2 {
+			predicates = append(predicates, thresholdPredicates(col)...)
+		}
+		for _, c := range predicates {
+			key, err := CanonicalFilters([]domain.Constraint{c})
+			if err != nil {
+				return nil, err
+			}
+			atoms = append(atoms, atom{key: key, constraint: c})
+		}
+	}
+	return atoms, nil
+}
+
+// valuePredicates enumerates one equality predicate per distinct value of a
+// value-constrained column. The operand is typed from the column's own type, not
+// from the value's spelling: introspection reports every value cast to text, and
+// the sandbox rejects a filter whose operand type disagrees with its column, so an
+// untyped predicate would compile-fail on every boolean and integer column.
+func valuePredicates(col sandboxclient.Column) []domain.Constraint {
+	out := make([]domain.Constraint, 0, len(col.DistinctValues))
+	for _, v := range col.DistinctValues {
+		operand := columnLiteral(col.Type, v)
+		if operand == nil {
+			continue
+		}
+		out = append(out, domain.Constraint{Field: col.Name, Op: domain.Equal, Operand: operand})
+	}
+	return out
+}
+
+// thresholdPredicates enumerates the two-sided threshold predicates a numeric
+// column's quantile cuts define. Both sides are derived because the search ranks
+// on directional delta and a segment above a cut and one at or below it are
+// different populations, not complements of one ranking.
+func thresholdPredicates(col sandboxclient.Column) []domain.Constraint {
+	out := make([]domain.Constraint, 0, 2*len(col.QuantileCuts))
+	for _, cut := range col.QuantileCuts {
+		out = append(out,
+			domain.Constraint{Field: col.Name, Op: domain.LessThanOrEqual, Value: cut},
+			domain.Constraint{Field: col.Name, Op: domain.GreaterThan, Value: cut},
+		)
+	}
+	return out
+}
+
+// columnLiteral types one introspected value against its column, returning nil for
+// a value that does not parse as the column's type — a boolean column whose probe
+// returned something other than true/false has no well-typed equality to offer, and
+// inventing one would only fail at compile time.
+func columnLiteral(colType, value string) *domain.LiteralValue {
+	switch {
+	case datasource.IsBooleanType(colType):
+		b, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil
+		}
+		return &domain.LiteralValue{Bool: &b}
+	case datasource.IsNumericType(colType):
+		n, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return nil
+		}
+		return &domain.LiteralValue{Number: &n}
+	default:
+		v := value
+		return &domain.LiteralValue{String: &v}
+	}
+}
+
+// mergeAtoms unions the findings-derived vocabulary with the schema-derived one,
+// dropping every schema atom on an excluded column and ranking the result. It also
+// returns how many enumerated predicates the exclusions removed, so a caller
+// reporting that number reports the filtering that actually happened.
+//
+// The exclusion applies to the schema-derived side only: a findings-derived atom
+// is a predicate the hypothesis loop already measured against this objective, so
+// it is evidence, and a critic's opinion about a column does not retract evidence.
+// Findings-derived provenance also wins a key collision, since the two carry the
+// same predicate but only one carries the source ids that link a winner back to
+// the triplets it generalizes.
+func mergeAtoms(findingAtoms, schemaAtoms []atom, excluded []string) ([]atom, int) {
+	drop := make(map[string]bool, len(excluded))
+	for _, col := range excluded {
+		drop[strings.ToLower(col)] = true
+	}
+	merged := slices.Clone(findingAtoms)
+	byKey := make(map[string]bool, len(findingAtoms))
+	for _, a := range findingAtoms {
+		byKey[a.key] = true
+	}
+	dropped := 0
+	for _, a := range schemaAtoms {
+		if drop[strings.ToLower(a.constraint.Field)] {
+			dropped++
+			continue
+		}
+		if byKey[a.key] {
+			continue
+		}
+		byKey[a.key] = true
+		merged = append(merged, a)
+	}
+	return rankAtoms(merged), dropped
+}
+
+// rankAtoms sorts an atom set by canonical key and numbers it, so rank is a pure
+// function of the set and a re-run walks the lattice in the same order.
+func rankAtoms(atoms []atom) []atom {
 	slices.SortFunc(atoms, func(a, b atom) int { return strings.Compare(a.key, b.key) })
 	for i := range atoms {
 		atoms[i].rank = i
 	}
-	return atoms, nil
+	return atoms
+}
+
+// conflictsWithNode reports whether conjoining an atom onto a node would breach the
+// policy contract's candidate invariant: two predicates on the same (field, op)
+// pair. Fields are compared case-insensitively, mirroring the sandbox compiler's
+// own column resolution, so two spellings of one column still collide.
+func conflictsWithNode(n *Node, a atom) bool {
+	for _, f := range n.filters {
+		if f.Op == a.constraint.Op && strings.EqualFold(f.Field, a.constraint.Field) {
+			return true
+		}
+	}
+	return false
+}
+
+// duplicateFieldOp reports whether a whole conjunction already breaches the same
+// invariant. It is the check for a candidate adopted intact rather than built atom
+// by atom, which never passes through conflictsWithNode.
+func duplicateFieldOp(filters []domain.Constraint) bool {
+	seen := make(map[string]bool, len(filters))
+	for _, f := range filters {
+		key := strings.ToLower(f.Field) + "\x00" + string(f.Op)
+		if seen[key] {
+			return true
+		}
+		seen[key] = true
+	}
+	return false
+}
+
+// belowFloor is the one reading of a measurement the support floor turns on: a
+// failed measurement has unknown support, which counts as insufficient, and a
+// successful one is judged against the floor. It has a name because the pruning
+// rules and the winner gate must agree on it — a divergence there would prune what
+// the gate would have accepted, or write back what the search thought starved.
+func belowFloor(m Measurement, minSupport int64) bool {
+	return m.Failed || m.Support < minSupport
+}
+
+// prunedBySubset applies the Apriori rule against measured evidence: a candidate is
+// unmeasurable-by-implication when any of its subsets came back below the support
+// floor or failed, since conjoining cannot grow support.
+//
+// Two subset families are checked, and both are load-bearing. Each single predicate,
+// because a starved predicate can never appear in any winner however the candidate
+// was reached — neither policy generates conjunctions in an order that guarantees a
+// starved predicate's pair was measured first, so the (k−1) family alone leaks at
+// order 3 and above. And each (k−1)-subset, because a pair can fall below the floor
+// while both its predicates clear it: {1,2,3} reached through a frequent {1,2} still
+// contains {1,3}, and must be dropped when that was measured below floor.
+//
+// Only *measured* evidence prunes — an unmeasured subset (never generated, or
+// dropped by width) says nothing about support, and letting it prune would disguise
+// a policy's own pruning as support-pruning. Both policies share it so the rule
+// cannot drift.
+func prunedBySubset(keys []string, memo map[string]Measurement, minSupport int64) bool {
+	for _, key := range keys {
+		if m, measured := memo[key]; measured && belowFloor(m, minSupport) {
+			return true
+		}
+	}
+	for skip := range keys {
+		subset := make([]string, 0, len(keys)-1)
+		for i, k := range keys {
+			if i != skip {
+				subset = append(subset, k)
+			}
+		}
+		m, measured := memo[canonicalKeyOf(subset)]
+		if measured && belowFloor(m, minSupport) {
+			return true
+		}
+	}
+	return false
 }
 
 func appendMissing(dst []string, ids ...string) []string {

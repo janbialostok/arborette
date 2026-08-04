@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"sort"
 	"strings"
 	"testing"
@@ -20,9 +21,32 @@ import (
 // a floor of 0 and a lift of 0 keep support and lift out of the way so a test
 // exercises exactly the axis it names. The publication cap is the production
 // default rather than 0, because every worker test constructs through
-// NewWorker's validation, which refuses a cap below 1.
+// NewWorker's validation, which refuses a cap below 1. The policy knobs are the
+// shipped defaults except Policy, which stays on the beam so the pre-existing
+// search tests keep measuring the policy they were written for; uctConfig is the
+// opt-in for the cases that exercise the other one.
 func testConfig() Config {
-	return Config{MaxMeasurements: 200, BeamWidth: 10, MaxOrder: 3, MinSupport: 0, MinLift: 0, MaxPublications: 20}
+	return Config{
+		MaxMeasurements:       200,
+		BeamWidth:             10,
+		MaxOrder:              3,
+		MinSupport:            0,
+		MinLift:               0,
+		MaxPublications:       20,
+		Policy:                policyBeam,
+		UCTExploration:        math.Sqrt2,
+		CausalMultiplierScale: 1,
+		GroundingFraction:     0.3,
+		RetrievalK:            8,
+		QuantileBins:          3,
+		CrossGoalGrounding:    true,
+	}
+}
+
+func uctConfig() Config {
+	cfg := testConfig()
+	cfg.Policy = policyUCT
+	return cfg
 }
 
 // segmentKey names a candidate by its filter columns, which is how the tests
@@ -122,6 +146,16 @@ type fakeRepo struct {
 	heuristics        []domain.MetaHeuristic
 	abstractedFrom    map[string][]string
 	cleared           []string
+	// Each of these reads carries an error hook so a test can pin the
+	// degrade-not-abort behaviour.
+	corpus               map[string]domain.MetaHeuristic
+	corpusErr            error
+	sourceFilters        map[string][][]domain.Constraint
+	sourceFiltersErr     error
+	interventionEvidence map[string]graph.CausalEvidence
+	heuristicEvidence    map[string]graph.CausalEvidence
+	evidenceErr          error
+	sourceFilterCalls    int
 }
 
 func newFakeRepo() *fakeRepo {
@@ -130,6 +164,8 @@ func newFakeRepo() *fakeRepo {
 		getErr:         map[string]error{},
 		createErrs:     map[string]error{},
 		abstractedFrom: map[string][]string{},
+		corpus:         map[string]domain.MetaHeuristic{},
+		sourceFilters:  map[string][][]domain.Constraint{},
 	}
 }
 
@@ -207,6 +243,44 @@ func (f *fakeRepo) ClearEmbeddingPending(_ context.Context, id string) error {
 func (f *fakeRepo) ListMetaHeuristics(context.Context) ([]domain.MetaHeuristic, error) {
 	return f.metaHeuristics, f.metaHeuristicsErr
 }
+func (f *fakeRepo) GetMetaHeuristics(_ context.Context, ids []string) ([]domain.MetaHeuristic, error) {
+	if f.corpusErr != nil {
+		return nil, f.corpusErr
+	}
+	out := make([]domain.MetaHeuristic, 0, len(ids))
+	for _, id := range ids {
+		if mh, ok := f.corpus[id]; ok {
+			out = append(out, mh)
+		}
+	}
+	return out, nil
+}
+func (f *fakeRepo) AbstractionSourceFilters(_ context.Context, mhID string) ([][]domain.Constraint, error) {
+	f.sourceFilterCalls++
+	if f.sourceFiltersErr != nil {
+		return nil, f.sourceFiltersErr
+	}
+	return f.sourceFilters[mhID], nil
+}
+func (f *fakeRepo) CausalEvidenceForInterventions(_ context.Context, ids []string) (map[string]graph.CausalEvidence, error) {
+	return f.evidenceFor(f.interventionEvidence, ids)
+}
+func (f *fakeRepo) CausalEvidenceForHeuristics(_ context.Context, ids []string) (map[string]graph.CausalEvidence, error) {
+	return f.evidenceFor(f.heuristicEvidence, ids)
+}
+
+func (f *fakeRepo) evidenceFor(source map[string]graph.CausalEvidence, ids []string) (map[string]graph.CausalEvidence, error) {
+	if f.evidenceErr != nil {
+		return nil, f.evidenceErr
+	}
+	out := map[string]graph.CausalEvidence{}
+	for _, id := range ids {
+		if e, ok := source[id]; ok {
+			out[id] = e
+		}
+	}
+	return out, nil
+}
 
 func stringProp(v any) string {
 	s, _ := v.(string)
@@ -234,6 +308,7 @@ type fakeSandbox struct {
 	omitRowCount bool
 
 	introspectCalls int
+	introspectReq   sandboxclient.IntrospectRequest
 	execCalls       int
 	measured        []string
 }
@@ -252,8 +327,9 @@ func newFakeSandbox() *fakeSandbox {
 	}
 }
 
-func (f *fakeSandbox) Introspect(context.Context, sandboxclient.IntrospectRequest) (sandboxclient.IntrospectResponse, error) {
+func (f *fakeSandbox) Introspect(_ context.Context, req sandboxclient.IntrospectRequest) (sandboxclient.IntrospectResponse, error) {
 	f.introspectCalls++
+	f.introspectReq = req
 	return sandboxclient.IntrospectResponse{Schema: f.schema}, f.introspectErr
 }
 
@@ -321,10 +397,19 @@ type fakeClaude struct {
 	// per-segment test does not have to reason about how far a shared script has
 	// advanced across segments.
 	alwaysLeak    string
+	terms         []llm.OntologyTerm
 	abstractErr   error
 	repairErr     error
 	abstractCalls int
 	repairCalls   int
+	critique      llm.AtomCritique
+	critiqueErr   error
+	critiqueCall  int
+	grounded      map[string][]domain.Constraint
+	groundErr     error
+	groundCalls   int
+	groundTerms   []llm.OntologyTerm
+	groundSchema  llm.SandboxSchema
 }
 
 func (f *fakeClaude) next() string {
@@ -343,7 +428,7 @@ func (f *fakeClaude) AbstractMetaHeuristic(context.Context, string, llm.MacroSeg
 	if f.abstractErr != nil {
 		return llm.Abstraction{}, f.abstractErr
 	}
-	return llm.Abstraction{Definition: f.next()}, nil
+	return llm.Abstraction{Definition: f.next(), OntologyTerms: f.terms}, nil
 }
 
 func (f *fakeClaude) RepairMetaHeuristic(context.Context, string, llm.MacroSegment, llm.Abstraction, string) (llm.Abstraction, error) {
@@ -351,16 +436,40 @@ func (f *fakeClaude) RepairMetaHeuristic(context.Context, string, llm.MacroSegme
 	if f.repairErr != nil {
 		return llm.Abstraction{}, f.repairErr
 	}
-	return llm.Abstraction{Definition: f.next()}, nil
+	return llm.Abstraction{Definition: f.next(), OntologyTerms: f.terms}, nil
+}
+
+func (f *fakeClaude) CritiqueAtoms(context.Context, string, llm.SandboxSchema) (llm.AtomCritique, error) {
+	f.critiqueCall++
+	if f.critiqueErr != nil {
+		return llm.AtomCritique{}, f.critiqueErr
+	}
+	return f.critique, nil
+}
+
+func (f *fakeClaude) GroundHeuristic(_ context.Context, definition string, terms []llm.OntologyTerm, schema llm.SandboxSchema) ([]domain.Constraint, error) {
+	f.groundCalls++
+	f.groundTerms = terms
+	f.groundSchema = schema
+	if f.groundErr != nil {
+		return nil, f.groundErr
+	}
+	return f.grounded[definition], nil
 }
 
 type fakeProvider struct {
-	err   error
-	calls int
+	err        error
+	queryErr   error
+	calls      int
+	queryCalls int
 }
 
+// EmbedQuery is the read path's embedding; the abstraction write path must never
+// reach it, so this counts calls instead of failing, letting a caller assert the
+// absence.
 func (f *fakeProvider) EmbedQuery(context.Context, string) ([]float32, error) {
-	return nil, errors.New("the write path must use EmbedDocument")
+	f.queryCalls++
+	return []float32{0.1, 0.2}, f.queryErr
 }
 func (f *fakeProvider) EmbedDocument(context.Context, string) ([]float32, error) {
 	f.calls++
@@ -376,6 +485,11 @@ type fakeEmbeddings struct {
 	refsErr      error
 	setGoalErr   error
 	goalRepaired map[string]string
+	scored       []store.ScoredRef
+	scoredErr    error
+	scoredCalls  int
+	scoredScope  store.SearchScope
+	scoredK      int
 }
 
 func (f *fakeEmbeddings) Upsert(_ context.Context, nodeID, goalID string, _ []float32) error {
@@ -392,6 +506,13 @@ func (f *fakeEmbeddings) Upsert(_ context.Context, nodeID, goalID string, _ []fl
 
 func (f *fakeEmbeddings) ListNodeRefs(context.Context) ([]store.NodeRef, error) {
 	return f.refs, f.refsErr
+}
+
+func (f *fakeEmbeddings) SimilaritySearchScored(_ context.Context, _ []float32, k int, scope store.SearchScope) ([]store.ScoredRef, error) {
+	f.scoredCalls++
+	f.scoredScope = scope
+	f.scoredK = k
+	return f.scored, f.scoredErr
 }
 
 func (f *fakeEmbeddings) SetGoalID(_ context.Context, nodeID, goalID string) error {

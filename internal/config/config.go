@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -208,6 +209,14 @@ type MCPConfig struct {
 //
 // Port is the serve-mode listen port -- serve mode is the local/long-running
 // alternative to the one-shot Batch job, driven by the Orchestrator's HTTPLauncher.
+//
+// Policy selects the traversal strategy: the level-wise beam, or the
+// knowledge-guided tree search that consults the accumulated Meta-Heuristic corpus.
+// It is a stage-level choice rather than a search knob, which is why its env name
+// carries no SEARCH segment. It defaults to the tree search on the strength of the
+// calibration regression, which measures both over a dataset with a known planted
+// structure; set it back to "beam" to revert without a deploy. What the remaining
+// knobs mean is documented on sleepcycle.Config, which consumes and validates them.
 type SleepCycleConfig struct {
 	Port              string
 	SandboxURL        string
@@ -219,6 +228,15 @@ type SleepCycleConfig struct {
 	MinSupport        int
 	MinLift           float64
 	MaxPublications   int
+
+	Policy                string
+	SchemaAtoms           bool
+	UCTExploration        float64
+	CausalMultiplierScale float64
+	GroundingFraction     float64
+	RetrievalK            int
+	QuantileBins          int
+	CrossGoalGrounding    bool
 }
 
 // VerifierConfig drives the Verifier (Engine B, stage 1: causal discovery). Port is
@@ -439,6 +457,15 @@ func Load() (Config, error) {
 			MinSupport:        intEnv("SLEEPCYCLE_SEARCH_MIN_SUPPORT", 30),
 			MinLift:           floatEnv("SLEEPCYCLE_SEARCH_MIN_LIFT", 0.05),
 			MaxPublications:   intEnv("SLEEPCYCLE_MAX_PUBLICATIONS", 20),
+
+			Policy:                env("SLEEPCYCLE_POLICY", "uct"),
+			SchemaAtoms:           boolEnv("SLEEPCYCLE_SEARCH_SCHEMA_ATOMS", false),
+			UCTExploration:        floatEnv("SLEEPCYCLE_SEARCH_UCT_EXPLORATION", math.Sqrt2),
+			CausalMultiplierScale: floatEnv("SLEEPCYCLE_SEARCH_CAUSAL_MULTIPLIER_SCALE", 1.0),
+			GroundingFraction:     floatEnv("SLEEPCYCLE_SEARCH_GROUNDING_FRACTION", 0.3),
+			RetrievalK:            intEnv("SLEEPCYCLE_SEARCH_RETRIEVAL_K", 8),
+			QuantileBins:          intEnv("SLEEPCYCLE_SEARCH_QUANTILE_BINS", 3),
+			CrossGoalGrounding:    boolEnv("SLEEPCYCLE_SEARCH_CROSS_GOAL_GROUNDING", true),
 		},
 		Verifier: VerifierConfig{
 			Port:                 env("VERIFIER_PORT", "8085"),

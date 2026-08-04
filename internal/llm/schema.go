@@ -163,6 +163,33 @@ func classifyGoalIntentSchema() map[string]any {
 	}, "track", "rationale", "claim_filters", "claim_direction")
 }
 
+// critiqueAtomsSchema is the structured-output schema for CritiqueAtoms: the columns
+// a search must not segment on and an optional ranking of the ones worth trying
+// first. Both ride as JSON-encoded strings rather than schema'd arrays, because a
+// column set is dataset-sized and growing — the axis the constrained-decoding
+// grammar has a ceiling on — and both are grounded to the real columns
+// deterministically after generation, which keeps this schema static per code
+// version and so statically cacheable.
+func critiqueAtomsSchema() map[string]any {
+	return object(props{
+		"excluded_columns": stringProp(),
+		"ranked_columns":   stringProp(),
+		"rationale":        stringProp(),
+	}, "excluded_columns", "ranked_columns", "rationale")
+}
+
+// groundHeuristicSchema is the structured-output schema for GroundHeuristic: the
+// filter conjunction the heuristic re-expresses to on this data source, plus the
+// mapping rationale. The conjunction is a JSON-encoded string for the same reason
+// the extracted claim's is — dataset-sized filter columns and values — leaving the
+// schema flat, static, and free of enums.
+func groundHeuristicSchema() map[string]any {
+	return object(props{
+		"filters":   stringProp(),
+		"rationale": stringProp(),
+	}, "filters", "rationale")
+}
+
 // constraintItem is the schema for one matrix hard-constraint. The field is a plain
 // string (grounded via the prompt, validated after generation); only the op keeps
 // its fixed-cardinality enum. It stays numeric-only because it is shared with

@@ -137,7 +137,7 @@ func (p *beamPolicy) advance() {
 func (p *beamPolicy) frontier() []*Node {
 	survivors := make([]measuredNode, 0, len(p.results))
 	for _, r := range p.results {
-		if !r.measurement.Failed && r.measurement.Support >= p.minSupport {
+		if !belowFloor(r.measurement, p.minSupport) {
 			survivors = append(survivors, r)
 		}
 	}
@@ -158,17 +158,18 @@ func (p *beamPolicy) frontier() []*Node {
 }
 
 // expand conjoins each frontier node with every higher-ranked atom, dropping any
-// candidate the Apriori rule already rules out.
+// candidate that would breach the policy contract's (field, op) invariant or that
+// the Apriori rule already rules out.
 func (p *beamPolicy) expand(frontier []*Node) []*Node {
 	var candidates []*Node
 	for _, f := range frontier {
 		top := f.ranks[len(f.ranks)-1]
 		for _, a := range p.atoms {
-			if a.rank <= top {
+			if a.rank <= top || conflictsWithNode(f, a) {
 				continue
 			}
 			child := conjoin(f, a)
-			if p.prunedBySubset(child) {
+			if prunedBySubset(child.keys, p.memo, p.minSupport) {
 				continue
 			}
 			candidates = append(candidates, child)
@@ -177,39 +178,27 @@ func (p *beamPolicy) expand(frontier []*Node) []*Node {
 	return candidates
 }
 
-// prunedBySubset applies the Apriori rule against measured evidence: drop a
-// candidate unmeasured if ANY of its (k−1)-subsets came back below the support
-// floor or failed, since support cannot grow by conjoining.
-//
-// Checking every subset rather than just the generating prefix is what makes the
-// guarantee hold off-prefix: {1,2,3} generated from a frequent {1,2} still
-// contains {1,3}, and must be dropped when that was below floor. Only *measured*
-// evidence prunes — an unmeasured subset (never generated, or dropped by width)
-// says nothing about support, and letting it prune would disguise width-pruning
-// as support-pruning.
-func (p *beamPolicy) prunedBySubset(node *Node) bool {
-	for skip := range node.keys {
-		subset := make([]string, 0, len(node.keys)-1)
-		for i, k := range node.keys {
-			if i != skip {
-				subset = append(subset, k)
-			}
-		}
-		m, measured := p.memo[canonicalKeyOf(subset)]
-		if measured && (m.Failed || m.Support < p.minSupport) {
-			return true
-		}
-	}
-	return false
-}
-
-// conjoin builds the child node adding one higher-ranked atom to a frontier node.
-// Ranks stay ascending, so the child's own top rank is the atom just added.
+// conjoin builds the child node adding one atom to a parent node, inserting it so
+// the node's atoms stay in ascending rank order. The beam only ever adds an atom
+// ranked above the parent's top, so the insert lands at the end there; a policy
+// that conjoins in any order still yields a node holding the shape Node documents.
+// The proposing heuristic carries forward: refining an adopted conjunction does not
+// make it any less that heuristic's suggestion.
 func conjoin(parent *Node, a atom) *Node {
-	keys := append(append([]string{}, parent.keys...), a.key)
-	ranks := append(append([]int{}, parent.ranks...), a.rank)
-	filters := append(append([]domain.Constraint{}, parent.filters...), a.constraint)
-	return &Node{keys: keys, ranks: ranks, filters: filters, canonical: canonicalKeyOf(keys)}
+	at := 0
+	for at < len(parent.ranks) && parent.ranks[at] < a.rank {
+		at++
+	}
+	keys := slices.Insert(slices.Clone(parent.keys), at, a.key)
+	ranks := slices.Insert(slices.Clone(parent.ranks), at, a.rank)
+	filters := slices.Insert(slices.Clone(parent.filters), at, a.constraint)
+	return &Node{
+		keys:       keys,
+		ranks:      ranks,
+		filters:    filters,
+		canonical:  canonicalKeyOf(keys),
+		proposedBy: parent.proposedBy,
+	}
 }
 
 // canonicalKeyOf joins per-atom canonical keys into a node key. Each atom key is

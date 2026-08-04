@@ -45,9 +45,32 @@ const liftEpsilon = 1e-9
 // is nothing to optimize and no conjoinable segment to search.
 var errDocumentGoal = errors.New("sleep cycle is not applicable to a document goal: it has no objective to optimize")
 
+// maxQuantileBins is the largest cut count the introspection will be asked for. It
+// mirrors the sandbox's own bin cap, which rejects a larger request with a 400 —
+// and introspection is a terminal step, so an out-of-range knob would fail every
+// run of every goal rather than degrading. Validating it here turns that into one
+// startup error naming the knob.
+const maxQuantileBins = 32
+
+const (
+	policyBeam = "beam"
+	policyUCT  = "uct"
+)
+
 // Config is the search's tuning, held package-locally rather than as a
 // config.SleepCycleConfig so internal/config stays a cmd/-only dependency
 // (infra-constructor convention). cmd/sleepcycle translates one into the other.
+//
+// The policy knobs tune the knowledge-guided traversal and the vocabulary it
+// searches. Policy selects the traversal; SchemaAtoms opts the
+// vocabulary into schema-derived predicates on top of the findings-derived ones;
+// UCTExploration is PUCT's exploration constant; CausalMultiplierScale is how much
+// a fully-confident causal verification multiplies a value estimate;
+// GroundingFraction is the share of the root's expansions spent adopting retrieved
+// conjunctions; RetrievalK is how many heuristics the grounding retrieval asks for;
+// QuantileBins is the cut count the introspection derives threshold predicates
+// from (0 = no threshold predicates); CrossGoalGrounding is the kill switch
+// narrowing that retrieval back to the running goal.
 type Config struct {
 	MaxMeasurements int
 	BeamWidth       int
@@ -55,6 +78,15 @@ type Config struct {
 	MinSupport      int
 	MinLift         float64
 	MaxPublications int
+
+	Policy                string
+	SchemaAtoms           bool
+	UCTExploration        float64
+	CausalMultiplierScale float64
+	GroundingFraction     float64
+	RetrievalK            int
+	QuantileBins          int
+	CrossGoalGrounding    bool
 }
 
 func (c Config) validate() error {
@@ -71,6 +103,18 @@ func (c Config) validate() error {
 		return fmt.Errorf("min lift must not be negative, got %v", c.MinLift)
 	case c.MaxPublications < 1:
 		return fmt.Errorf("max publications must be at least 1, got %d", c.MaxPublications)
+	case c.Policy != policyBeam && c.Policy != policyUCT:
+		return fmt.Errorf("policy must be %q or %q, got %q", policyBeam, policyUCT, c.Policy)
+	case c.UCTExploration <= 0:
+		return fmt.Errorf("uct exploration constant must be positive, got %v", c.UCTExploration)
+	case c.CausalMultiplierScale < 0:
+		return fmt.Errorf("causal multiplier scale must not be negative, got %v", c.CausalMultiplierScale)
+	case c.GroundingFraction < 0 || c.GroundingFraction > 1:
+		return fmt.Errorf("grounding fraction must be in [0, 1], got %v", c.GroundingFraction)
+	case c.RetrievalK < 1:
+		return fmt.Errorf("retrieval k must be at least 1, got %d", c.RetrievalK)
+	case c.QuantileBins != 0 && (c.QuantileBins < 2 || c.QuantileBins > maxQuantileBins):
+		return fmt.Errorf("quantile bins must be 0 or in [2, %d], got %d", maxQuantileBins, c.QuantileBins)
 	}
 	return nil
 }
@@ -89,9 +133,13 @@ type searchRepo interface {
 	CreatePreConditionFor(ctx context.Context, stateID, interventionID string) error
 	CreateProduced(ctx context.Context, interventionID, outcomeID string, edge domain.ProducedEdge) error
 	GetMetaHeuristic(ctx context.Context, id string) (domain.MetaHeuristic, error)
+	GetMetaHeuristics(ctx context.Context, ids []string) ([]domain.MetaHeuristic, error)
 	CreateMetaHeuristic(ctx context.Context, mh domain.MetaHeuristic, abstractedFrom []string) error
 	ClearEmbeddingPending(ctx context.Context, id string) error
 	ListMetaHeuristics(ctx context.Context) ([]domain.MetaHeuristic, error)
+	AbstractionSourceFilters(ctx context.Context, metaHeuristicID string) ([][]domain.Constraint, error)
+	CausalEvidenceForInterventions(ctx context.Context, interventionIDs []string) (map[string]graph.CausalEvidence, error)
+	CausalEvidenceForHeuristics(ctx context.Context, metaHeuristicIDs []string) (map[string]graph.CausalEvidence, error)
 }
 
 type sandboxExecutor interface {
@@ -102,12 +150,15 @@ type sandboxExecutor interface {
 type claudeClient interface {
 	AbstractMetaHeuristic(ctx context.Context, goalText string, seg llm.MacroSegment) (llm.Abstraction, error)
 	RepairMetaHeuristic(ctx context.Context, goalText string, seg llm.MacroSegment, prior llm.Abstraction, validationErr string) (llm.Abstraction, error)
+	CritiqueAtoms(ctx context.Context, goalText string, schema llm.SandboxSchema) (llm.AtomCritique, error)
+	GroundHeuristic(ctx context.Context, definition string, terms []llm.OntologyTerm, schema llm.SandboxSchema) ([]domain.Constraint, error)
 }
 
 type embeddingStore interface {
 	Upsert(ctx context.Context, nodeID, goalID string, embedding []float32) error
 	ListNodeRefs(ctx context.Context) ([]store.NodeRef, error)
 	SetGoalID(ctx context.Context, nodeID, goalID string) error
+	SimilaritySearchScored(ctx context.Context, query []float32, k int, scope store.SearchScope) ([]store.ScoredRef, error)
 }
 
 type goalStore interface {
@@ -232,7 +283,14 @@ func (w *Worker) Run(ctx context.Context, goalID string) (err error) {
 	w.sweepStale(ctx, goalID)
 	w.reconcileEmbeddings(ctx)
 
-	introspect, err := w.sandbox.Introspect(ctx, sandboxclient.IntrospectRequest{DataSourceRef: goal.DataSourceRef})
+	// The quantile probe is requested only when the vocabulary will use it: the cuts
+	// cost a scan per numeric column, and a run searching findings-derived atoms
+	// alone has nothing to derive threshold predicates for.
+	introspectReq := sandboxclient.IntrospectRequest{DataSourceRef: goal.DataSourceRef}
+	if w.cfg.SchemaAtoms {
+		introspectReq.QuantileBins = w.cfg.QuantileBins
+	}
+	introspect, err := w.sandbox.Introspect(ctx, introspectReq)
 	if err != nil {
 		return fmt.Errorf("introspect: %w", err)
 	}
@@ -263,19 +321,16 @@ func (w *Worker) Run(ctx context.Context, goalID string) (err error) {
 	}
 	bestSingle := bestSingleSegment(findings, obj, int64(w.cfg.MinSupport))
 
-	atoms, err := buildAtoms(findings)
+	findingAtoms, err := buildAtoms(findings)
 	if err != nil {
 		return fmt.Errorf("build atoms: %w", err)
 	}
-	// No conjunction is formable either when there are fewer than two distinct
-	// predicates or when the order cap forbids conjoining at all. The order clause
-	// is load-bearing: with plenty of atoms and MaxOrder 1 the atom count alone
-	// would pass while no conjunction can exist.
+
 	var written []winner
-	if len(atoms) < 2 || w.cfg.MaxOrder < 2 {
-		searchSkipped = "no conjunction formable"
+	policy, atoms, skipped := w.selectPolicy(ctx, target, goal.GoalText, obj, introspect.Schema, findingAtoms, findings, baseline, bestSingle)
+	if skipped != "" {
+		searchSkipped = skipped
 	} else {
-		policy := newBeamPolicy(atoms, w.cfg, baseline, obj.Direction)
 		outcome := w.runSearch(ctx, target, obj, policy)
 		measurements = len(outcome.measured)
 		if segments := w.materiallyBetter(outcome, bestSingle, obj); len(segments) > 0 {
@@ -283,7 +338,6 @@ func (w *Worker) Run(ctx context.Context, goalID string) (err error) {
 			winners = len(written)
 		}
 	}
-
 	cands := append(w.candidatesFromFindings(ctx, goalID, findings, obj, baseline),
 		w.candidatesFromWinners(written, atoms, obj, baseline)...)
 	selected := selectPublications(cands, w.cfg.MaxPublications)

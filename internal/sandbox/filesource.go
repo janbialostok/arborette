@@ -76,6 +76,15 @@ func (s *FileSource) Kind() datasource.SourceKind { return datasource.KindTabula
 // guaranteed by emitting only DESCRIBE/SELECT over the ephemeral connection, not
 // by any access_mode.
 func (s *FileSource) Introspect(ctx context.Context) (*datasource.Schema, error) {
+	return s.IntrospectQuantiles(ctx, 0)
+}
+
+// IntrospectQuantiles is Introspect with an opt-in quantile probe: with bins at
+// least 2 every numeric column additionally reports its bins-1 interior cut
+// points, over the same staged engine, so a caller deriving threshold predicates
+// pays no extra download or parse. Zero bins is exactly Introspect, which is what
+// keeps the extension additive for every existing caller.
+func (s *FileSource) IntrospectQuantiles(ctx context.Context, bins int) (*datasource.Schema, error) {
 	db, tableFn, cleanup, err := s.stage(ctx)
 	if err != nil {
 		return nil, err
@@ -89,7 +98,33 @@ func (s *FileSource) Introspect(ctx context.Context) (*datasource.Schema, error)
 	if err := s.probeDistinctValues(ctx, db, tableFn, cols); err != nil {
 		return nil, err
 	}
+	if err := s.probeQuantileCuts(ctx, db, tableFn, cols, bins); err != nil {
+		return nil, err
+	}
 	return &datasource.Schema{Kind: datasource.KindTabular, Columns: cols}, nil
+}
+
+// probeQuantileCuts fills QuantileCuts for each numeric column over the same staged
+// engine. A column whose quantiles all came back NULL — constant or empty — is left
+// nil rather than carrying an empty set, so a consumer cannot mistake "no usable
+// boundary" for "probed and none needed".
+func (s *FileSource) probeQuantileCuts(ctx context.Context, db *sql.DB, tableFn string, cols []datasource.Column, bins int) error {
+	if bins < 2 {
+		return nil
+	}
+	for i := range cols {
+		if !isNumeric(cols[i].Type) {
+			continue
+		}
+		cuts, err := s.quantileCuts(ctx, db, tableFn, cols[i].Name, bins)
+		if err != nil {
+			return err
+		}
+		if len(cuts) > 0 {
+			cols[i].QuantileCuts = cuts
+		}
+	}
+	return nil
 }
 
 // probeDistinctValues fills DistinctValues for each low-cardinality categorical
@@ -260,16 +295,9 @@ func (s *FileSource) Analyze(ctx context.Context, req AnalyzeRequest) (AnalyzeRe
 }
 
 func (s *FileSource) analyzeContingency(ctx context.Context, db *sql.DB, tableFn string, cols []datasource.Column, req AnalyzeRequest) (AnalyzeResponse, error) {
-	cuts := map[int][]float64{}
-	for i, c := range req.Columns {
-		if c.Bins <= 0 {
-			continue
-		}
-		got, err := s.quantileCuts(ctx, db, tableFn, c.Name, c.Bins)
-		if err != nil {
-			return AnalyzeResponse{}, err
-		}
-		cuts[i] = got
+	cuts, err := s.binnedCuts(ctx, db, tableFn, cols, req.Columns)
+	if err != nil {
+		return AnalyzeResponse{}, err
 	}
 
 	query, args, err := compileContingency(tableFn, cols, req.Columns, req.Filters, cuts)
@@ -376,16 +404,9 @@ func (s *FileSource) analyzeMoments(ctx context.Context, db *sql.DB, tableFn str
 // stays a null pointer rather than a spurious zero — the positivity signal the caller
 // gates on.
 func (s *FileSource) analyzeEffect(ctx context.Context, db *sql.DB, tableFn string, cols []datasource.Column, req AnalyzeRequest) (AnalyzeResponse, error) {
-	cuts := map[int][]float64{}
-	for i, c := range req.Adjust {
-		if c.Bins <= 0 {
-			continue
-		}
-		got, err := s.quantileCuts(ctx, db, tableFn, c.Name, c.Bins)
-		if err != nil {
-			return AnalyzeResponse{}, err
-		}
-		cuts[i] = got
+	cuts, err := s.binnedCuts(ctx, db, tableFn, cols, req.Adjust)
+	if err != nil {
+		return AnalyzeResponse{}, err
 	}
 
 	query, args, err := compileStratifiedEffect(tableFn, cols, req, cuts)
@@ -429,6 +450,37 @@ func (s *FileSource) analyzeEffect(ctx context.Context, db *sql.DB, tableFn stri
 		return AnalyzeResponse{}, fmt.Errorf("effect query: %w", err)
 	}
 	return AnalyzeResponse{Kind: req.Kind, Strata: strata}, nil
+}
+
+// binnedCuts precomputes the quantile cut points of every binned column in a
+// request, keyed by the column's request index for the compile step to bind.
+//
+// It resolves and type-checks each column first, because the probe runs ahead of
+// the compiler that would otherwise catch it: quantile_cont over a categorical
+// column reaches DuckDB as a binder error, which masks to a 500, where the same
+// request rejected at compile time is the analyst-fixable 400 that says which
+// column cannot be binned. Both analyze kinds share it so the two cannot diverge on
+// which error a caller sees.
+func (s *FileSource) binnedCuts(ctx context.Context, db *sql.DB, tableFn string, cols []datasource.Column, columns []AnalyzeColumn) (map[int][]float64, error) {
+	cuts := map[int][]float64{}
+	for i, c := range columns {
+		if c.Bins <= 0 {
+			continue
+		}
+		col, err := resolveColumn(cols, c.Name)
+		if err != nil {
+			return nil, err
+		}
+		if !isNumeric(col.Type) {
+			return nil, fmt.Errorf("%w: binned column %q (%s)", errNonNumeric, col.Name, col.Type)
+		}
+		got, err := s.quantileCuts(ctx, db, tableFn, col.Name, c.Bins)
+		if err != nil {
+			return nil, err
+		}
+		cuts[i] = got
+	}
+	return cuts, nil
 }
 
 // quantileCuts reads one column's bins-1 interior quantile cut points over the

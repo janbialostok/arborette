@@ -143,51 +143,15 @@ func (t coarseType) String() string {
 	}
 }
 
-// numericTypes is the canonical DuckDB numeric set. DECIMAL is handled by prefix
-// (DESCRIBE reports fixed-point columns as DECIMAL(p,s), common in Parquet) so an
-// exact-string match would spuriously reject them.
-var numericTypes = map[string]bool{
-	"TINYINT":   true,
-	"SMALLINT":  true,
-	"INTEGER":   true,
-	"BIGINT":    true,
-	"HUGEINT":   true,
-	"UTINYINT":  true,
-	"USMALLINT": true,
-	"UINTEGER":  true,
-	"UBIGINT":   true,
-	"UHUGEINT":  true,
-	"FLOAT":     true,
-	"DOUBLE":    true,
-}
-
-// integerTypes is the DuckDB integer set (numericTypes minus the floating-point
-// and fixed-point kinds). Distinct-value probing is restricted to these plus
-// text and boolean columns, so a FLOAT/DOUBLE/DECIMAL column -- effectively
-// continuous, never under a low-cardinality cap -- is not probed.
-var integerTypes = map[string]bool{
-	"TINYINT":   true,
-	"SMALLINT":  true,
-	"INTEGER":   true,
-	"BIGINT":    true,
-	"HUGEINT":   true,
-	"UTINYINT":  true,
-	"USMALLINT": true,
-	"UINTEGER":  true,
-	"UBIGINT":   true,
-	"UHUGEINT":  true,
-}
-
 // isProbeableForDistinctValues reports whether a column's type is in the
 // low-cardinality categorical surface value grounding probes: text, boolean, or
 // integer. Floating-point, fixed-point, and temporal columns are effectively
 // continuous, so they are never probed for distinct values.
 func isProbeableForDistinctValues(t string) bool {
-	u := strings.ToUpper(strings.TrimSpace(t))
-	if integerTypes[u] {
+	if datasource.IsIntegerType(t) {
 		return true
 	}
-	switch columnCoarseType(u) {
+	switch columnCoarseType(t) {
 	case typeBoolean, typeString:
 		return true
 	default:
@@ -864,13 +828,12 @@ func columnCoarseType(t string) coarseType {
 	switch {
 	case isNumeric(u):
 		return typeNumeric
-	case u == "BOOLEAN" || u == "BOOL":
+	case datasource.IsBooleanType(u):
 		return typeBoolean
 	case strings.HasPrefix(u, "VARCHAR"), strings.HasPrefix(u, "CHAR"),
 		strings.HasPrefix(u, "TEXT"), u == "BPCHAR", u == "STRING":
 		return typeString
-	case strings.HasPrefix(u, "DATE"), strings.HasPrefix(u, "TIME"),
-		strings.HasPrefix(u, "TIMESTAMP"):
+	case datasource.IsTemporalType(u):
 		return typeTemporal
 	default:
 		return typeString
@@ -907,15 +870,7 @@ func resolveColumn(cols []datasource.Column, field string) (datasource.Column, e
 	}
 }
 
-// isNumeric reports whether a DuckDB column type is aggregatable as a number,
-// including any DECIMAL(p,s).
-func isNumeric(t string) bool {
-	u := strings.ToUpper(strings.TrimSpace(t))
-	if numericTypes[u] {
-		return true
-	}
-	return strings.HasPrefix(u, "DECIMAL")
-}
+func isNumeric(t string) bool { return datasource.IsNumericType(t) }
 
 // quoteIdent double-quotes a validated identifier, escaping embedded quotes.
 func quoteIdent(name string) string {

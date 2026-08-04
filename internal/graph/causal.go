@@ -121,6 +121,58 @@ func (r *Neo4jRepository) CausalEvidenceForHeuristics(ctx context.Context, metaH
 	return res.(map[string]CausalEvidence), nil
 }
 
+// CausalEvidenceForInterventions returns the live causal evidence behind each of the
+// given Interventions, keyed by intervention id and absent for those with none. It
+// is CausalEvidenceForHeuristics without the heuristic hop: the Sleep-Cycle search
+// weights its value estimates by whether a candidate's constituent findings were
+// causally verified, and those findings are Interventions, not abstractions.
+//
+// It is one query rather than a GetCausalEvidence per finding, because the search
+// weights every eligible finding on every run and a per-id read would put that many
+// round trips in front of the first measurement. It is exempt from the
+// observational-only collection filter by design, as the other causal reads are.
+func (r *Neo4jRepository) CausalEvidenceForInterventions(ctx context.Context, interventionIDs []string) (map[string]CausalEvidence, error) {
+	if len(interventionIDs) == 0 {
+		return map[string]CausalEvidence{}, nil
+	}
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (i:"+labelIntervention+")-[e:"+domain.Produced+"]->(:"+labelOutcome+") "+
+				"WHERE i.id IN $ids AND e.epistemic_source = $source AND coalesce(e.superseded, false) = false "+
+				"RETURN i.id AS iid, e ORDER BY e.graph_version",
+			map[string]any{"ids": interventionIDs, "source": string(domain.EpistemicCausalInferred)},
+		)
+		if err != nil {
+			return nil, err
+		}
+		recs, err := result.Collect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]CausalEvidence, len(recs))
+		for _, rec := range recs {
+			iid, _ := rec.Get("iid")
+			interventionID, ok := iid.(string)
+			if !ok {
+				continue
+			}
+			rel, err := recordRelationship(rec, "e")
+			if err != nil {
+				return nil, err
+			}
+			// Ascending graph_version, so a later row is the more recent verification
+			// and overwriting is what leaves the latest one — matching the
+			// single-intervention read's ORDER BY graph_version DESC LIMIT 1.
+			out[interventionID] = causalEvidenceFromRelationship(interventionID, rel)
+		}
+		return out, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get causal evidence for interventions: %w", err)
+	}
+	return res.(map[string]CausalEvidence), nil
+}
+
 func causalEvidenceFromRelationship(interventionID string, rel neo4j.Relationship) CausalEvidence {
 	effect, _ := rel.Props["effect_size"].(float64)
 	confidence, _ := rel.Props["confidence"].(float64)

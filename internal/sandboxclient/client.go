@@ -34,12 +34,16 @@ const RowCountKey = "row_count"
 
 // Column is one introspected column name and its type. DistinctValues carries the
 // column's distinct value set when it is a low-cardinality categorical column, and
-// is nil otherwise (high-cardinality, continuous, or not probed); omitempty so the
-// legacy value-less schema is unchanged on the wire.
+// is nil otherwise (high-cardinality, continuous, or not probed); QuantileCuts
+// carries a numeric column's interior quantile cut points when the request asked
+// for them, and is nil otherwise (non-numeric, not requested, or a constant column
+// whose quantiles came back NULL). Both are omitempty so the legacy value-less
+// schema is unchanged on the wire.
 type Column struct {
-	Name           string   `json:"name"`
-	Type           string   `json:"type"`
-	DistinctValues []string `json:"distinct_values,omitempty"`
+	Name           string    `json:"name"`
+	Type           string    `json:"type"`
+	DistinctValues []string  `json:"distinct_values,omitempty"`
+	QuantileCuts   []float64 `json:"quantile_cuts,omitempty"`
 }
 
 // Schema is a data source's introspected shape.
@@ -57,10 +61,13 @@ type TargetBinding struct {
 }
 
 // IntrospectRequest asks the sandbox for a data source's schema plus a binding
-// of each optimization target to a column.
+// of each optimization target to a column. QuantileBins opts into per-numeric-
+// column quantile cut points (0 = off, otherwise at least 2 and within the
+// sandbox's bin cap); omitempty so the legacy request is unchanged on the wire.
 type IntrospectRequest struct {
 	DataSourceRef string          `json:"data_source_ref"`
 	Targets       []domain.Target `json:"targets"`
+	QuantileBins  int             `json:"quantile_bins,omitempty"`
 }
 
 // IntrospectResponse returns the schema and per-target column bindings. For a

@@ -86,6 +86,7 @@ const (
 	PropDataSourceRef        = "data_source_ref"
 	PropSupport              = "support"
 	PropClaimDerived         = "claim_derived"
+	PropProposedBy           = "proposed_by_meta_heuristic_id"
 )
 
 // State is a snapshot/telemetry point in time. GoalID scopes it to the
@@ -135,6 +136,16 @@ type Outcome struct {
 	Provenance *ProvenanceLocator
 }
 
+// OntologyTerm maps one concrete, dataset-bound variable to the universal
+// structural term an abstraction replaced it with. Persisting the mapping beside
+// the definition is what lets a later run re-instantiate a heuristic against real
+// columns: the definition alone names only bracketed terms, so without the pairs
+// the only route back to a filter is to re-derive it from scratch.
+type OntologyTerm struct {
+	Concrete    string `json:"concrete"`
+	Ontological string `json:"ontological"`
+}
+
 // MetaHeuristic is a semantic abstraction produced during the Sleep Cycle. Its
 // embedding lives in pgvector keyed by ID; EmbeddingPending is true from node
 // creation until the pgvector write succeeds. Stale marks a heuristic whose
@@ -142,12 +153,21 @@ type Outcome struct {
 // optimization function whose abstraction run wrote it, scoping the node's
 // embedding to that goal; a legacy node created before goal scoping carries an
 // empty GoalID until a later run relinks it.
+//
+// OntologyTerms, OriginGoalID, and OriginDataSourceRef are the abstraction's
+// provenance, recorded so a reuse path can tell same-dataset re-instantiation
+// (the origin ref matches, and the term map resolves every bracketed term) from
+// cross-dataset grounding. All three are empty on a node written before they were
+// persisted, which is exactly the signal to route it through grounding.
 type MetaHeuristic struct {
-	ID               string
-	Definition       string
-	GoalID           string
-	EmbeddingPending bool
-	Stale            bool
+	ID                  string
+	Definition          string
+	GoalID              string
+	EmbeddingPending    bool
+	Stale               bool
+	OntologyTerms       []OntologyTerm
+	OriginGoalID        string
+	OriginDataSourceRef string
 }
 
 // ProducedEdge carries the measured effect size and a self-reported confidence

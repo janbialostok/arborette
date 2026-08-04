@@ -472,3 +472,35 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Where**: `internal/orchestrator/causalverify_test.go` (declaration), with call sites in `corrections_test.go` and `promote_test.go`
 - **Why**: The name refers to the causal *verification* surface the helper was written for, not the routing track, but to anyone working on the router it reads as "a verify-track goal" — and it returns `Track: store.TrackExplore`. That produced a vacuous test in this session: a case asserting the claimless-verify-track promotion fallback used it without setting `Track`, so the branch under test was never entered and the mutation that should have killed the test survived; only re-running the mutation caught it. `verifyTrackGoal(t, field)` in `promote_test.go` is the helper that actually sets the track. A track-neutral name (`registeredGoal()`) removes the trap; ~a dozen mechanical call sites.
 - **Noted**: 2026-08-04
+
+### Consolidate the duplicated schema/column-value adapters into internal/sandboxclient
+
+- **Type**: plan
+- **Category**: refactor
+- **Where**: `internal/sleepcycle/grounding.go` (`llmSchema`, `distinctValues`), `internal/orchestrator/hypothesis.go` (`toSandboxSchema`, `columnValues`), `internal/verifier/claim.go` (inline names+values loop in `groundingFailure`)
+- **Why**: Three near-identical copies of two adapters. The orchestrator's `schemaDTO` is a type alias for `sandboxclient.Schema`, so its adapter and sleepcycle's have identical signatures *and* byte-identical bodies under two names; the value indexer exists three times, named `distinctValues` in one package and `columnValues` in another. Both feed `domain.UnknownFilterColumns`/`UnknownFilterValues`, which live in `domain` precisely because several services must agree on the grounding check — the adapters that build their arguments belong together too. Verified there is no import-cycle obstacle: `internal/llm` imports only `domain` and `config`, so hosting them in `internal/sandboxclient` (adding a `sandboxclient → llm` edge) is acyclic. `internal/domain` is not viable — it would have to name `llm.SandboxSchema`, breaking its dependency-free rule, which is why `UnknownFilterValues` takes a plain `map[string][]string`. Deferred from the knowledge-guided sleep-cycle change because consolidating would widen it into two more services.
+- **Noted**: 2026-08-04
+
+### Reuse heuristics.Service for the Sleep Cycle's retrieve-then-hydrate instead of copying it
+
+- **Type**: plan
+- **Category**: refactor
+- **Where**: `internal/sleepcycle/grounding.go` (`groundProposals`), `internal/heuristics/service.go` (`Query`, `retireOrphans`), `internal/store/embeddingstore.go` (`SimilaritySearchScored`)
+- **Why**: `groundProposals` reproduces `Service.Query` statement for statement — embed the query, similarity-search, batch `GetMetaHeuristics`, index by id, walk in retrieval order rather than graph order — down to restating the same "walk the search's order, not the batch's" comment in both places. The copy also drops the self-healing the original has: `Query` retires a pgvector row whose graph node is gone (gated on one live sibling), while grounding skips the `!ok` lookup and leaves the orphan to be retrieved again on every future run — so the reuse path re-pays for a dead row indefinitely and the corpus never converges. `Service` already owns both collaborators and `SimilaritySearchScored` now exists, so adding a scored variant there and calling it from the Sleep Cycle gives the reuse path orphan retirement for free and leaves one implementation. Deferred from the knowledge-guided sleep-cycle change because it restructures the grounding path and moves collaborator ownership.
+- **Noted**: 2026-08-04
+
+### Reject DuckDB composite (LIST/ARRAY) column types in the shared classifier, and decide on INTERVAL
+
+- **Type**: direct
+- **Category**: reliability
+- **Where**: `internal/datasource/datasource.go` (`IsNumericType`, `IsTemporalType`, and the test table in `datasource_test.go`), consumed at `internal/sandbox/compile.go` (aggregate target check, numeric-threshold filter guard, `columnCoarseType`)
+- **Why**: Verified against the pinned engine (DuckDB 1.4.1): a list column's `DESCRIBE` type is literally `DECIMAL(10,2)[]` / `TIMESTAMP[]`, `filesource.go` maps every DESCRIBE row through with no composite filter, and both spellings pass the `HasPrefix` tests. The compiler then admits the column and DuckDB rejects it at execution — `Binder Error: No function matches ... 'avg(DECIMAL(10,2)[])'` — which `writeStageErr` masks as a 500, where the whole point of compile-time validation is an analyst-fixable 400. Fix: reject a type containing `[` before the prefix tests. Separately `duckdb_types()` puts INTERVAL in the DATETIME category, which `IsTemporalType`'s DATE/TIME prefixes miss, so an INTERVAL column is refused as a window `ORDER BY` at registration though DuckDB orders intervals fine (Parquet-only; `read_csv_auto` never infers it) — either add it or say the omission is deliberate. Both predate the consolidation but belong here now that this package is the single documented owner and its test claims exhaustiveness. Deferred because closing them changes what the sandbox compiler accepts.
+- **Noted**: 2026-08-04
+
+### Bundle selectPolicy's run-scoped inputs into a struct
+
+- **Type**: direct
+- **Category**: refactor
+- **Where**: `internal/sleepcycle/policy.go` (`selectPolicy`), with call sites in `worker.go`, `grounding_test.go`, `knowledge_run_test.go`
+- **Why**: Nine positional parameters, two of which carry the same input (`findings`, and `findingAtoms` which is `buildAtoms(findings)`), one consulted for a single field (`obj.Direction`), and a `target` that already holds the goal id and data-source ref — so the callee re-splits what the caller joined. The cost is at the call sites: the production call runs past 120 columns and the test calls are positional soup. The package already has the model in `searchTarget` ("run-invariant addressing"), so a sibling `searchInputs` built once in `Run` and passed as `(ctx, target, inputs)` fixes it; a small `policyChoice{policy, atoms, skipReason}` return would additionally make the documented "a nil policy always comes with a reason" invariant expressible in the type. Raised in two independent review rounds and skipped both times as shape rather than defect — the semantic ambiguity in the middle return value was fixed separately. Same class as the `NewServer` positional-parameter entry above, different package and remedy.
+- **Noted**: 2026-08-04

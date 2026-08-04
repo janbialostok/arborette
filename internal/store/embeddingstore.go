@@ -199,8 +199,39 @@ func (s SearchScope) validate() error {
 }
 
 // SimilaritySearch returns up to the k nearest node_ids to the query vector by
-// cosine distance (the <=> operator, matching the hnsw vector_cosine_ops index),
-// filtered by the scope and the store's distance floor.
+// cosine distance, filtered by the scope and the store's distance floor. It is the
+// id-only projection of SimilaritySearchScored, which holds the query, its
+// transaction, and the constraints both entry points enforce.
+func (e *EmbeddingStore) SimilaritySearch(ctx context.Context, query []float32, k int, scope SearchScope) ([]string, error) {
+	refs, err := e.SimilaritySearchScored(ctx, query, k, scope)
+	if err != nil {
+		return nil, err
+	}
+	if refs == nil {
+		return nil, nil
+	}
+	ids := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ids = append(ids, ref.NodeID)
+	}
+	return ids, nil
+}
+
+// ScoredRef is one similarity hit with the cosine distance that ranked it, for a
+// caller that weights hits rather than only ordering them. Distance is in [0, 2]
+// (the <=> operator's range), so 0 is an exact match.
+type ScoredRef struct {
+	NodeID   string
+	Distance float64
+}
+
+// SimilaritySearchScored returns up to the k nearest node_ids to the query vector
+// by cosine distance (the <=> operator, matching the hnsw vector_cosine_ops index),
+// each with the distance that ranked it, filtered by the scope and the store's
+// distance floor. It carries the distance because a consumer that weights knowledge
+// by how close it is (a search prior, a confidence) cannot recover it from an
+// ordered id list, and re-reading it per hit would cost a second scan of the same
+// neighbourhood.
 //
 // The scope's goal predicate and the floor are applied as post-filters over the
 // hnsw candidate neighbourhood, so a goal-scoped query over a corpus dominated
@@ -211,7 +242,7 @@ func (s SearchScope) validate() error {
 // of that scope within the floor) up to hnsw.max_scan_tuples (default 20000
 // tuples scanned) -- exhaustive at expected corpus scale; revisit that GUC with
 // the floor calibration if the corpus ever approaches the bound.
-func (e *EmbeddingStore) SimilaritySearch(ctx context.Context, query []float32, k int, scope SearchScope) ([]string, error) {
+func (e *EmbeddingStore) SimilaritySearchScored(ctx context.Context, query []float32, k int, scope SearchScope) ([]ScoredRef, error) {
 	if err := scope.validate(); err != nil {
 		return nil, err
 	}
@@ -234,14 +265,14 @@ func (e *EmbeddingStore) SimilaritySearch(ctx context.Context, query []float32, 
 	// so the two modes cannot share one OR-ed clause.
 	if scope.CrossGoal {
 		rows, err = tx.Query(ctx,
-			"SELECT node_id FROM meta_heuristic_embeddings WHERE (embedding <=> $1) <= $2 "+
-				"ORDER BY embedding <=> $1 LIMIT $3",
+			"SELECT node_id, embedding <=> $1 AS distance FROM meta_heuristic_embeddings "+
+				"WHERE (embedding <=> $1) <= $2 ORDER BY embedding <=> $1 LIMIT $3",
 			vec, e.distanceFloor, k,
 		)
 	} else {
 		rows, err = tx.Query(ctx,
-			"SELECT node_id FROM meta_heuristic_embeddings WHERE (embedding <=> $1) <= $2 AND goal_id = $3 "+
-				"ORDER BY embedding <=> $1 LIMIT $4",
+			"SELECT node_id, embedding <=> $1 AS distance FROM meta_heuristic_embeddings "+
+				"WHERE (embedding <=> $1) <= $2 AND goal_id = $3 ORDER BY embedding <=> $1 LIMIT $4",
 			vec, e.distanceFloor, scope.GoalID, k,
 		)
 	}
@@ -250,13 +281,13 @@ func (e *EmbeddingStore) SimilaritySearch(ctx context.Context, query []float32, 
 	}
 	defer rows.Close()
 
-	var ids []string
+	var refs []ScoredRef
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var ref ScoredRef
+		if err := rows.Scan(&ref.NodeID, &ref.Distance); err != nil {
 			return nil, fmt.Errorf("scan similarity row: %w", err)
 		}
-		ids = append(ids, id)
+		refs = append(refs, ref)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate similarity rows: %w", err)
@@ -264,7 +295,7 @@ func (e *EmbeddingStore) SimilaritySearch(ctx context.Context, query []float32, 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("similarity search: commit: %w", err)
 	}
-	return ids, nil
+	return refs, nil
 }
 
 // NodeRef is one embedding row's identity and goal scope, the reconcile pass's

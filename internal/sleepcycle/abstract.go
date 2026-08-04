@@ -67,7 +67,16 @@ func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objec
 		// CreateMetaHeuristic MERGEs the node and each edge and leaves
 		// embedding_pending alone, so re-issuing it adds what is missing without
 		// disturbing a finished abstraction.
-		relinkErr := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: mhID, Definition: existing.Definition, GoalID: target.goalID}, cand.abstractedFrom)
+		// The existing node's own terms and origin are passed straight back: this branch
+		// has no fresh abstraction to read them from.
+		relinkErr := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{
+			ID:                  mhID,
+			Definition:          existing.Definition,
+			GoalID:              target.goalID,
+			OntologyTerms:       existing.OntologyTerms,
+			OriginGoalID:        existing.OriginGoalID,
+			OriginDataSourceRef: existing.OriginDataSourceRef,
+		}, cand.abstractedFrom)
 		if !existing.EmbeddingPending {
 			// The heuristic is written and embedded, so it is reachable to a consumer
 			// whether or not this run managed to widen its evidence. Reporting it as
@@ -102,7 +111,18 @@ func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objec
 		return err
 	}
 
-	if err := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: mhID, Definition: abstraction.Definition, GoalID: target.goalID}, cand.abstractedFrom); err != nil {
+	// The term map and the origin are persisted with the definition, not derived at
+	// read time: the definition names only bracketed terms, so a later run reaching
+	// for this heuristic has no other route back to the columns it generalized.
+	mh := domain.MetaHeuristic{
+		ID:                  mhID,
+		Definition:          abstraction.Definition,
+		GoalID:              target.goalID,
+		OntologyTerms:       ontologyTermsFromLLM(abstraction.OntologyTerms),
+		OriginGoalID:        target.goalID,
+		OriginDataSourceRef: target.dataSourceRef,
+	}
+	if err := w.repo.CreateMetaHeuristic(ctx, mh, cand.abstractedFrom); err != nil {
 		return fmt.Errorf("create meta-heuristic %q: %w", mhID, err)
 	}
 	return w.embed(ctx, target.goalID, mhID, abstraction.Definition, cand.abstractedFrom)

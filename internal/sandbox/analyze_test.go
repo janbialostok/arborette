@@ -235,10 +235,27 @@ func TestAnalyzeStaging(t *testing.T) {
 	t.Run("post-staging compile error maps to 400", func(t *testing.T) {
 		// Binning the categorical g column is a schema-dependent compile error
 		// (errNonNumeric) surfaced only after staging; it must map to 400 (analyst-
-		// fixable), not a masked 500, so the sweep can tell it from a fault.
-		code, _ := post(`{"data_source_ref":"` + ref + `","kind":"contingency","columns":[{"name":"g","bins":2}]}`)
-		if code != http.StatusBadRequest {
-			t.Fatalf("binned categorical column status = %d, want 400", code)
+		// fixable), not a masked 500, so the sweep can tell it from a fault. Both
+		// analyze kinds bin columns through one helper, so both are asserted: the
+		// quantile probe runs ahead of the compiler that would otherwise catch this,
+		// and an unguarded probe reaches DuckDB as a binder error that masks to 500.
+		binned := map[string]string{
+			"contingency":       `{"data_source_ref":"` + ref + `","kind":"contingency","columns":[{"name":"g","bins":2}]}`,
+			"stratified_effect": `{"data_source_ref":"` + ref + `","kind":"stratified_effect","aggregation":"avg","value_expression":{"kind":"column_ref","column":"n"},"segment":[{"field":"n","op":"gt","value":1}],"adjust":[{"name":"g","bins":2}]}`,
+			"sampled_effect":    `{"data_source_ref":"` + ref + `","kind":"sampled_effect","sample_fraction":1,"aggregation":"avg","value_expression":{"kind":"column_ref","column":"n"},"segment":[{"field":"n","op":"gt","value":1}],"adjust":[{"name":"g","bins":2}]}`,
+		}
+		for kind, body := range binned {
+			code, _ := post(body)
+			if code != http.StatusBadRequest {
+				t.Fatalf("%s: binned categorical column status = %d, want 400", kind, code)
+			}
+		}
+
+		// An unknown binned column is resolved before the probe too, for the same
+		// reason: it is analyst-fixable, not a fault.
+		unknown := `{"data_source_ref":"` + ref + `","kind":"contingency","columns":[{"name":"nope","bins":2}]}`
+		if code, _ := post(unknown); code != http.StatusBadRequest {
+			t.Fatalf("unknown binned column status = %d, want 400", code)
 		}
 	})
 }

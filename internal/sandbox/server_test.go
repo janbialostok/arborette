@@ -97,6 +97,10 @@ func TestHandlerValidation(t *testing.T) {
 		{"execute bad cast", "/execute", `{"data_source_ref":"x.csv","aggregation":"avg","value_expression":{"kind":"cast","cast_type":"INTEGER","operand":{"kind":"column_ref","column":"a"}},"objective_label":"x"}`, http.StatusBadRequest},
 		{"introspect bad json", "/introspect", "{nope", http.StatusBadRequest},
 		{"introspect empty ref", "/introspect", `{"targets":[]}`, http.StatusBadRequest},
+		// A bin count outside [2, cap] is rejected before staging, like every other
+		// shape check: one bin bins nothing, and an unbounded count is a scan per cut.
+		{"introspect one quantile bin", "/introspect", `{"data_source_ref":"x.csv","quantile_bins":1}`, http.StatusBadRequest},
+		{"introspect quantile bins over cap", "/introspect", `{"data_source_ref":"x.csv","quantile_bins":33}`, http.StatusBadRequest},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

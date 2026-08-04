@@ -196,6 +196,63 @@ func TestDistinctValueProbeCapAndNulls(t *testing.T) {
 	}
 }
 
+// TestIntrospectQuantileCuts pins the opt-in threshold probe: off by default (so
+// every existing caller's response is unchanged), bins-1 interior cuts per numeric
+// column when asked, nothing for a categorical column, and nothing for a constant
+// column whose quantiles are all the same value — the degenerate case a consumer
+// must not mistake for a usable boundary.
+func TestIntrospectQuantileCuts(t *testing.T) {
+	ctx := context.Background()
+	client := newTestClient(t, ctx)
+	// spread varies across every quantile; flat is constant; name is categorical.
+	const fixture = "spread,flat,name\n1,7,a\n2,7,b\n3,7,c\n4,7,d\n"
+	ref := putObject(t, ctx, client, ".csv", []byte(fixture))
+	src := NewFileSource(client, nil, ref, 1<<20, "1GiB", 50)
+
+	unprobed, err := src.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	for _, c := range unprobed.Columns {
+		if c.QuantileCuts != nil {
+			t.Fatalf("a caller that did not ask for cuts must get none, got %v for %q", c.QuantileCuts, c.Name)
+		}
+	}
+
+	probed, err := src.IntrospectQuantiles(ctx, 4)
+	if err != nil {
+		t.Fatalf("introspect with quantiles: %v", err)
+	}
+	cuts := map[string][]float64{}
+	for _, c := range probed.Columns {
+		cuts[c.Name] = c.QuantileCuts
+	}
+	if len(cuts["spread"]) != 3 {
+		t.Fatalf("4 bins must yield 3 interior cuts, got %v", cuts["spread"])
+	}
+	if !sortedAscending(cuts["spread"]) {
+		t.Fatalf("cuts must be ascending, got %v", cuts["spread"])
+	}
+	if cuts["name"] != nil {
+		t.Fatalf("a categorical column has no quantiles, got %v", cuts["name"])
+	}
+	// A constant column's cuts are all one value, which bins nothing: three
+	// boundaries at 7 describe a single population, so the predicates derived from
+	// them would be a tautology and its empty complement.
+	if len(cuts["flat"]) > 0 && cuts["flat"][0] != cuts["flat"][len(cuts["flat"])-1] {
+		t.Fatalf("a constant column cannot yield distinct cuts, got %v", cuts["flat"])
+	}
+}
+
+func sortedAscending(vs []float64) bool {
+	for i := 1; i < len(vs); i++ {
+		if vs[i] < vs[i-1] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestServerEndpoints(t *testing.T) {
 	ctx := context.Background()
 	client := newTestClient(t, ctx)

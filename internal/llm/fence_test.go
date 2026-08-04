@@ -94,6 +94,19 @@ func TestAllFencedClientMethodsFenceUntrustedInput(t *testing.T) {
 			poisoned := SandboxSchema{Columns: []SandboxColumn{{Name: "tier", Type: "VARCHAR", DistinctValues: []string{payload}}}}
 			c.ClassifyGoalIntent(ctx, GoalIntentInput{GoalText: "goal", Schema: poisoned})
 		}},
+		{"CritiqueAtoms/goalText", func(c *client) { c.CritiqueAtoms(ctx, payload, schema) }},
+		{"CritiqueAtoms/distinctValue", func(c *client) {
+			poisoned := SandboxSchema{Columns: []SandboxColumn{{Name: "tier", Type: "VARCHAR", DistinctValues: []string{payload}}}}
+			c.CritiqueAtoms(ctx, "goal", poisoned)
+		}},
+		{"GroundHeuristic/definition", func(c *client) {
+			// A definition is prior model output read back out of the corpus, so it is
+			// untrusted on the way in even though this system wrote it.
+			c.GroundHeuristic(ctx, payload, nil, schema)
+		}},
+		{"GroundHeuristic/ontologyTerm", func(c *client) {
+			c.GroundHeuristic(ctx, "def", []OntologyTerm{{Concrete: payload, Ontological: "[Term]"}}, schema)
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

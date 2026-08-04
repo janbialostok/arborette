@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -243,5 +244,65 @@ func TestSandboxCacheAndLimitDefaults(t *testing.T) {
 	}
 	if cfg.Sandbox.MaxBodyBytes != 2048 {
 		t.Fatalf("MaxBodyBytes override = %d, want 2048", cfg.Sandbox.MaxBodyBytes)
+	}
+}
+
+// TestSleepCyclePolicyKnobs pins the env wiring for the knowledge-guided policy: a
+// typo in a name falls back to the default invisibly.
+//
+// Two matter beyond the pattern. The default policy is what the calibration
+// regression justifies, so a silent revert to the beam must fail here. And the
+// cross-goal knob is a kill switch — a typo'd name means an operator's attempt to
+// narrow retrieval does nothing at all, with no error to notice.
+func TestSleepCyclePolicyKnobs(t *testing.T) {
+	setPostgresEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SleepCycle.Policy != "uct" {
+		t.Fatalf("default policy = %q, want the knowledge-guided default", cfg.SleepCycle.Policy)
+	}
+	if cfg.SleepCycle.SchemaAtoms {
+		t.Fatalf("schema atoms must be off by default, got %v", cfg.SleepCycle.SchemaAtoms)
+	}
+	if !cfg.SleepCycle.CrossGoalGrounding {
+		t.Fatalf("cross-goal grounding must be on by default, got %v", cfg.SleepCycle.CrossGoalGrounding)
+	}
+	if cfg.SleepCycle.UCTExploration != math.Sqrt2 {
+		t.Fatalf("default exploration = %v, want sqrt(2)", cfg.SleepCycle.UCTExploration)
+	}
+	if cfg.SleepCycle.CausalMultiplierScale != 1.0 {
+		t.Fatalf("default causal scale = %v, want 1.0", cfg.SleepCycle.CausalMultiplierScale)
+	}
+	if cfg.SleepCycle.GroundingFraction != 0.3 {
+		t.Fatalf("default grounding fraction = %v, want 0.3", cfg.SleepCycle.GroundingFraction)
+	}
+	if cfg.SleepCycle.RetrievalK != 8 {
+		t.Fatalf("default retrieval k = %d, want 8", cfg.SleepCycle.RetrievalK)
+	}
+	if cfg.SleepCycle.QuantileBins != 3 {
+		t.Fatalf("default quantile bins = %d, want 3", cfg.SleepCycle.QuantileBins)
+	}
+
+	t.Setenv("SLEEPCYCLE_POLICY", "beam")
+	t.Setenv("SLEEPCYCLE_SEARCH_SCHEMA_ATOMS", "true")
+	t.Setenv("SLEEPCYCLE_SEARCH_UCT_EXPLORATION", "2.5")
+	t.Setenv("SLEEPCYCLE_SEARCH_CAUSAL_MULTIPLIER_SCALE", "0")
+	t.Setenv("SLEEPCYCLE_SEARCH_GROUNDING_FRACTION", "0.75")
+	t.Setenv("SLEEPCYCLE_SEARCH_RETRIEVAL_K", "12")
+	t.Setenv("SLEEPCYCLE_SEARCH_QUANTILE_BINS", "5")
+	t.Setenv("SLEEPCYCLE_SEARCH_CROSS_GOAL_GROUNDING", "false")
+
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	got := cfg.SleepCycle
+	if got.Policy != "beam" || !got.SchemaAtoms || got.UCTExploration != 2.5 ||
+		got.CausalMultiplierScale != 0 || got.GroundingFraction != 0.75 ||
+		got.RetrievalK != 12 || got.QuantileBins != 5 || got.CrossGoalGrounding {
+		t.Fatalf("every knob must read from its own variable, got %+v", got)
 	}
 }

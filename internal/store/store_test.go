@@ -975,3 +975,91 @@ func TestEmbeddingGrants(t *testing.T) {
 		t.Fatal("expected orchestrator UPDATE on embeddings to be denied")
 	}
 }
+
+// TestSimilaritySearchScoredCarriesDistances pins the scored variant on the axis
+// the plain one cannot cover: the distance that ranked each hit. A consumer that
+// weights knowledge by how close it is reads that number directly, so a wrong
+// column or a wrong ordering would silently mis-weight every prior derived from it.
+//
+// The goal-scoped arm is asserted too, because that branch binds the goal against a
+// uuid column — the one shape that fails at bind time rather than returning a wrong
+// answer, and therefore the one a fake collaborator can never catch.
+func TestSimilaritySearchScoredCarriesDistances(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	testutil.TruncateEmbeddings(t, ctx, cfg)
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	embeddings := store.NewEmbeddingStore(p, 2)
+
+	goalID := testutil.NewID(t)
+	nearID, midID := testutil.NewID(t), testutil.NewID(t)
+	if err := embeddings.Upsert(ctx, nearID, goalID, oneHot(map[int]float32{0: 1})); err != nil {
+		t.Fatalf("upsert near: %v", err)
+	}
+	if err := embeddings.Upsert(ctx, midID, goalID, oneHot(map[int]float32{0: 1, 1: 1})); err != nil {
+		t.Fatalf("upsert mid: %v", err)
+	}
+
+	query := oneHot(map[int]float32{0: 1})
+	scored, err := embeddings.SimilaritySearchScored(ctx, query, 10, store.SearchScope{GoalID: goalID})
+	if err != nil {
+		t.Fatalf("scored similarity search: %v", err)
+	}
+	if len(scored) != 2 {
+		t.Fatalf("scored search returned %d hits, want both goal rows", len(scored))
+	}
+	if scored[0].NodeID != nearID || scored[1].NodeID != midID {
+		t.Fatalf("hits must be ordered by distance, got %+v", scored)
+	}
+	// An identical direction is cosine distance 0; a 45-degree one is 1 - cos(45°).
+	if scored[0].Distance > 1e-6 {
+		t.Fatalf("an exact-direction match must have distance ~0, got %v", scored[0].Distance)
+	}
+	if scored[1].Distance <= scored[0].Distance || scored[1].Distance > 1 {
+		t.Fatalf("a 45-degree hit must sit between the exact match and orthogonal, got %v", scored[1].Distance)
+	}
+}
+
+// TestSimilaritySearchScoredHonoursFloorAndLimit: the scored variant is the one
+// implementation behind both entry points, so the floor and the k cap it enforces
+// are what the unscored caller gets too.
+func TestSimilaritySearchScoredHonoursFloorAndLimit(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	testutil.TruncateEmbeddings(t, ctx, cfg)
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	embeddings := store.NewEmbeddingStore(p, 0.5)
+
+	nearID, midID, farID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	if err := embeddings.Upsert(ctx, nearID, "", oneHot(map[int]float32{0: 1})); err != nil {
+		t.Fatalf("upsert near: %v", err)
+	}
+	if err := embeddings.Upsert(ctx, midID, "", oneHot(map[int]float32{0: 1, 1: 1})); err != nil {
+		t.Fatalf("upsert mid: %v", err)
+	}
+	if err := embeddings.Upsert(ctx, farID, "", oneHot(map[int]float32{1: 1})); err != nil {
+		t.Fatalf("upsert far: %v", err)
+	}
+
+	query := oneHot(map[int]float32{0: 1})
+	scored, err := embeddings.SimilaritySearchScored(ctx, query, 10, store.SearchScope{CrossGoal: true})
+	if err != nil {
+		t.Fatalf("scored similarity search: %v", err)
+	}
+	for _, ref := range scored {
+		if ref.NodeID == farID {
+			t.Fatalf("the floor must drop the orthogonal row, got %+v", scored)
+		}
+		if ref.Distance > 0.5 {
+			t.Fatalf("a hit beyond the floor was returned: %+v", ref)
+		}
+	}
+
+	capped, err := embeddings.SimilaritySearchScored(ctx, query, 1, store.SearchScope{CrossGoal: true})
+	if err != nil {
+		t.Fatalf("capped scored search: %v", err)
+	}
+	if len(capped) != 1 || capped[0].NodeID != nearID {
+		t.Fatalf("k must cap the scored result at the nearest hit, got %+v", capped)
+	}
+}

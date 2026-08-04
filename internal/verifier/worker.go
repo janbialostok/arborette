@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/arborette/arborette/internal/datasource"
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/llm"
@@ -359,25 +360,11 @@ func toColumns(cols []sandboxclient.Column) []Column {
 	for _, c := range cols {
 		out = append(out, Column{
 			Name:    c.Name,
-			Numeric: isNumericType(c.Type),
+			Numeric: datasource.IsNumericType(c.Type),
 			Samples: c.DistinctValues,
 		})
 	}
 	return out
-}
-
-// isNumericType mirrors the sandbox compiler's numeric classification across the CGO
-// firewall (the sandbox package cannot be imported here), so a column routes to the
-// numeric test path exactly as it would compile.
-func isNumericType(t string) bool {
-	u := strings.ToUpper(strings.TrimSpace(t))
-	switch u {
-	case "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
-		"UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
-		"FLOAT", "DOUBLE":
-		return true
-	}
-	return strings.HasPrefix(u, "DECIMAL")
 }
 
 // selectionPriority is the column-cap priority list: the objective columns (from the

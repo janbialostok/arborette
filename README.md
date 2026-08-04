@@ -122,8 +122,8 @@ Four things to know before writing an SSE client, none of them guessable from th
 ### Phase 2 — Sleep Cycle
 
 The Sleep-Cycle Worker is a one-shot batch job that searches for **macro-segments** — conjunctions
-of the predicates Phase 1 surfaced — that beat anything Phase 1 found on its own, then decides what
-is worth publishing as knowledge. In order, one run:
+of filter predicates — that beat anything Phase 1 found on its own, then decides what is worth
+publishing as knowledge. In order, one run:
 
 1. Settles the previous run's leftovers: sweeps Meta-Heuristics whose evidence was since rejected,
    and re-embeds any left with a pending embedding by a mid-write crash.
@@ -133,11 +133,18 @@ is worth publishing as knowledge. In order, one run:
    achieved, not the support-shrunk score that ranks publications later. `S*` is the best
    *finding*, not the best single predicate: a depth-2 Phase-1 branch is an equally valid `S*`, and
    it sets a correspondingly higher bar.
-4. Builds the atom vocabulary — every distinct predicate any finding introduced — and runs a
-   level-wise **beam search over the conjunction lattice** with anti-monotone (Apriori) support
-   pruning. Conjoining predicates can only shrink the matched row set, so a candidate below the
-   support floor is pruned along with every superset it could reach. Every surviving candidate is
-   measured **empirically** through the Sandbox, objective and row count in one query.
+4. Builds the atom vocabulary — every distinct predicate any finding introduced — and searches the
+   **conjunction lattice**, by default with a **knowledge-guided PUCT tree search** that descends
+   where the measured evidence and its priors point. Prior Meta-Heuristics retrieved from the corpus
+   enter as whole conjunctions to adopt, so a goal can start from what another goal learned; a
+   causal verification multiplies a candidate's value estimate, so a segment resting on a verified
+   effect outranks a merely correlated one. Both are additive — with an empty corpus and no verified
+   edges the search is plain UCT. `SLEEPCYCLE_POLICY=beam` selects the level-wise **beam** instead.
+   Either way anti-monotone (Apriori) support pruning applies: conjoining predicates can only shrink
+   the matched row set, so a predicate below the support floor is pruned along with every
+   conjunction that contains it, and no candidate ever conjoins two predicates on one column and
+   operator (`x >= 4 ∧ x >= 12` *is* `x >= 12`). Every surviving candidate is measured **empirically**
+   through the Sandbox, objective and row count in one query.
 5. Writes each materially-better macro-segment back as a full triplet against the global baseline,
    flagged as sleep-derived, under an id derived deterministically from the goal and the
    canonicalized filter set so a re-run after a crash rewrites identical nodes instead of
@@ -380,9 +387,10 @@ Two follow-ups:
   `sleepcycle` job reads `.env` on every run, so this edit persists until undone, and a floor of 5
   left in place quietly publishes Meta-Heuristics backed by a handful of rows — the exact outcome
   the default exists to prevent.
-- **Expect zero winners from the conjunction search.** The lattice can only conjoin predicates Phase
-  1 proposed and this sample yields too few, so the run publishes from Phase-1 findings directly —
-  correct behavior on thin evidence, not a misconfiguration.
+- **Expect zero winners from the conjunction search.** The sample yields too few rows for any
+  conjunction to clear the support floor and the lift bar, so the run publishes from Phase-1
+  findings directly — correct behavior on thin evidence, not a misconfiguration. A fresh goal also
+  has no corpus to retrieve from, so the reuse path contributes nothing on a first run.
 - **The counts that matter are not on stdout.** The job logs its measurement count and, when it
   abstracts nothing, the reason — but `winners` and `published` live only in the run's
   `sleepcycle_run_complete` audit row, so confirming either means querying the `audit_log` table
@@ -523,11 +531,23 @@ Sleep-Cycle tuning:
 | Variable | Default | What it gates |
 |---|---|---|
 | `SLEEPCYCLE_SEARCH_MAX_MEASUREMENTS` | 200 | A run's Sandbox query volume — every candidate costs one call. |
+| `SLEEPCYCLE_POLICY` | `uct` | Which traversal runs: the knowledge-guided tree search, or `beam` for the level-wise walk. A stage-level choice, so the name carries no `SEARCH_` segment. |
 | `SLEEPCYCLE_SEARCH_BEAM_WIDTH` | 10 | Candidates carried forward per lattice level. |
 | `SLEEPCYCLE_SEARCH_MAX_ORDER` | 3 | Maximum conjunction order; below 2 no conjunction is formable and the search is skipped. |
 | `SLEEPCYCLE_SEARCH_MIN_SUPPORT` | 30 | Absolute matched-row floor. Reaches four stages — see [Phase 2](#phase-2--sleep-cycle). |
 | `SLEEPCYCLE_SEARCH_MIN_LIFT` | 0.05 | Relative improvement over `S*` required for write-back. |
 | `SLEEPCYCLE_MAX_PUBLICATIONS` | 20 | How many segments one run abstracts into Meta-Heuristics. Selection runs after the search, which is why the name carries no `SEARCH_` segment. |
+| `SLEEPCYCLE_SEARCH_UCT_EXPLORATION` | √2 | PUCT's exploration constant. Estimates are normalized per run, so it means the same thing on every objective. |
+| `SLEEPCYCLE_SEARCH_CAUSAL_MULTIPLIER_SCALE` | 1.0 | How much a fully-confident causal verification multiplies a value estimate. 0 turns the weighting off; no evidence always multiplies by exactly 1. |
+| `SLEEPCYCLE_SEARCH_GROUNDING_FRACTION` | 0.3 | Share of the root's expansions spent adopting conjunctions retrieved from the corpus. |
+| `SLEEPCYCLE_SEARCH_RETRIEVAL_K` | 8 | How many Meta-Heuristics that retrieval asks for. |
+| `SLEEPCYCLE_SEARCH_CROSS_GOAL_GROUNDING` | true | Kill switch: false narrows retrieval to the running goal, which leaves the reuse path inert. |
+| `SLEEPCYCLE_SEARCH_SCHEMA_ATOMS` | false | Enumerate predicates from the data source's own schema alongside the ones Phase 1 surfaced. Costs one model call to review the enumeration. |
+| `SLEEPCYCLE_SEARCH_QUANTILE_BINS` | 3 | Cut count the schema vocabulary derives threshold predicates from. 0 disables them; any other value must be in [2, 32] or the worker refuses to start. |
+
+`SLEEPCYCLE_SEARCH_UCT_EXPLORATION`, `_CAUSAL_MULTIPLIER_SCALE`, `_GROUNDING_FRACTION`,
+`_RETRIEVAL_K`, and `_CROSS_GOAL_GROUNDING` are read only under `SLEEPCYCLE_POLICY=uct`;
+`_BEAM_WIDTH` only under `=beam`; `_QUANTILE_BINS` only when `_SCHEMA_ATOMS=true`.
 
 Causal verification — when Engine B runs:
 
@@ -566,11 +586,10 @@ Open themes, each with the reason it is open:
   transaction velocity, amount versus that account's trailing mean, geo-impossibility between
   consecutive events — is currently inexpressible. Precomputing such features as plain columns is
   the working path.
-- **Search quality.** The beam spends slots on same-column threshold conjunctions that are
-  semantically degenerate (`x >= 4 ∧ x >= 12` *is* `x >= 12`), displacing the cross-column
-  combinations that can actually win. Separately, similarity search is unbounded k-NN with no
-  relevance floor, so an off-topic query still gets its nearest neighbours back, ranked, with
-  nothing marking them as unrelated.
+- **Search quality.** The schema-derived vocabulary that makes the lattice genuinely large is
+  opt-in, because enumerating it depends on one model call to flag the identifier, post-outcome, and
+  objective-restating columns that support and lift gates cannot catch by construction — and that
+  critic's precision is uncalibrated against a dataset with known-useless columns.
 - **Cross-store consistency.** A Meta-Heuristic lives in Neo4j and its embedding in pgvector with no
   shared transaction, so the two can drift — a node whose embedding vanished still reports itself
   complete while being invisible to the search that actually serves consumers.
@@ -582,21 +601,12 @@ Open themes, each with the reason it is open:
   set. Every analyst-facing route, the Sandbox's whole surface, and rate limiting everywhere remain
   open. This needs a deliberate pass before anything is exposed beyond a laptop.
 
-### V2 — the dual-engine architecture
-
-The near-term input to V2 is a **schema-derived atom vocabulary** for the Sleep Cycle. Today the
-beam can only conjoin predicates Phase 1 happened to propose, so a column the hypothesis loop never
-touched is invisible to Phase 2 entirely — the reachable search space is capped by incidental
-coverage. Enumerating atoms from the schema directly (enum values as-is, quantile cuts for numerics)
-removes that cap, and inverts the LLM from proposer to **critic**: one call to flag leakage,
-tautological, and post-outcome columns that support and lift gates cannot catch by construction.
+### Not yet built
 
 What remains open is the half of Engine B that needs a live system to act on. **Physically executed
 interventions** — running the experiment in an isolated ephemeral sandbox and writing a do-calculus
 edge, rather than adjusting the observational rows — would replace inference with evidence, and
-**A\* guided by existing Meta-Heuristics** would choose which expensive experiment to run first. The
-Sleep Cycle's search policy then swaps from the level-wise beam to **UCT-MCTS** over the resulting
-mixed graph, scoring paths validated by a causal edge far above merely correlated ones.
+**A\* guided by existing Meta-Heuristics** would choose which expensive experiment to run first.
 
 ## Repository layout
 

@@ -128,39 +128,11 @@ func resolveSchemaColumn(cols []columnDTO, field string) (columnDTO, bool) {
 }
 
 // isOrderableColumnType reports whether a DuckDB column type can back a window's
-// ORDER BY: a numeric or temporal type. It mirrors the sandbox compiler's coarse
-// type classification, which lives behind the CGO firewall and cannot be imported,
-// so the orchestrator can reject a non-orderable time column at registration.
+// ORDER BY: a numeric or temporal type. The classification is the shared one, so
+// the orchestrator rejects a non-orderable time column at registration on the same
+// terms the compiler will apply when it runs.
 func isOrderableColumnType(t string) bool {
-	u := strings.ToUpper(strings.TrimSpace(t))
-	switch {
-	case orderableNumericTypes[u],
-		strings.HasPrefix(u, "DECIMAL"),
-		strings.HasPrefix(u, "DATE"),
-		strings.HasPrefix(u, "TIME"),
-		strings.HasPrefix(u, "TIMESTAMP"):
-		return true
-	default:
-		return false
-	}
-}
-
-// orderableNumericTypes is the DuckDB numeric set (the fixed-point DECIMAL(p,s) is
-// matched by prefix in isOrderableColumnType), mirroring the sandbox compiler's
-// numericTypes across the CGO firewall.
-var orderableNumericTypes = map[string]bool{
-	"TINYINT":   true,
-	"SMALLINT":  true,
-	"INTEGER":   true,
-	"BIGINT":    true,
-	"HUGEINT":   true,
-	"UTINYINT":  true,
-	"USMALLINT": true,
-	"UINTEGER":  true,
-	"UBIGINT":   true,
-	"UHUGEINT":  true,
-	"FLOAT":     true,
-	"DOUBLE":    true,
+	return datasource.IsNumericType(t) || datasource.IsTemporalType(t)
 }
 
 // handleSubmitGoal registers an analyst goal: it ingests the data source into the

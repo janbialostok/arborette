@@ -77,9 +77,10 @@ func (s *Server) Routes() http.Handler {
 // the shared datasource types are tag-less by design, so the sandbox maps to
 // these local DTOs rather than tagging the shared package.
 type columnDTO struct {
-	Name           string   `json:"name"`
-	Type           string   `json:"type"`
-	DistinctValues []string `json:"distinct_values,omitempty"`
+	Name           string    `json:"name"`
+	Type           string    `json:"type"`
+	DistinctValues []string  `json:"distinct_values,omitempty"`
+	QuantileCuts   []float64 `json:"quantile_cuts,omitempty"`
 }
 
 type schemaDTO struct {
@@ -96,10 +97,14 @@ type TargetBinding struct {
 }
 
 // IntrospectRequest asks for the schema of a data source plus a binding of each
-// optimization target to a column.
+// optimization target to a column. QuantileBins opts into per-numeric-column
+// quantile cut points (0 = off, otherwise in [2, the analyze bin cap]), so a
+// caller deriving threshold predicates gets the boundaries the data supports
+// without a second staging pass.
 type IntrospectRequest struct {
 	DataSourceRef string          `json:"data_source_ref"`
 	Targets       []domain.Target `json:"targets"`
+	QuantileBins  int             `json:"quantile_bins,omitempty"`
 }
 
 // IntrospectResponse returns the schema and the per-target column bindings. For a
@@ -270,6 +275,13 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
 		return
 	}
+	// The bin count shares /analyze's cap: both bound the same per-column quantile
+	// work over the same engine, so a second knob would only let the two drift.
+	if req.QuantileBins != 0 && (req.QuantileBins < 2 || req.QuantileBins > s.analyzeMaxBins) {
+		service.WriteErr(w, http.StatusBadRequest,
+			fmt.Sprintf("quantile_bins %d not in [2, %d]", req.QuantileBins, s.analyzeMaxBins))
+		return
+	}
 	if !s.validateRef(w, r, req.DataSourceRef) {
 		return
 	}
@@ -293,7 +305,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize, s.distinctValueCap)
-	schema, err := src.Introspect(r.Context())
+	schema, err := src.IntrospectQuantiles(r.Context(), req.QuantileBins)
 	if err != nil {
 		writeStageErr(w, err)
 		return
@@ -520,7 +532,7 @@ func bindTargets(targets []domain.Target, cols []datasource.Column) ([]TargetBin
 func toSchemaDTO(schema *datasource.Schema) schemaDTO {
 	cols := make([]columnDTO, 0, len(schema.Columns))
 	for _, c := range schema.Columns {
-		cols = append(cols, columnDTO{Name: c.Name, Type: c.Type, DistinctValues: c.DistinctValues})
+		cols = append(cols, columnDTO{Name: c.Name, Type: c.Type, DistinctValues: c.DistinctValues, QuantileCuts: c.QuantileCuts})
 	}
 	return schemaDTO{Kind: string(schema.Kind), Columns: cols}
 }

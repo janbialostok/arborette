@@ -452,3 +452,53 @@ func TestFailedMeasurementIsExcludedFromTheFrontier(t *testing.T) {
 		}
 	}
 }
+
+// TestConfigValidationRejectsBadPolicyTuning covers the knowledge-guided knobs the
+// original table predates. They come from the environment like every other knob, so
+// a bad value must fail once at startup rather than mid-search — and two of these
+// are boundary predicates that read the same whether they are inverted or not.
+func TestConfigValidationRejectsBadPolicyTuning(t *testing.T) {
+	cases := map[string]func(*Config){
+		"unknown policy":                func(c *Config) { c.Policy = "greedy" },
+		"empty policy":                  func(c *Config) { c.Policy = "" },
+		"zero exploration":              func(c *Config) { c.UCTExploration = 0 },
+		"negative exploration":          func(c *Config) { c.UCTExploration = -1 },
+		"negative causal scale":         func(c *Config) { c.CausalMultiplierScale = -0.1 },
+		"grounding fraction below 0":    func(c *Config) { c.GroundingFraction = -0.1 },
+		"grounding fraction above 1":    func(c *Config) { c.GroundingFraction = 1.1 },
+		"retrieval k below 1":           func(c *Config) { c.RetrievalK = 0 },
+		"one quantile bin bins nothing": func(c *Config) { c.QuantileBins = 1 },
+		"negative quantile bins":        func(c *Config) { c.QuantileBins = -1 },
+		// Above the sandbox's own cap the introspect answers 400, and introspection is
+		// terminal — so an unbounded value fails every run of every goal rather than
+		// degrading, which is what this clause converts into one startup error.
+		"quantile bins above the sandbox cap": func(c *Config) { c.QuantileBins = maxQuantileBins + 1 },
+	}
+	for name, breakIt := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := testConfig()
+			breakIt(&cfg)
+			if err := cfg.validate(); err == nil {
+				t.Fatalf("expected %s to be rejected at startup", name)
+			}
+		})
+	}
+
+	// The boundaries themselves are legal: a fraction at either end, and the probe
+	// switched off entirely.
+	for name, tune := range map[string]func(*Config){
+		"grounding fraction 0":     func(c *Config) { c.GroundingFraction = 0 },
+		"grounding fraction 1":     func(c *Config) { c.GroundingFraction = 1 },
+		"causal scale 0":           func(c *Config) { c.CausalMultiplierScale = 0 },
+		"quantile probe off":       func(c *Config) { c.QuantileBins = 0 },
+		"quantile bins at the cap": func(c *Config) { c.QuantileBins = maxQuantileBins },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := testConfig()
+			tune(&cfg)
+			if err := cfg.validate(); err != nil {
+				t.Fatalf("%s must be accepted, got %v", name, err)
+			}
+		})
+	}
+}

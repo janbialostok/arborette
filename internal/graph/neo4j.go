@@ -292,6 +292,10 @@ func (r *Neo4jRepository) CreateProduced(ctx context.Context, interventionID, ou
 // committing nothing) on any missing or duplicate reference, so a Meta-Heuristic
 // is never abstracted from incomplete evidence.
 func (r *Neo4jRepository) CreateMetaHeuristic(ctx context.Context, mh domain.MetaHeuristic, abstractedFrom []string) error {
+	terms, err := marshalOntologyTerms(mh.OntologyTerms)
+	if err != nil {
+		return err
+	}
 	return r.writeOp(ctx, "create meta-heuristic "+mh.ID, func(tx neo4j.ManagedTransaction) (any, error) {
 		// A bare `WHERE n.id IN $ids` would silently drop nonexistent ids, so
 		// match counts are checked per requested id.
@@ -326,16 +330,34 @@ func (r *Neo4jRepository) CreateMetaHeuristic(ctx context.Context, mh domain.Met
 		// before the per-edge UNWIND, not per edge. Guarding it on a non-empty goalID
 		// is what lets a legacy node heal on re-abstraction while a goal-less caller
 		// can never re-blank a node that already carries a goal.
+		//
+		// The abstraction provenance heals on the same guarded-FOREACH terms, for the
+		// same reason: the re-link branch re-issues this write carrying only the
+		// definition it read back, so an unguarded ON MATCH SET would blank the terms
+		// and origin every time a later run widened an existing heuristic's evidence.
+		// ontology_terms rides as a JSON string because Neo4j properties cannot nest.
 		result, err := tx.Run(ctx,
 			"MERGE (m:"+labelMetaHeuristic+" {id: $id}) "+
-				"ON CREATE SET m.definition = $definition, m.embedding_pending = true, m.goal_id = $goalID "+
+				"ON CREATE SET m.definition = $definition, m.embedding_pending = true, m.goal_id = $goalID, "+
+				"m.ontology_terms = $terms, m.origin_goal_id = $originGoalID, m.origin_datasource_ref = $originRef "+
 				"ON MATCH SET m.definition = $definition "+
 				"FOREACH (_ IN CASE WHEN $goalID <> '' THEN [1] ELSE [] END | SET m.goal_id = $goalID) "+
+				"FOREACH (_ IN CASE WHEN $terms <> '' THEN [1] ELSE [] END | SET m.ontology_terms = $terms) "+
+				"FOREACH (_ IN CASE WHEN $originGoalID <> '' THEN [1] ELSE [] END | SET m.origin_goal_id = $originGoalID) "+
+				"FOREACH (_ IN CASE WHEN $originRef <> '' THEN [1] ELSE [] END | SET m.origin_datasource_ref = $originRef) "+
 				"WITH m UNWIND $ids AS targetId "+
 				"MATCH (t {id: targetId}) "+
 				"MERGE (m)-[:"+domain.AbstractedFrom+"]->(t) "+
 				"RETURN count(*) AS edges",
-			map[string]any{"id": mh.ID, "definition": mh.Definition, "goalID": mh.GoalID, "ids": abstractedFrom},
+			map[string]any{
+				"id":           mh.ID,
+				"definition":   mh.Definition,
+				"goalID":       mh.GoalID,
+				"terms":        terms,
+				"originGoalID": mh.OriginGoalID,
+				"originRef":    mh.OriginDataSourceRef,
+				"ids":          abstractedFrom,
+			},
 		)
 		if err != nil {
 			return nil, err
@@ -654,6 +676,55 @@ func (r *Neo4jRepository) TraceCausalChain(ctx context.Context, metaHeuristicID 
 	return res.([]CausalTriplet), nil
 }
 
+// AbstractionSourceFilters returns the filter conjunctions of the Interventions a
+// Meta-Heuristic was abstracted from — the concrete segments its definition
+// generalizes. It is the same-dataset re-instantiation path's input: when the
+// heuristic's origin data source matches the target's, its own source
+// conjunctions are already expressed in that dataset's columns, so no grounding
+// call is needed to recover them.
+//
+// Only the Intervention hop is walked (the ABSTRACTED_FROM set also carries State
+// and Outcome ids), and a conjunction that fails to decode is skipped rather than
+// failing the read: one malformed property must not cost the caller every other
+// conjunction the heuristic offers.
+func (r *Neo4jRepository) AbstractionSourceFilters(ctx context.Context, metaHeuristicID string) ([][]domain.Constraint, error) {
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (m:"+labelMetaHeuristic+" {id: $id})-[:"+domain.AbstractedFrom+"]->(i:"+labelIntervention+") "+
+				"RETURN i ORDER BY i.id",
+			map[string]any{"id": metaHeuristicID},
+		)
+		if err != nil {
+			return nil, err
+		}
+		recs, err := result.Collect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([][]domain.Constraint, 0, len(recs))
+		for _, rec := range recs {
+			node, err := recordNode(rec, "i")
+			if err != nil {
+				return nil, err
+			}
+			intervention, err := interventionFromNode(stringProp(node.Props["id"]), node)
+			if err != nil {
+				continue
+			}
+			filters, err := domain.DecodeConstraints(intervention.Properties[domain.PropNewFilters])
+			if err != nil || len(filters) == 0 {
+				continue
+			}
+			out = append(out, filters)
+		}
+		return out, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("abstraction source filters for %q: %w", metaHeuristicID, err)
+	}
+	return res.([][]domain.Constraint), nil
+}
+
 func tripletFromRecord(rec *neo4j.Record) (CausalTriplet, error) {
 	sNode, err := recordNode(rec, "s")
 	if err != nil {
@@ -715,17 +786,51 @@ func interventionFromNode(id string, node neo4j.Node) (domain.Intervention, erro
 	}, nil
 }
 
+// metaHeuristicFromNode decodes one Meta-Heuristic node. Undecodable ontology
+// terms read as none rather than failing the read: the terms are a reuse
+// optimization (their absence routes the heuristic through grounding), so a
+// malformed property must not blank out a search whose neighbourhood touches it.
 func metaHeuristicFromNode(node neo4j.Node) domain.MetaHeuristic {
 	def, _ := node.Props["definition"].(string)
 	pending, _ := node.Props["embedding_pending"].(bool)
 	stale, _ := node.Props["stale"].(bool)
 	return domain.MetaHeuristic{
-		ID:               stringProp(node.Props["id"]),
-		Definition:       def,
-		GoalID:           stringProp(node.Props["goal_id"]),
-		EmbeddingPending: pending,
-		Stale:            stale,
+		ID:                  stringProp(node.Props["id"]),
+		Definition:          def,
+		GoalID:              stringProp(node.Props["goal_id"]),
+		EmbeddingPending:    pending,
+		Stale:               stale,
+		OntologyTerms:       unmarshalOntologyTerms(node.Props["ontology_terms"]),
+		OriginGoalID:        stringProp(node.Props["origin_goal_id"]),
+		OriginDataSourceRef: stringProp(node.Props["origin_datasource_ref"]),
 	}
+}
+
+// marshalOntologyTerms serializes the term map to the JSON string the node
+// property holds. An empty set marshals to "" rather than "[]" so the write's
+// guarded FOREACH reads it as "this caller carries no terms" and leaves any
+// persisted ones alone.
+func marshalOntologyTerms(terms []domain.OntologyTerm) (string, error) {
+	if len(terms) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(terms)
+	if err != nil {
+		return "", fmt.Errorf("marshal ontology terms: %w", err)
+	}
+	return string(b), nil
+}
+
+func unmarshalOntologyTerms(v any) []domain.OntologyTerm {
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return nil
+	}
+	var terms []domain.OntologyTerm
+	if err := json.Unmarshal([]byte(s), &terms); err != nil {
+		return nil
+	}
+	return terms
 }
 
 func outcomeFromNode(id string, node neo4j.Node) (domain.Outcome, error) {

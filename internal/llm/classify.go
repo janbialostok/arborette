@@ -52,8 +52,10 @@ type GoalIntentResult struct {
 const maxRationaleLen = 2000
 
 var (
-	errUnknownTrack     = errors.New("goal intent classifier returned an unknown track")
-	errRationaleTooLong = fmt.Errorf("goal intent rationale exceeds %d bytes", maxRationaleLen)
+	errUnknownTrack = errors.New("goal intent classifier returned an unknown track")
+	// Named for no single caller: the message reaches an audit detail, where the
+	// wrong stage name sends an operator to the wrong place.
+	errRationaleTooLong = fmt.Errorf("rationale exceeds %d bytes", maxRationaleLen)
 	errNoClaimFilters   = errors.New("verify track returned no claim filters")
 	errUnknownDirection = errors.New("goal intent classifier returned an unusable claimed effect direction")
 )
@@ -121,28 +123,20 @@ func decodeGoalIntent(body string) (GoalIntentResult, error) {
 }
 
 // decodeClaimFilters parses the JSON-encoded filter conjunction the claim names.
-// It decodes through filterWire, the same polymorphic-value decoder the intervention
-// proposals use, so a claimed segment and a proposed one are built from one shape —
-// the prompt describes that shape identically for both, and a second decoder here
-// would let the two drift apart.
+// It decodes through decodeFilterConjunction, the same polymorphic-value decoder
+// the intervention proposals use, so a claimed segment and a proposed one are built
+// from one shape — the prompt describes that shape identically for both, and a
+// second decoder here would let the two drift apart.
 func decodeClaimFilters(raw string) ([]domain.Constraint, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, errNoClaimFilters
 	}
-	var wire []filterWire
-	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
+	filters, err := decodeFilterConjunction(raw)
+	if err != nil {
 		return nil, fmt.Errorf("parse claim filters: %w", err)
 	}
-	if len(wire) == 0 {
+	if len(filters) == 0 {
 		return nil, errNoClaimFilters
-	}
-	filters := make([]domain.Constraint, 0, len(wire))
-	for _, fw := range wire {
-		f, err := fw.toConstraint()
-		if err != nil {
-			return nil, fmt.Errorf("parse claim filters: %w", err)
-		}
-		filters = append(filters, f)
 	}
 	return filters, nil
 }

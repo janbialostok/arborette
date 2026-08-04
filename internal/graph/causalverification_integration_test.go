@@ -200,3 +200,74 @@ func TestCausalEvidenceForHeuristics(t *testing.T) {
 		t.Fatalf("empty request = %v (err %v), want an empty map", out, err)
 	}
 }
+
+// TestCausalEvidenceForInterventions pins the batched read the Sleep-Cycle search
+// weights its value estimates by. Every clause it filters on is exercised: only
+// causal_inferred edges count, a retracted one does not, an intervention with no
+// verification is simply absent, and a re-verified intervention is served at its
+// newest version rather than whichever row the scan reached last.
+func TestCausalEvidenceForInterventions(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, ctx)
+	goalID := testutil.NewID(t)
+
+	verified, _ := seedCausalTriplet(t, ctx, repo, goalID)
+	reverified, _ := seedCausalTriplet(t, ctx, repo, goalID)
+	retracted, _ := seedCausalTriplet(t, ctx, repo, goalID)
+	observational, _ := seedCausalTriplet(t, ctx, repo, goalID)
+
+	verify := func(interventionID string, version int, confidence float64) {
+		t.Helper()
+		if err := repo.WriteCausalVerification(ctx, interventionID, version,
+			domain.Outcome{GoalID: goalID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{"e": confidence}},
+			domain.ProducedEdge{EffectSize: confidence, Confidence: confidence, EpistemicSource: domain.EpistemicCausalInferred},
+		); err != nil {
+			t.Fatalf("write causal verification: %v", err)
+		}
+	}
+	verify(verified, 1, 0.8)
+	verify(reverified, 1, 0.2)
+	verify(reverified, 2, 0.9)
+	verify(retracted, 1, 0.95)
+	if err := repo.SupersedePriorCausalOutcomes(ctx, retracted, 1); err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+
+	evidence, err := repo.CausalEvidenceForInterventions(ctx,
+		[]string{verified, reverified, retracted, observational})
+	if err != nil {
+		t.Fatalf("causal evidence for interventions: %v", err)
+	}
+
+	got, ok := evidence[verified]
+	if !ok || got.Confidence != 0.8 || got.InterventionID != verified {
+		t.Fatalf("verified intervention = %+v (present %v), want its own edge at confidence 0.8", got, ok)
+	}
+	// Ascending graph_version with a last-row-wins overwrite is only correct because
+	// of the ORDER BY; without it the older verification could be served.
+	if latest := evidence[reverified]; latest.Confidence != 0.9 || latest.GraphVersion != 2 {
+		t.Fatalf("re-verified intervention = %+v, want the newest version's edge", latest)
+	}
+	if _, present := evidence[retracted]; present {
+		t.Fatalf("a retracted verification must not be served: %+v", evidence[retracted])
+	}
+	if _, present := evidence[observational]; present {
+		t.Fatalf("an intervention with only an observational edge must be absent: %+v", evidence[observational])
+	}
+}
+
+// TestCausalEvidenceForInterventionsShortCircuitsOnNoIDs: the empty case must not
+// reach the database, since the search calls it on every run and a goal with no
+// eligible finding is ordinary.
+func TestCausalEvidenceForInterventionsShortCircuitsOnNoIDs(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, ctx)
+
+	evidence, err := repo.CausalEvidenceForInterventions(ctx, nil)
+	if err != nil {
+		t.Fatalf("causal evidence for no interventions: %v", err)
+	}
+	if len(evidence) != 0 {
+		t.Fatalf("expected an empty map, got %+v", evidence)
+	}
+}
