@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,20 +12,55 @@ import (
 	"github.com/arborette/arborette/internal/datasource"
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/objectstore"
+	"github.com/arborette/arborette/internal/service"
 )
 
-// Server is the stateless HTTP surface of the Sandbox Execution service. It holds
-// only the object-store client and the staging limits; every request builds a
-// fresh FileSource for the ref it carries, so the sandbox owns no per-goal state.
-type Server struct {
-	objects        *objectstore.Client
-	maxObjectBytes int64
-	maxTempDirSize string
+// refValidator reports whether a data source ref is one this system minted at
+// ingest, scoping the sandbox to the registry rather than arbitrary bucket paths.
+// It is a narrow local interface so internal/sandbox does not import internal/store;
+// cmd/sandbox adapts the store method into it. A nil validator is a test seam only
+// -- the wired binary always validates.
+type refValidator interface {
+	Validate(ctx context.Context, ref string) (bool, error)
 }
 
-// NewServer wires the handlers to the object store and staging limits.
-func NewServer(objects *objectstore.Client, maxObjectBytes int64, maxTempDirSize string) *Server {
-	return &Server{objects: objects, maxObjectBytes: maxObjectBytes, maxTempDirSize: maxTempDirSize}
+// Server is the HTTP surface of the Sandbox Execution service. It is stateless in
+// semantics -- every request builds a fresh reader for the ref it carries, so the
+// sandbox owns no per-goal state -- while the optional cache adds a pure performance
+// layer over immutable content-addressed refs. The limiter bounds per-class
+// concurrency, and the ref validator scopes requests to registered data sources.
+type Server struct {
+	objects           *objectstore.Client
+	validator         refValidator
+	cache             *StageCache
+	limiter           *classLimiter
+	maxObjectBytes    int64
+	maxBodyBytes      int64
+	maxTempDirSize    string
+	distinctValueCap  int
+	analyzeMaxColumns int
+	analyzeMaxBins    int
+}
+
+// NewServer wires the handlers to the object store, the ref validator, the staging
+// cache, the concurrency limiter, and the staging limits. It takes primitives and
+// narrow types only (infra-constructor convention). A nil validator and a nil cache
+// are documented test seams; the wired binary passes real ones. analyzeMaxColumns
+// and analyzeMaxBins bound the /analyze request shape (per-kind column count and a
+// binned column's bin count), derived from config.
+func NewServer(objects *objectstore.Client, validator refValidator, cache *StageCache, limiter *classLimiter, maxObjectBytes, maxBodyBytes int64, maxTempDirSize string, distinctValueCap, analyzeMaxColumns, analyzeMaxBins int) *Server {
+	return &Server{
+		objects:           objects,
+		validator:         validator,
+		cache:             cache,
+		limiter:           limiter,
+		maxObjectBytes:    maxObjectBytes,
+		maxBodyBytes:      maxBodyBytes,
+		maxTempDirSize:    maxTempDirSize,
+		distinctValueCap:  distinctValueCap,
+		analyzeMaxColumns: analyzeMaxColumns,
+		analyzeMaxBins:    analyzeMaxBins,
+	}
 }
 
 // Routes returns the mux for the endpoints.
@@ -32,6 +68,7 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /introspect", s.handleIntrospect)
 	mux.HandleFunc("POST /execute", s.handleExecute)
+	mux.HandleFunc("POST /analyze", s.handleAnalyze)
 	mux.HandleFunc("POST /document/text", s.handleDocumentText)
 	return mux
 }
@@ -40,8 +77,10 @@ func (s *Server) Routes() http.Handler {
 // the shared datasource types are tag-less by design, so the sandbox maps to
 // these local DTOs rather than tagging the shared package.
 type columnDTO struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name           string    `json:"name"`
+	Type           string    `json:"type"`
+	DistinctValues []string  `json:"distinct_values,omitempty"`
+	QuantileCuts   []float64 `json:"quantile_cuts,omitempty"`
 }
 
 type schemaDTO struct {
@@ -58,10 +97,14 @@ type TargetBinding struct {
 }
 
 // IntrospectRequest asks for the schema of a data source plus a binding of each
-// optimization target to a column.
+// optimization target to a column. QuantileBins opts into per-numeric-column
+// quantile cut points (0 = off, otherwise in [2, the analyze bin cap]), so a
+// caller deriving threshold predicates gets the boundaries the data supports
+// without a second staging pass.
 type IntrospectRequest struct {
 	DataSourceRef string          `json:"data_source_ref"`
 	Targets       []domain.Target `json:"targets"`
+	QuantileBins  int             `json:"quantile_bins,omitempty"`
 }
 
 // IntrospectResponse returns the schema and the per-target column bindings. For a
@@ -100,6 +143,8 @@ type ExecuteRequest struct {
 	Target          domain.Target           `json:"target"`
 	ValueExpression *domain.Expression      `json:"value_expression,omitempty"`
 	ObjectiveLabel  string                  `json:"objective_label,omitempty"`
+	EntityKeyColumn string                  `json:"entity_key_column,omitempty"`
+	TimeColumn      string                  `json:"time_column,omitempty"`
 	IncludeRowCount bool                    `json:"include_row_count,omitempty"`
 	Filters         []domain.Constraint     `json:"filters"`
 }
@@ -118,14 +163,126 @@ type ExecuteResponse struct {
 	Value map[string]any `json:"value"`
 }
 
+// Analyze-kind discriminators. contingency returns GROUP BY counts; moments
+// returns sum/sum-of-squares/cross-product aggregates for correlation estimation;
+// stratified_effect returns per-stratum segment/baseline aggregates for backdoor
+// adjustment; sampled_effect is the same shape over a reservoir subsample.
+const (
+	AnalyzeContingency      = "contingency"
+	AnalyzeMoments          = "moments"
+	AnalyzeStratifiedEffect = "stratified_effect"
+	AnalyzeSampledEffect    = "sampled_effect"
+)
+
+// AnalyzeColumn is one contingency-table column. Bins 0 groups on the raw
+// (categorical) value; a positive Bins quantile-buckets a numeric column into that
+// many bins. The numeric endpoints of a mixed pair are binned this way by the
+// caller; the moments kind never bins.
+type AnalyzeColumn struct {
+	Name string `json:"name"`
+	Bins int    `json:"bins,omitempty"`
+}
+
+// AnalyzeRequest asks for one contingency, moments, or effect aggregation over a
+// data source under optional hard-constraint filters. Fields are populated by kind:
+// Columns (contingency), Variables + GroupBy (moments), or Aggregation +
+// ValueExpression + Segment + Adjust (stratified_effect/sampled_effect). The
+// discriminator is additive-friendly: an unknown kind is rejected so later kinds
+// slot in without breaking the contract.
+//
+// For the effect kinds Aggregation + ValueExpression are the objective measured per
+// stratum (reusing the /execute compiler, so the non-hallucination guarantee is
+// identical); Segment is the treatment predicate whose segment/baseline arms are
+// aggregated within each stratum; Adjust is the (binnable) conditioning set Z the
+// query groups over; SampleFraction (sampled_effect only) is the reservoir subsample
+// share in (0, 1]; RandomStratifierBins, when positive, adds a server-generated
+// random bucket as an extra grouping term (the random-confounder refutation).
+type AnalyzeRequest struct {
+	DataSourceRef        string              `json:"data_source_ref"`
+	Kind                 string              `json:"kind"`
+	Filters              []domain.Constraint `json:"filters,omitempty"`
+	Columns              []AnalyzeColumn     `json:"columns,omitempty"`
+	Variables            []string            `json:"variables,omitempty"`
+	GroupBy              []string            `json:"group_by,omitempty"`
+	Aggregation          string              `json:"aggregation,omitempty"`
+	ValueExpression      *domain.Expression  `json:"value_expression,omitempty"`
+	Segment              []domain.Constraint `json:"segment,omitempty"`
+	Adjust               []AnalyzeColumn     `json:"adjust,omitempty"`
+	SampleFraction       float64             `json:"sample_fraction,omitempty"`
+	RandomStratifierBins int                 `json:"random_stratifier_bins,omitempty"`
+}
+
+// ContingencyCell is one row of a contingency table: the group-key values (in the
+// requested column order, numeric-binned rendered as bucket labels) and the matched
+// row count.
+type ContingencyCell struct {
+	Values []string `json:"values"`
+	Count  int64    `json:"count"`
+}
+
+// MomentsRow is one stratum's moment aggregates. Group is the categorical group-key
+// values (empty for the ungrouped form); N is the complete-case row count; Sum and
+// SumSq are per-variable in request order; Cross is the pairwise cross-product sums
+// for pairs (i,j) with i<j in request order, so the caller can form the covariance
+// (and thus correlation) matrix.
+type MomentsRow struct {
+	Group []string  `json:"group,omitempty"`
+	N     int64     `json:"n"`
+	Sum   []float64 `json:"sum"`
+	SumSq []float64 `json:"sum_sq"`
+	Cross []float64 `json:"cross"`
+}
+
+// StratumRow is one stratum of an effect aggregation: the conditioning-set key
+// values (Adjust column order, numeric-binned rendered as bucket labels, plus the
+// random bucket last when requested), the stratum's total complete-case row count N,
+// and the segment and baseline arms' counts and objective aggregates. SegmentAgg and
+// BaselineAgg are nullable — an arm with no matching rows aggregates to SQL NULL —
+// mirroring ExecuteResponse's null-number convention so the caller distinguishes an
+// empty arm from a measured zero.
+type StratumRow struct {
+	Values      []string `json:"values"`
+	N           int64    `json:"n"`
+	SegmentN    int64    `json:"segment_n"`
+	SegmentAgg  *float64 `json:"segment_agg"`
+	BaselineN   int64    `json:"baseline_n"`
+	BaselineAgg *float64 `json:"baseline_agg"`
+}
+
+// AnalyzeResponse carries the aggregation result keyed by kind: Cells for
+// contingency, Moments for moments, Strata for stratified_effect/sampled_effect.
+type AnalyzeResponse struct {
+	Kind    string            `json:"kind"`
+	Cells   []ContingencyCell `json:"cells,omitempty"`
+	Moments []MomentsRow      `json:"moments,omitempty"`
+	Strata  []StratumRow      `json:"strata,omitempty"`
+}
+
 func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
+	release, ok := s.acquireSlot(r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	var req IntrospectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.DataSourceRef == "" {
-		writeErr(w, http.StatusBadRequest, "data_source_ref is required")
+		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
+		return
+	}
+	// The bin count shares /analyze's cap: both bound the same per-column quantile
+	// work over the same engine, so a second knob would only let the two drift.
+	if req.QuantileBins != 0 && (req.QuantileBins < 2 || req.QuantileBins > s.analyzeMaxBins) {
+		service.WriteErr(w, http.StatusBadRequest,
+			fmt.Sprintf("quantile_bins %d not in [2, %d]", req.QuantileBins, s.analyzeMaxBins))
+		return
+	}
+	if !s.validateRef(w, r, req.DataSourceRef) {
 		return
 	}
 
@@ -134,21 +291,21 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	// Claude. Kind detection is by extension, mirroring the tabular reader's own
 	// extension dispatch, so the two readers own non-overlapping formats.
 	if isDocumentRef(req.DataSourceRef) {
-		src := NewDocumentSource(s.objects, req.DataSourceRef, s.maxObjectBytes)
+		src := NewDocumentSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes)
 		pages, err := src.Pages(r.Context())
 		if err != nil {
 			writeStageErr(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, IntrospectResponse{
+		service.WriteJSON(w, http.StatusOK, IntrospectResponse{
 			Schema: schemaDTO{Kind: string(datasource.KindDocument)},
 			Sample: documentSample(pages),
 		})
 		return
 	}
 
-	src := NewFileSource(s.objects, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
-	schema, err := src.Introspect(r.Context())
+	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize, s.distinctValueCap)
+	schema, err := src.IntrospectQuantiles(r.Context(), req.QuantileBins)
 	if err != nil {
 		writeStageErr(w, err)
 		return
@@ -156,33 +313,81 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 
 	bindings, err := bindTargets(req.Targets, schema.Columns)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		service.WriteErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, IntrospectResponse{Schema: toSchemaDTO(schema), TargetBindings: bindings})
+	service.WriteJSON(w, http.StatusOK, IntrospectResponse{Schema: toSchemaDTO(schema), TargetBindings: bindings})
+}
+
+// acquireSlot takes a concurrency slot for the default request class, blocking
+// until one frees. A non-nil error means the request context was cancelled while
+// waiting -- the client is gone, so no response is written.
+func (s *Server) acquireSlot(r *http.Request) (func(), bool) {
+	return s.acquireSlotClass(r, ClassDefault)
+}
+
+// acquireSlotClass takes a concurrency slot for the named class, so /analyze can
+// hold its own class independent of the default surface's slots.
+func (s *Server) acquireSlotClass(r *http.Request, class string) (func(), bool) {
+	release, err := s.limiter.Acquire(r.Context(), class)
+	if err != nil {
+		return nil, false
+	}
+	return release, true
+}
+
+// validateRef scopes a request to a registered data source. Unknown ref -> the same
+// 404 shape an object-store miss produces, so the boundary leaks no
+// registered-vs-missing oracle. A nil validator (test seam) skips the check; the
+// wired binary always validates.
+func (s *Server) validateRef(w http.ResponseWriter, r *http.Request, ref string) bool {
+	if s.validator == nil {
+		return true
+	}
+	ok, err := s.validator.Validate(r.Context(), ref)
+	if err != nil {
+		log.Printf("sandbox: validate data source ref: %v", err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	if !ok {
+		service.WriteErr(w, http.StatusNotFound, "data source not found")
+		return false
+	}
+	return true
 }
 
 // handleDocumentText serves a document's ordered per-page plain text. It mirrors
 // handleIntrospect's stage-and-read shape and is deterministic (no LLM): the
 // orchestrator fetches this once per run as the substrate for provenance search.
 func (s *Server) handleDocumentText(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
+	release, ok := s.acquireSlot(r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	var req DocumentTextRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.DataSourceRef == "" {
-		writeErr(w, http.StatusBadRequest, "data_source_ref is required")
+		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
+		return
+	}
+	if !s.validateRef(w, r, req.DataSourceRef) {
 		return
 	}
 
-	src := NewDocumentSource(s.objects, req.DataSourceRef, s.maxObjectBytes)
+	src := NewDocumentSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes)
 	pages, err := src.Pages(r.Context())
 	if err != nil {
 		writeStageErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, DocumentTextResponse{Pages: pages})
+	service.WriteJSON(w, http.StatusOK, DocumentTextResponse{Pages: pages})
 }
 
 // isDocumentRef reports whether a ref is a document this service reads (a PDF
@@ -193,23 +398,49 @@ func isDocumentRef(ref string) bool {
 }
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
+	release, ok := s.acquireSlot(r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	var req ExecuteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.DataSourceRef == "" {
-		writeErr(w, http.StatusBadRequest, "data_source_ref is required")
+		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
+		return
+	}
+	if !s.validateRef(w, r, req.DataSourceRef) {
 		return
 	}
 
 	if req.Type != "" && req.Type != domain.InterventionQuery {
-		writeErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported intervention type %q", req.Type))
+		service.WriteErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported intervention type %q", req.Type))
 		return
 	}
 
-	src := NewFileSource(s.objects, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize)
-	m, err := src.ExecuteCounted(r.Context(), req.Aggregation, req.Target, req.ValueExpression, req.Filters, req.IncludeRowCount)
+	// Reject a statically-invalid request (bad aggregation/operator/cast/literal)
+	// before constructing the reader, so no object-store Get is paid for a request
+	// the compiler would refuse anyway. Column/type checks need the schema and stay
+	// in the compiler.
+	if err := staticValidate(req.Aggregation, req.ValueExpression, req.Filters); err != nil {
+		writeStageErr(w, err)
+		return
+	}
+	// A windowed value expression needs entity/time bindings to compile; reject one
+	// without them here, pre-staging, since the check is schema-independent.
+	if req.ValueExpression != nil && domain.HasWindowKind(*req.ValueExpression) &&
+		(req.EntityKeyColumn == "" || req.TimeColumn == "") {
+		service.WriteErr(w, http.StatusBadRequest, "windowed objective requires entity_key_column and time_column")
+		return
+	}
+
+	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize, s.distinctValueCap)
+	m, err := src.ExecuteCounted(r.Context(), req.Aggregation, req.Target, req.ValueExpression, req.Filters, req.IncludeRowCount, req.EntityKeyColumn, req.TimeColumn)
 	if err != nil {
 		writeStageErr(w, err)
 		return
@@ -230,7 +461,52 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	if m.Counted {
 		value[rowCountKey] = m.RowCount
 	}
-	writeJSON(w, http.StatusOK, ExecuteResponse{Value: value})
+	service.WriteJSON(w, http.StatusOK, ExecuteResponse{Value: value})
+}
+
+// handleAnalyze answers a contingency or moments aggregation, following
+// handleExecute's hardening order: MaxBytesReader -> acquire an analyze-class slot
+// -> decode -> validateRef -> static request-shape validation (a 422, pre-staging)
+// -> compile+run over the staged engine -> writeStageErr. It is the read-only
+// surface the causal-discovery sweep drives.
+func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
+	release, ok := s.acquireSlotClass(r, ClassAnalyze)
+	if !ok {
+		return
+	}
+	defer release()
+
+	var req AnalyzeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		service.WriteErr(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.DataSourceRef == "" {
+		service.WriteErr(w, http.StatusBadRequest, "data_source_ref is required")
+		return
+	}
+	if !s.validateRef(w, r, req.DataSourceRef) {
+		return
+	}
+
+	// Request-shape validation is schema-independent, so it runs before staging and
+	// answers 422 (unprocessable) rather than the 400/404 writeStageErr maps: an
+	// unknown kind or over-cap column count is a caller contract error, not a
+	// staging fault. Column existence and type checks need the schema and stay in
+	// the compile step below.
+	if err := staticValidateAnalyze(req, s.analyzeMaxColumns, s.analyzeMaxBins); err != nil {
+		service.WriteErr(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	src := NewFileSource(s.objects, s.cache, req.DataSourceRef, s.maxObjectBytes, s.maxTempDirSize, s.distinctValueCap)
+	resp, err := src.Analyze(r.Context(), req)
+	if err != nil {
+		writeStageErr(w, err)
+		return
+	}
+	service.WriteJSON(w, http.StatusOK, resp)
 }
 
 // bindTargets binds each target to a column using the shared case-insensitive
@@ -256,7 +532,7 @@ func bindTargets(targets []domain.Target, cols []datasource.Column) ([]TargetBin
 func toSchemaDTO(schema *datasource.Schema) schemaDTO {
 	cols := make([]columnDTO, 0, len(schema.Columns))
 	for _, c := range schema.Columns {
-		cols = append(cols, columnDTO{Name: c.Name, Type: c.Type})
+		cols = append(cols, columnDTO{Name: c.Name, Type: c.Type, DistinctValues: c.DistinctValues, QuantileCuts: c.QuantileCuts})
 	}
 	return schemaDTO{Kind: string(schema.Kind), Columns: cols}
 }
@@ -267,7 +543,7 @@ func toSchemaDTO(schema *datasource.Schema) schemaDTO {
 func writeStageErr(w http.ResponseWriter, err error) {
 	switch {
 	case objectstore.IsNotFound(err):
-		writeErr(w, http.StatusNotFound, "data source not found")
+		service.WriteErr(w, http.StatusNotFound, "data source not found")
 	case errors.Is(err, errUnknownField),
 		errors.Is(err, errAmbiguousField),
 		errors.Is(err, errNonNumeric),
@@ -279,27 +555,11 @@ func writeStageErr(w http.ResponseWriter, err error) {
 		errors.Is(err, errUnsupportedFormat),
 		errors.Is(err, errUnsupportedDocument),
 		errors.Is(err, errObjectTooLarge):
-		writeErr(w, http.StatusBadRequest, err.Error())
+		service.WriteErr(w, http.StatusBadRequest, err.Error())
 	default:
 		// The detail is masked from the client but logged so a 500-class defect
 		// leaves a diagnostic trail.
 		log.Printf("sandbox: internal error: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 	}
-}
-
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("sandbox: encode response: %v", err)
-	}
-}
-
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, errorResponse{Error: msg})
 }

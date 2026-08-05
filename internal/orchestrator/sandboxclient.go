@@ -11,7 +11,6 @@ import (
 type (
 	columnDTO            = sandboxclient.Column
 	schemaDTO            = sandboxclient.Schema
-	TargetBinding        = sandboxclient.TargetBinding
 	IntrospectRequest    = sandboxclient.IntrospectRequest
 	IntrospectResponse   = sandboxclient.IntrospectResponse
 	DocumentTextRequest  = sandboxclient.DocumentTextRequest
@@ -19,8 +18,4 @@ type (
 	ExecuteRequest       = sandboxclient.ExecuteRequest
 	ExecuteResponse      = sandboxclient.ExecuteResponse
 	SandboxError         = sandboxclient.SandboxError
-	SandboxClient        = sandboxclient.Client
 )
-
-// NewSandboxClient points a client at the sandbox base URL.
-var NewSandboxClient = sandboxclient.NewClient

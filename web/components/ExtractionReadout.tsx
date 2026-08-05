@@ -1,3 +1,4 @@
+import { formatConfidence } from "@/lib/format";
 import type { ExtractionTripletPayload } from "@/lib/orchestrator";
 import { cn } from "@/components/ui";
 
@@ -38,7 +39,7 @@ export function ExtractionReadout({
             low ? "text-warn" : "text-signal",
           )}
         >
-          {confidence.toFixed(2)}
+          {formatConfidence(confidence)}
         </span>
       </div>
 

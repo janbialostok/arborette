@@ -104,6 +104,12 @@ func (w *Worker) writeSegment(ctx context.Context, target searchTarget, obj obje
 			domain.PropSupport:              seg.measurement.Support,
 		},
 	}
+	// The properties map is open, so recording the proposer needs no graph-schema
+	// change, and its absence stays the honest answer for a segment the search built
+	// from this goal's own predicates.
+	if seg.node.proposedBy != "" {
+		intervention.Properties[domain.PropProposedBy] = seg.node.proposedBy
+	}
 	if err := w.repo.CreateIntervention(ctx, intervention); err != nil {
 		return winner{}, err
 	}
@@ -133,12 +139,23 @@ func (w *Worker) writeSegment(ctx context.Context, target searchTarget, obj obje
 		return winner{}, err
 	}
 
-	w.report(ctx, "sleepcycle_intervention", "intervention", map[string]any{
+	// The proposing heuristic is recorded as nil rather than "" when the search built
+	// the segment itself: an empty string is a valid-looking id, and a consumer
+	// counting knowledge reuse would file such a winner under a phantom heuristic.
+	interventionDetail := map[string]any{
 		"optimization_function_id": target.goalID,
 		"intervention_id":          interventionID,
 		"canonical_filter":         canonical,
 		"support":                  seg.measurement.Support,
-	})
+		// A literal, not the graph property constant: the audit log's schema is its
+		// own, and renaming a node property must not silently rename a field a
+		// consumer queries on.
+		"proposed_by_meta_heuristic_id": nil,
+	}
+	if seg.node.proposedBy != "" {
+		interventionDetail["proposed_by_meta_heuristic_id"] = seg.node.proposedBy
+	}
+	w.report(ctx, "sleepcycle_intervention", "intervention", interventionDetail)
 	w.report(ctx, "sleepcycle_outcome", "outcome", map[string]any{
 		"optimization_function_id": target.goalID,
 		"outcome_id":               outcomeID,

@@ -54,7 +54,7 @@ type candidate struct {
 func (w *Worker) candidatesFromFindings(ctx context.Context, goalID string, findings []graph.CausalTriplet, obj objective.Objective, baseline float64) []candidate {
 	var cands []candidate
 	for _, f := range findings {
-		filters, err := decodeConstraints(f.Intervention.Properties[domain.PropEffectiveFilters])
+		filters, err := domain.DecodeConstraints(f.Intervention.Properties[domain.PropEffectiveFilters])
 		if err != nil {
 			w.publicationFailure(ctx, goalID, f.Intervention.ID, err)
 			continue
@@ -126,32 +126,14 @@ func (w *Worker) candidatesFromWinners(written []winner, atoms []atom, obj objec
 }
 
 // shrunkScore ranks a candidate by how far it moves the objective, discounted by
-// how much evidence backs the move. The weight support/(support+k) is the
-// empirical-Bayes shrinkage of the measured value toward the baseline, and
-// multiplying the delta by it is algebraically identical to shrinking the value
-// first and then taking the delta.
+// how much evidence backs the move — the shared support-shrunk score, at this
+// worker's support floor.
 //
-// Ranking on the raw delta instead puts a 54-row segment that hit 100% above an
-// 800-row segment at 98.9% — publishing the thinner evidence as the stronger
-// heuristic, which is precisely backwards for a consumer that can only act on
-// what was published. k is MinSupport rather than a knob of its own: the floor
-// already states how many rows the operator considers sufficient evidence, and
-// that is exactly where the weight reaches one half.
+// k is MinSupport rather than a knob of its own: the floor already states how many
+// rows the operator considers sufficient evidence, and that is exactly where the
+// shrinkage weight reaches one half.
 func (w *Worker) shrunkScore(value, baseline float64, support int64, direction domain.TargetDirection) float64 {
-	k := float64(w.cfg.MinSupport)
-	return directionalDelta(value, baseline, direction) * float64(support) / (float64(support) + k)
-}
-
-// directionalDelta is the value's movement in the objective's desired direction,
-// so a plain descending sort ranks both directions. Every ranked stage shares it:
-// a sign error here silently inverts a whole ranking, so it gets one definition
-// rather than one per stage.
-func directionalDelta(value, baseline float64, direction domain.TargetDirection) float64 {
-	d := value - baseline
-	if direction == domain.Minimize {
-		return -d
-	}
-	return d
+	return domain.ShrunkScore(value, baseline, support, float64(w.cfg.MinSupport), direction)
 }
 
 // publicationFailure records one candidate that could not be built. Isolated per

@@ -40,14 +40,19 @@ const maxTokens = 16000
 // worker. Every method takes structured inputs and returns structured outputs
 // using the shared prompt and response-decode machinery below.
 type Client interface {
-	GenerateEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema) (domain.EvaluationMatrix, error)
-	RepairEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema, prior domain.EvaluationMatrix, validationErr string) (domain.EvaluationMatrix, error)
+	GenerateEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema, windowed bool) (domain.EvaluationMatrix, error)
+	RepairEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema, prior domain.EvaluationMatrix, validationErr string, windowed bool) (domain.EvaluationMatrix, error)
 	ProposeInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) (Proposal, error)
 	RepairInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext, prior Proposal, validationErr string) (Proposal, error)
 	IntrospectDocumentFields(ctx context.Context, goalText, sample string) ([]domain.TargetField, error)
 	Extract(ctx context.Context, pdf []byte, field domain.TargetField, method string) (string, float64, error)
 	AbstractMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment) (Abstraction, error)
 	RepairMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment, prior Abstraction, validationErr string) (Abstraction, error)
+	OrientCausalEdges(ctx context.Context, goalText string, columns []ColumnSemantics, edges []OrientEdge) ([]OrientDecision, error)
+	RepairOrientCausalEdges(ctx context.Context, goalText string, columns []ColumnSemantics, edges []OrientEdge, prior []OrientDecision, validationErr string) ([]OrientDecision, error)
+	ClassifyGoalIntent(ctx context.Context, goal GoalIntentInput) (GoalIntentResult, error)
+	CritiqueAtoms(ctx context.Context, goalText string, schema SandboxSchema) (AtomCritique, error)
+	GroundHeuristic(ctx context.Context, definition string, terms []OntologyTerm, schema SandboxSchema) ([]domain.Constraint, error)
 }
 
 // NewClient builds an LLM client from configuration. The LLM_PROVIDER env
@@ -92,34 +97,50 @@ type client struct {
 	backend completer
 }
 
-func (c *client) GenerateEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema) (domain.EvaluationMatrix, error) {
-	user := "Analyst goal:\n" + goalText + "\n\nAvailable columns:\n" + columnSummary(schema)
-	body, err := c.backend.complete(ctx, evaluationMatrixSystem, user, evaluationMatrixSchema(schema))
+func (c *client) GenerateEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema, windowed bool) (domain.EvaluationMatrix, error) {
+	fence := NewFence("GOAL-CONTEXT")
+	user := "Analyst goal:\n" + fence.Wrap(goalText) + "\n\nAvailable columns:\n" + fence.Wrap(columnSummary(schema)) +
+		windowAvailability(windowed)
+	body, err := c.backend.complete(ctx, evaluationMatrixSystem+fence.Directive(), user, evaluationMatrixSchema(schema))
 	if err != nil {
 		return domain.EvaluationMatrix{}, err
 	}
 	return decodeMatrix(body)
 }
 
-func (c *client) RepairEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema, prior domain.EvaluationMatrix, validationErr string) (domain.EvaluationMatrix, error) {
+func (c *client) RepairEvaluationMatrix(ctx context.Context, goalText string, schema SandboxSchema, prior domain.EvaluationMatrix, validationErr string, windowed bool) (domain.EvaluationMatrix, error) {
 	priorJSON, err := encodeMatrix(prior)
 	if err != nil {
 		return domain.EvaluationMatrix{}, fmt.Errorf("encode prior matrix: %w", err)
 	}
-	user := "Analyst goal:\n" + goalText + "\n\nAvailable columns:\n" + columnSummary(schema) +
-		"\nThis fitted objective failed to compile against the data source:\n" + string(priorJSON) +
-		"\n\nThe sandbox rejected it with:\n" + validationErr +
+	fence := NewFence("GOAL-CONTEXT")
+	user := "Analyst goal:\n" + fence.Wrap(goalText) + "\n\nAvailable columns:\n" + fence.Wrap(columnSummary(schema)) +
+		windowAvailability(windowed) +
+		"\nThis fitted objective failed to compile against the data source:\n" + fence.Wrap(string(priorJSON)) +
+		"\n\nThe sandbox rejected it with:\n" + fence.Wrap(validationErr) +
 		"\n\nReturn a corrected Evaluation Matrix whose objective compiles and measures."
-	body, err := c.backend.complete(ctx, evaluationMatrixRepairSystem, user, evaluationMatrixSchema(schema))
+	body, err := c.backend.complete(ctx, evaluationMatrixRepairSystem+fence.Directive(), user, evaluationMatrixSchema(schema))
 	if err != nil {
 		return domain.EvaluationMatrix{}, err
 	}
 	return decodeMatrix(body)
 }
 
+// windowAvailability tells the objective-fitting model whether this goal bound the
+// entity/time columns a windowed value expression needs. Window kinds are
+// unreachable without those bindings, so the model must use them only when
+// available. The line is service-derived (trusted), so it sits outside the fence.
+func windowAvailability(windowed bool) string {
+	if windowed {
+		return "\n\nWindowed objectives ARE available for this goal (entity and time columns are bound): you may use the lag and trailing_aggregate value-expression kinds when the goal calls for an entity-relative signal."
+	}
+	return "\n\nWindowed objectives are NOT available for this goal (no entity/time columns bound): do not use the lag or trailing_aggregate value-expression kinds."
+}
+
 func (c *client) ProposeInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) (Proposal, error) {
-	body, err := c.backend.complete(ctx, interventionTreeSystem,
-		treePrompt(goalText, matrix, schema, node), interventionTreeSchema(schema))
+	fence := NewFence("GOAL-CONTEXT")
+	body, err := c.backend.complete(ctx, interventionTreeSystem+fence.Directive(),
+		treePrompt(fence, goalText, matrix, schema, node), interventionTreeSchema(schema))
 	if err != nil {
 		return Proposal{}, err
 	}
@@ -127,11 +148,12 @@ func (c *client) ProposeInterventionTree(ctx context.Context, goalText string, m
 }
 
 func (c *client) RepairInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext, prior Proposal, validationErr string) (Proposal, error) {
-	user := treePrompt(goalText, matrix, schema, node) +
-		"\nThese proposed candidates referenced columns absent from the schema:\n" + renderCandidates(prior.Candidates) +
-		"\n\nThe rejection:\n" + validationErr +
-		"\n\nRe-propose the candidates using only the listed columns, with their exact names."
-	body, err := c.backend.complete(ctx, interventionTreeRepairSystem, user, interventionTreeSchema(schema))
+	fence := NewFence("GOAL-CONTEXT")
+	user := treePrompt(fence, goalText, matrix, schema, node) +
+		"\nThese proposed candidates were rejected:\n" + fence.Wrap(renderCandidates(prior.Candidates)) +
+		"\n\nThe rejection:\n" + fence.Wrap(validationErr) +
+		"\n\nRe-propose replacement candidates that resolve the rejection, drawing every filter column and value from the Available columns list."
+	body, err := c.backend.complete(ctx, interventionTreeRepairSystem+fence.Directive(), user, interventionTreeSchema(schema))
 	if err != nil {
 		return Proposal{}, err
 	}
@@ -139,8 +161,9 @@ func (c *client) RepairInterventionTree(ctx context.Context, goalText string, ma
 }
 
 func (c *client) IntrospectDocumentFields(ctx context.Context, goalText, sample string) ([]domain.TargetField, error) {
-	user := "Analyst goal:\n" + goalText + "\n\nDocument sample (first page):\n" + sample
-	body, err := c.backend.complete(ctx, documentFieldsSystem, user, documentFieldsSchema())
+	fence := NewFence("DOC-CONTEXT")
+	user := "Analyst goal:\n" + fence.Wrap(goalText) + "\n\nDocument sample (first page):\n" + fence.Wrap(sample)
+	body, err := c.backend.complete(ctx, documentFieldsSystem+fence.Directive(), user, documentFieldsSchema())
 	if err != nil {
 		return nil, err
 	}
@@ -148,8 +171,9 @@ func (c *client) IntrospectDocumentFields(ctx context.Context, goalText, sample 
 }
 
 func (c *client) Extract(ctx context.Context, pdf []byte, field domain.TargetField, method string) (string, float64, error) {
-	body, err := c.backend.completeWithPDF(ctx, extractionSystem, pdf,
-		extractionInstruction(field, method), extractionSchema())
+	fence := NewFence("FIELD-CONTEXT")
+	body, err := c.backend.completeWithPDF(ctx, extractionSystem+fence.Directive(), pdf,
+		extractionInstruction(fence, field, method), extractionSchema())
 	if err != nil {
 		return "", 0, err
 	}
@@ -157,8 +181,9 @@ func (c *client) Extract(ctx context.Context, pdf []byte, field domain.TargetFie
 }
 
 func (c *client) AbstractMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment) (Abstraction, error) {
-	body, err := c.backend.complete(ctx, metaHeuristicSystem,
-		macroSegmentPrompt(goalText, seg), metaHeuristicSchema())
+	fence := NewFence("SEGMENT-CONTEXT")
+	body, err := c.backend.complete(ctx, metaHeuristicSystem+fence.Directive(),
+		macroSegmentPrompt(fence, goalText, seg), metaHeuristicSchema())
 	if err != nil {
 		return Abstraction{}, err
 	}
@@ -166,11 +191,12 @@ func (c *client) AbstractMetaHeuristic(ctx context.Context, goalText string, seg
 }
 
 func (c *client) RepairMetaHeuristic(ctx context.Context, goalText string, seg MacroSegment, prior Abstraction, validationErr string) (Abstraction, error) {
-	user := macroSegmentPrompt(goalText, seg) +
-		"\nThis definition still referenced concrete, dataset-bound terms:\n" + prior.Definition +
-		"\n\nThe rejection:\n" + validationErr +
+	fence := NewFence("SEGMENT-CONTEXT")
+	user := macroSegmentPrompt(fence, goalText, seg) +
+		"\nThis definition still referenced concrete, dataset-bound terms:\n" + fence.Wrap(prior.Definition) +
+		"\n\nThe rejection:\n" + fence.Wrap(validationErr) +
 		"\n\nRewrite the definition so every variable is a bracketed ontology term and no raw column name survives."
-	body, err := c.backend.complete(ctx, metaHeuristicRepairSystem, user, metaHeuristicSchema())
+	body, err := c.backend.complete(ctx, metaHeuristicRepairSystem+fence.Directive(), user, metaHeuristicSchema())
 	if err != nil {
 		return Abstraction{}, err
 	}
@@ -211,9 +237,11 @@ func decodeExtraction(body string) (string, float64, error) {
 	return wire.Value, wire.Confidence, nil
 }
 
-func extractionInstruction(field domain.TargetField, method string) string {
+func extractionInstruction(fence Fence, field domain.TargetField, method string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Extract this field from the attached document:\n- %s: %s\n", field.Name, field.Description)
+	b.WriteString("Extract this field from the attached document:\n")
+	b.WriteString(fence.Wrap(fmt.Sprintf("- %s: %s", field.Name, field.Description)))
+	b.WriteString("\n")
 	if method != "" {
 		fmt.Fprintf(&b, "\nApproach: %s\n", method)
 	}
@@ -262,6 +290,28 @@ func decodeProposal(body string) (Proposal, error) {
 		proposal.Candidates = append(proposal.Candidates, CandidateIntervention{Filters: filters})
 	}
 	return proposal, nil
+}
+
+// decodeFilterConjunction parses a JSON-encoded array of filter objects into a
+// typed conjunction. Every call whose output carries filters as a plain string
+// rather than a schema'd array — claim extraction, heuristic grounding — decodes
+// through it, so the shape the prompts describe and the shape the code accepts
+// cannot drift apart. An empty array decodes to an empty conjunction; what that
+// means is the caller's to decide.
+func decodeFilterConjunction(raw string) ([]domain.Constraint, error) {
+	var wire []filterWire
+	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
+		return nil, err
+	}
+	filters := make([]domain.Constraint, 0, len(wire))
+	for _, fw := range wire {
+		f, err := fw.toConstraint()
+		if err != nil {
+			return nil, err
+		}
+		filters = append(filters, f)
+	}
+	return filters, nil
 }
 
 func (f filterWire) toConstraint() (domain.Constraint, error) {
@@ -402,37 +452,41 @@ const evaluationMatrixRepairSystem = "You fit an analyst's optimization goal to 
 	"each column's exact name as written there — a name absent from the list will not compile." +
 	expressionShapeGuide
 
-const expressionShapeGuide = ` Each target's "value" field MUST be a JSON string containing a JSON object that encodes the value expression — not a bare object. That object is a discriminated union on a "kind" field, one of: column_ref {"kind":"column_ref","column":<name>}; literal {"kind":"literal","literal":{"number"|"string"|"bool":<value>}}; cast {"kind":"cast","operand":<expr>,"cast_type":<type>}; comparison {"kind":"comparison","op":<op>,"left":<expr>,"right":<expr>}; arithmetic {"kind":"arithmetic","op":<op>,"left":<expr>,"right":<expr>}; case {"kind":"case","cases":[{"when":<expr>,"then":<expr>}],"else":<expr>}. Nested expressions are the same object shape. A plain numeric objective is a bare column_ref, e.g. "value":"{\"kind\":\"column_ref\",\"column\":\"revenue\"}". A boolean rate is avg over a comparison, e.g. "value":"{\"kind\":\"comparison\",\"op\":\"=\",\"left\":{\"kind\":\"column_ref\",\"column\":\"Transported\"},\"right\":{\"kind\":\"literal\",\"literal\":{\"bool\":true}}}". A bucketed rate is avg over a case, e.g. avg(CASE WHEN age > 18 THEN 1 ELSE 0 END) is a case whose one branch compares age > 18 then literal 1, else literal 0. Reference only columns from the "Available columns" list inside the expression.`
+const expressionShapeGuide = ` Each target's "value" field MUST be a JSON string containing a JSON object that encodes the value expression — not a bare object. That object is a discriminated union on a "kind" field, one of: column_ref {"kind":"column_ref","column":<name>}; literal {"kind":"literal","literal":{"number"|"string"|"bool":<value>}}; cast {"kind":"cast","operand":<expr>,"cast_type":<type>}; comparison {"kind":"comparison","op":<op>,"left":<expr>,"right":<expr>}; arithmetic {"kind":"arithmetic","op":<op>,"left":<expr>,"right":<expr>}; case {"kind":"case","cases":[{"when":<expr>,"then":<expr>}],"else":<expr>}. Nested expressions are the same object shape. A plain numeric objective is a bare column_ref, e.g. "value":"{\"kind\":\"column_ref\",\"column\":\"revenue\"}". A boolean rate is avg over a comparison, e.g. "value":"{\"kind\":\"comparison\",\"op\":\"=\",\"left\":{\"kind\":\"column_ref\",\"column\":\"Transported\"},\"right\":{\"kind\":\"literal\",\"literal\":{\"bool\":true}}}". A bucketed rate is avg over a case, e.g. avg(CASE WHEN age > 18 THEN 1 ELSE 0 END) is a case whose one branch compares age > 18 then literal 1, else literal 0. Two additional kinds express entity-relative signals over an entity's ordered history and are valid ONLY when windowed objectives are available for the goal: lag {"kind":"lag","inner":<expr>,"offset":<n>} is the value of the inner expression n rows earlier for the same entity (n an integer >= 1); trailing_aggregate {"kind":"trailing_aggregate","window_agg":<agg>,"inner":<expr>,"window_size":<n>} applies an aggregate (avg/sum/min/max/count) of the inner expression over the n rows preceding the current one for the same entity (n an integer >= 1). A window kind may not nest inside another window kind. For example, a transaction amount relative to the account's recent mean is arithmetic dividing a column_ref by a trailing_aggregate avg of that column. Reference only columns from the "Available columns" list inside the expression.`
 
 const interventionTreeSystem = "You propose candidate interventions for an empirical hypothesis tree over a " +
 	"tabular data source. Each candidate is a set of filters that segments the data; the run " +
 	"measures a single fixed objective aggregate over each segment. The objective is already fixed. Filter fields " +
 	"must reference ONLY columns present in the provided \"Available columns\" list, using each column's exact " +
-	"name as written there — a name absent from the list will be rejected. Candidates vary filters only — never " +
-	"re-propose the objective." + filterShapeGuide
+	"name as written there — a name absent from the list will be rejected. When a column lists a value set " +
+	"(shown as \"values: ...\"), an eq/neq/in/not_in filter on that column MUST use only values drawn verbatim " +
+	"from that set — a value absent from it will be rejected; a column with no listed values is not " +
+	"value-constrained. Candidates vary filters only — never re-propose the objective." + filterShapeGuide
 
 const interventionTreeRepairSystem = "You propose candidate interventions for an empirical hypothesis tree over a " +
-	"tabular data source. A previous proposal referenced filter columns absent from the schema. Given the rejected " +
-	"candidates and the naming error, re-propose the candidates as filters that segment the data " +
+	"tabular data source. A previous proposal was rejected — a filter naming an unknown column or value, or a " +
+	"segment that matched no rows. Given the rejected candidates and the rejection reason, re-propose replacement " +
+	"candidates as filters that segment the data " +
 	"toward the fixed objective. Filter fields must reference ONLY columns present in the provided \"Available " +
-	"columns\" list, using each column's exact name as written there. Candidates vary filters only — never " +
-	"re-propose the objective." + filterShapeGuide
+	"columns\" list, using each column's exact name as written there. When a column lists a value set (shown as " +
+	"\"values: ...\"), an eq/neq/in/not_in filter on that column MUST use only values drawn verbatim from that " +
+	"set. Candidates vary filters only — never re-propose the objective." + filterShapeGuide
 
 const filterShapeGuide = ` Each filter is {"field":<column>,"op":<operator>,"value":<value>}. Choose the operator and value by the column's type: a numeric column uses "lt"/"lte"/"gt"/"gte" with a number (e.g. {"field":"Age","op":"lte","value":18}); a boolean column uses "eq"/"neq" with true or false (e.g. {"field":"CryoSleep","op":"eq","value":true}); a categorical/string column uses "eq"/"neq" with a string, or "in"/"not_in" with an array of strings (e.g. {"field":"HomePlanet","op":"in","value":["Europa","Mars"]}). The value is a bare JSON scalar for eq/neq and the threshold ops, and a JSON array for in/not_in — never a quoted-JSON string. Use only an operator and value type that match the column's type.`
 
-func treePrompt(goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) string {
+func treePrompt(fence Fence, goalText string, matrix domain.EvaluationMatrix, schema SandboxSchema, node TreeContext) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Analyst goal:\n%s\n\n", goalText)
-	fmt.Fprintf(&b, "Evaluation Matrix:\n%s\n\n", MatrixSummary(matrix))
-	fmt.Fprintf(&b, "Available columns:\n%s\n\n", columnSummary(schema))
+	fmt.Fprintf(&b, "Analyst goal:\n%s\n\n", fence.Wrap(goalText))
+	fmt.Fprintf(&b, "Evaluation Matrix:\n%s\n\n", fence.Wrap(MatrixSummary(matrix)))
+	fmt.Fprintf(&b, "Available columns:\n%s\n\n", fence.Wrap(columnSummary(schema)))
 	if node.IsRoot {
 		fmt.Fprintf(&b, "This is the root node. Propose up to %d candidate interventions (filters only) that "+
 			"segment the data toward the objective.\n", node.Breadth)
 		return b.String()
 	}
-	fmt.Fprintf(&b, "Fixed objective: %s, to %s.\n", node.ObjectiveLabel, node.Direction)
+	fmt.Fprintf(&b, "Fixed objective (to %s):\n%s\n", node.Direction, fence.Wrap(node.ObjectiveLabel))
 	fmt.Fprintf(&b, "Parent's effective filters (your proposals nest cumulatively on top of these):\n%s\n",
-		filterSummary(node.ParentFilters))
+		fence.Wrap(filterSummary(node.ParentFilters)))
 	if node.PriorValue != nil {
 		fmt.Fprintf(&b, "Parent's measured objective value (the baseline to improve on): %v\n", *node.PriorValue)
 	}
@@ -459,9 +513,25 @@ func MatrixSummary(matrix domain.EvaluationMatrix) string {
 func columnSummary(schema SandboxSchema) string {
 	var b strings.Builder
 	for _, c := range schema.Columns {
-		fmt.Fprintf(&b, "- %s (%s)\n", c.Name, c.Type)
+		fmt.Fprintf(&b, "- %s (%s)", c.Name, c.Type)
+		if len(c.DistinctValues) > 0 {
+			fmt.Fprintf(&b, " values: %s", quotedValues(c.DistinctValues))
+		}
+		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// quotedValues renders a low-cardinality column's distinct values as a
+// comma-separated quoted list for the grounding prompt (e.g. `"a", "b", "c"`).
+// The values are dataset-derived untrusted text, so every caller interpolates the
+// column summary inside a fenced region.
+func quotedValues(values []string) string {
+	parts := make([]string, 0, len(values))
+	for _, v := range values {
+		parts = append(parts, fmt.Sprintf("%q", v))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func filterSummary(filters []domain.Constraint) string {

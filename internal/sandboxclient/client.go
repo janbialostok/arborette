@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/arborette/arborette/internal/domain"
+	"github.com/arborette/arborette/internal/service"
 )
 
 // defaultSandboxTimeout bounds a single sandbox call so a background caller
@@ -31,10 +32,18 @@ const defaultSandboxTimeout = 2 * time.Minute
 // agg(expr) shape, so it can never collide with this key.
 const RowCountKey = "row_count"
 
-// Column is one introspected column name and its type.
+// Column is one introspected column name and its type. DistinctValues carries the
+// column's distinct value set when it is a low-cardinality categorical column, and
+// is nil otherwise (high-cardinality, continuous, or not probed); QuantileCuts
+// carries a numeric column's interior quantile cut points when the request asked
+// for them, and is nil otherwise (non-numeric, not requested, or a constant column
+// whose quantiles came back NULL). Both are omitempty so the legacy value-less
+// schema is unchanged on the wire.
 type Column struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name           string    `json:"name"`
+	Type           string    `json:"type"`
+	DistinctValues []string  `json:"distinct_values,omitempty"`
+	QuantileCuts   []float64 `json:"quantile_cuts,omitempty"`
 }
 
 // Schema is a data source's introspected shape.
@@ -52,10 +61,13 @@ type TargetBinding struct {
 }
 
 // IntrospectRequest asks the sandbox for a data source's schema plus a binding
-// of each optimization target to a column.
+// of each optimization target to a column. QuantileBins opts into per-numeric-
+// column quantile cut points (0 = off, otherwise at least 2 and within the
+// sandbox's bin cap); omitempty so the legacy request is unchanged on the wire.
 type IntrospectRequest struct {
 	DataSourceRef string          `json:"data_source_ref"`
 	Targets       []domain.Target `json:"targets"`
+	QuantileBins  int             `json:"quantile_bins,omitempty"`
 }
 
 // IntrospectResponse returns the schema and per-target column bindings. For a
@@ -91,6 +103,8 @@ type ExecuteRequest struct {
 	Target          domain.Target           `json:"target"`
 	ValueExpression *domain.Expression      `json:"value_expression,omitempty"`
 	ObjectiveLabel  string                  `json:"objective_label,omitempty"`
+	EntityKeyColumn string                  `json:"entity_key_column,omitempty"`
+	TimeColumn      string                  `json:"time_column,omitempty"`
 	IncludeRowCount bool                    `json:"include_row_count,omitempty"`
 	Filters         []domain.Constraint     `json:"filters"`
 }
@@ -121,6 +135,78 @@ func RowCount(resp ExecuteResponse) (int64, bool) {
 	}
 }
 
+// Analyze-kind discriminators, byte-identical to the sandbox's own constants.
+const (
+	AnalyzeContingency      = "contingency"
+	AnalyzeMoments          = "moments"
+	AnalyzeStratifiedEffect = "stratified_effect"
+	AnalyzeSampledEffect    = "sampled_effect"
+)
+
+// AnalyzeColumn is one contingency-table column: Bins 0 groups on the raw
+// categorical value, a positive Bins quantile-buckets a numeric column.
+type AnalyzeColumn struct {
+	Name string `json:"name"`
+	Bins int    `json:"bins,omitempty"`
+}
+
+// AnalyzeRequest asks the sandbox for one contingency, moments, or effect
+// aggregation. It is a CGO-free copy of the sandbox wire struct (Columns for
+// contingency; Variables + GroupBy for moments; Aggregation + ValueExpression +
+// Segment + Adjust for the effect kinds); keep it byte-for-byte JSON-compatible.
+type AnalyzeRequest struct {
+	DataSourceRef        string              `json:"data_source_ref"`
+	Kind                 string              `json:"kind"`
+	Filters              []domain.Constraint `json:"filters,omitempty"`
+	Columns              []AnalyzeColumn     `json:"columns,omitempty"`
+	Variables            []string            `json:"variables,omitempty"`
+	GroupBy              []string            `json:"group_by,omitempty"`
+	Aggregation          string              `json:"aggregation,omitempty"`
+	ValueExpression      *domain.Expression  `json:"value_expression,omitempty"`
+	Segment              []domain.Constraint `json:"segment,omitempty"`
+	Adjust               []AnalyzeColumn     `json:"adjust,omitempty"`
+	SampleFraction       float64             `json:"sample_fraction,omitempty"`
+	RandomStratifierBins int                 `json:"random_stratifier_bins,omitempty"`
+}
+
+// ContingencyCell is one contingency-table row: the group-key values and the count.
+type ContingencyCell struct {
+	Values []string `json:"values"`
+	Count  int64    `json:"count"`
+}
+
+// MomentsRow is one stratum's moment aggregates: the group key (empty when
+// ungrouped), the complete-case row count, per-variable Sum/SumSq in request order,
+// and the pairwise cross-product sums (pairs i<j in request order).
+type MomentsRow struct {
+	Group []string  `json:"group,omitempty"`
+	N     int64     `json:"n"`
+	Sum   []float64 `json:"sum"`
+	SumSq []float64 `json:"sum_sq"`
+	Cross []float64 `json:"cross"`
+}
+
+// StratumRow is one stratum of an effect aggregation: the conditioning-set key
+// values, the total complete-case count, and the segment and baseline arms' counts
+// and objective aggregates (nullable — an empty arm aggregates to null). It is a
+// CGO-free copy of the sandbox wire struct; keep it byte-for-byte JSON-compatible.
+type StratumRow struct {
+	Values      []string `json:"values"`
+	N           int64    `json:"n"`
+	SegmentN    int64    `json:"segment_n"`
+	SegmentAgg  *float64 `json:"segment_agg"`
+	BaselineN   int64    `json:"baseline_n"`
+	BaselineAgg *float64 `json:"baseline_agg"`
+}
+
+// AnalyzeResponse carries the aggregation result keyed by kind.
+type AnalyzeResponse struct {
+	Kind    string            `json:"kind"`
+	Cells   []ContingencyCell `json:"cells,omitempty"`
+	Moments []MomentsRow      `json:"moments,omitempty"`
+	Strata  []StratumRow      `json:"strata,omitempty"`
+}
+
 // SandboxError is a non-200 response from the sandbox, carrying the HTTP status
 // and the decoded {error} body (or a status fallback when the body is empty).
 // Callers classify by Status: a 400 is an analyst-fixable compile/validation
@@ -135,17 +221,20 @@ func (e *SandboxError) Error() string { return e.Message }
 // Client calls the Sandbox Execution HTTP service. It is built with primitive
 // args (infra-constructor convention).
 type Client struct {
-	baseURL string
-	client  *http.Client
+	baseURL   string
+	client    *http.Client
+	authToken string
 }
 
-// NewClient points a client at the sandbox base URL. A nil httpClient gets one
-// bounded by defaultSandboxTimeout.
-func NewClient(baseURL string, httpClient *http.Client) *Client {
+// NewClient points a client at the sandbox base URL. authToken is the shared secret
+// the sandbox verifies on every route; empty presents no credential (which the
+// sandbox's own empty-token fail-open accepts). A nil httpClient gets one bounded by
+// defaultSandboxTimeout.
+func NewClient(baseURL, authToken string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultSandboxTimeout}
 	}
-	return &Client{baseURL: baseURL, client: httpClient}
+	return &Client{baseURL: baseURL, client: httpClient, authToken: authToken}
 }
 
 // Introspect POSTs an introspection request to /introspect.
@@ -162,6 +251,17 @@ func (c *Client) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	var resp ExecuteResponse
 	if err := c.post(ctx, "/execute", req, &resp); err != nil {
 		return ExecuteResponse{}, err
+	}
+	return resp, nil
+}
+
+// Analyze POSTs a contingency or moments aggregation request to /analyze. It is the
+// read-only surface the verifier's discovery sweep runs its conditional-independence
+// tests through; errors classify by SandboxError.Status like the other calls.
+func (c *Client) Analyze(ctx context.Context, req AnalyzeRequest) (AnalyzeResponse, error) {
+	var resp AnalyzeResponse
+	if err := c.post(ctx, "/analyze", req, &resp); err != nil {
+		return AnalyzeResponse{}, err
 	}
 	return resp, nil
 }
@@ -187,12 +287,18 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 		return fmt.Errorf("build sandbox request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// An unconfigured secret sends no header rather than an empty one: the sandbox
+	// fails open on an empty configured token, but a malformed credential would be
+	// rejected outright.
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("call sandbox %s: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer service.DrainAndClose(resp)
 	if resp.StatusCode != http.StatusOK {
 		message := fmt.Sprintf("sandbox %s returned status %d", path, resp.StatusCode)
 		var body struct {

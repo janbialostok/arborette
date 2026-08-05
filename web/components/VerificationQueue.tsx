@@ -12,6 +12,7 @@ import {
   type ResolveAction,
   type ResolveResult,
 } from "@/lib/orchestrator";
+import { formatConfidence } from "@/lib/format";
 import {
   fromEntry,
   fromOutcome,
@@ -161,7 +162,7 @@ async function loadReview(id: string, source: Source): Promise<Review> {
 
 function queueCaption(review: Review | null): string {
   if (!review || review.threshold == null) return "review queue";
-  return `review queue · below ${review.threshold.toFixed(2)} confidence · ${review.epochMode} epoch`;
+  return `review queue · below ${formatConfidence(review.threshold)} confidence · ${review.epochMode} epoch`;
 }
 
 function SourceToggle({
@@ -250,7 +251,7 @@ function ReviewList({
                     this is keeps the two panes from looking contradictory. */}
                 <span className="tabular">
                   {source === "queue" ? "queued at" : "confidence"}{" "}
-                  {item.confidence.toFixed(2)}
+                  {formatConfidence(item.confidence)}
                 </span>
               </div>
             </button>
@@ -315,7 +316,7 @@ function OutcomeDetail({
           <SectionLabel>{item.field}</SectionLabel>
           <div className="flex items-center gap-2">
             <span className="font-mono text-[11px] tabular text-faint">
-              confidence {item.confidence.toFixed(2)}
+              confidence {formatConfidence(item.confidence)}
             </span>
             <StatusBadge status={item.status} />
           </div>
@@ -428,7 +429,7 @@ function VerdictRow({
             value={corrected}
             onChange={(e) => setCorrected(e.target.value)}
             placeholder="The value as the document states it"
-            className="w-full rounded-lg border border-line bg-surface px-4 py-2.5 text-sm text-fg outline-none transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+            className="w-full rounded-lg border border-line bg-surface px-4 py-2.5 text-sm text-fg outline-hidden transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
           />
           <Button
             onClick={() => resolve("correct")}

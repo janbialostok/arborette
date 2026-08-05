@@ -15,7 +15,23 @@ export type OrchestratorEvent =
   | { type: "triplet"; payload: TripletPayload }
   | { type: "branch_failure"; payload: BranchFailurePayload }
   | { type: "confidence_distribution"; payload: ConfidenceDistribution }
-  | { type: "loop_complete"; payload?: undefined };
+  | { type: "loop_complete"; payload?: undefined }
+  | { type: "verification"; payload: VerificationTransition }
+  | { type: "causal_verification_dispatched"; payload: { intervention_id: string } }
+  | { type: "causal_graph_corrected"; payload: CorrectionResult };
+
+// A Verifier transition, relayed by the orchestrator rather than emitted by it:
+// the relay wraps the worker's own event whole, so the frame's top-level type is
+// the constant "verification" and the transition name arrives one level down. A
+// consumer switching on the outer type alone never sees the transition, which is
+// why this payload carries its own `type`. It is typed open — a Verifier release can
+// add a transition, and a frame this UI does not know must still parse.
+export interface VerificationTransition {
+  type: string;
+  intervention_id?: string;
+  status?: string;
+  reason?: string;
+}
 
 // A run publishes one of two triplet shapes under the same frame type, decided
 // by what the goal reads: a tabular goal measures a segment and reports an
@@ -183,6 +199,112 @@ export interface ResolveResult {
   confidence: number;
 }
 
+// One column of the discovered causal graph. `kind` is how discovery treated it —
+// categorical or numeric — which is what decided the independence test it took.
+export interface CausalColumn {
+  name: string;
+  kind: string;
+}
+
+// One discovered edge, keyed on the canonical (col_a < col_b) pair with the
+// orientation carried as `direction` rather than in the pair's order.
+// `provenance` says who oriented it (statistical, llm_prior, analyst) and
+// `status` whether the pair was actually tested — an untested pair (unknown,
+// budget_capped) stays undirected on purpose, so effects that depend on it report
+// as not identifiable rather than resting on an orientation nobody established.
+export interface CausalGraphEdge {
+  col_a: string;
+  col_b: string;
+  direction: EdgeDirection;
+  provenance: string;
+  confidence: number;
+  status: string;
+}
+
+export type EdgeDirection = "a_to_b" | "b_to_a" | "undirected" | "unknown";
+
+// What the discovery run covered. `excluded_columns` and `budget_truncated` are
+// the coverage limits an analyst has to see to read the graph honestly: a column
+// discovery never looked at cannot appear as a confounder.
+export interface CausalGraphMeta {
+  version: number;
+  excluded_columns: string[];
+  budget_truncated: boolean;
+  test_count: number;
+  discovered_at: string;
+}
+
+export interface CausalGraph {
+  columns: CausalColumn[];
+  edges: CausalGraphEdge[];
+  meta: CausalGraphMeta;
+}
+
+// The statuses a causal verification reaches. causally_verified is the sole
+// confirming one and is deliberately distinct from the human-review `confirmed` of
+// an extraction outcome: one says the data supports a causal effect, the other that a
+// person agreed with a value. Kept as a union so the copy and tone map keyed by it
+// must cover every case; the DTO's own `status` stays a string because a later
+// release can add one, which must render rather than crash.
+export type CausalVerificationStatus =
+  | "pending"
+  | "causally_verified"
+  | "confounded"
+  | "not_identifiable"
+  | "unsupported_objective"
+  | "failed";
+
+// One causal-verification record. The four numeric fields are null — never 0 —
+// until the run reaches a terminal outcome, and the short-circuit outcomes leave
+// some of them null forever, so every render of them is null-safe. `stale` marks
+// a record a graph correction invalidated: it is being re-verified, and its
+// numbers describe a model the analyst has already corrected.
+export interface CausalVerification {
+  id: string;
+  intervention_id: string;
+  graph_version: number;
+  status: string;
+  naive_effect: number | null;
+  adjusted_effect: number | null;
+  adjustment_set: string[];
+  refutation_score: number | null;
+  confidence: number | null;
+  stale: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+// The orientations a correction may assert. Narrower than EdgeDirection on
+// purpose: "unknown" is a value the graph serves for a pair discovery never
+// tested, and asserting it is a 400 — an analyst either states a direction or
+// withdraws one.
+export type CorrectionDirection = "a_to_b" | "b_to_a" | "undirected";
+
+// An analyst's edit to the discovered graph. from/to read as cause→effect for
+// flip and add and are ignored by delete; `direction` overrides that reading,
+// which is the only way to return an edge to undirected.
+export interface EdgeCorrection {
+  op: "flip" | "delete" | "add";
+  from: string;
+  to: string;
+  direction?: CorrectionDirection;
+}
+
+// What a correction changed: the columns it touched (in the graph's own spelling,
+// which is what adjustment sets hold), the new graph version it is served as, and
+// how many invalidated verifications were re-dispatched because of it.
+export interface CorrectionResult {
+  op: string;
+  columns: string[];
+  graph_version: number;
+  redispatched: number;
+}
+
+export interface VerifyDispatch {
+  optimization_function_id: string;
+  intervention_id: string;
+}
+
 // One item of a streamed chat turn. Kept out of OrchestratorEvent because these
 // frames only ever arrive on a chat response, never on a run stream — the two
 // unions share the wire format and nothing else. A tool's name arrives on
@@ -318,12 +440,63 @@ export function resolveVerification(
   );
 }
 
+// getCausalGraph reads the graph discovery committed for a goal's data source. It
+// rejects with a 404 OrchestratorError until a discovery has committed one, which
+// is an empty state rather than a fault — no run has needed a graph yet.
+export function getCausalGraph(id: string): Promise<CausalGraph> {
+  return requestJSON<CausalGraph>(
+    `${API_BASE}/goals/${encodeURIComponent(id)}/causal-graph`,
+  );
+}
+
+// correctCausalEdge applies one analyst edit to the discovered graph. A 409 means
+// another correction or a discovery sweep holds the graph, so the edit was not
+// applied and the view it was made against may already be stale.
+export function correctCausalEdge(
+  id: string,
+  correction: EdgeCorrection,
+): Promise<CorrectionResult> {
+  return requestJSON<CorrectionResult>(
+    `${API_BASE}/goals/${encodeURIComponent(id)}/causal-graph/corrections`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(correction),
+    },
+  );
+}
+
+// verifyFinding asks for one observational finding to be verified causally. It
+// answers 202 and nothing else: verification runs for minutes and reports through
+// the goal's stream and the verification list.
+export function verifyFinding(
+  id: string,
+  interventionID: string,
+): Promise<VerifyDispatch> {
+  return requestJSON<VerifyDispatch>(
+    `${API_BASE}/goals/${encodeURIComponent(id)}/findings/${encodeURIComponent(interventionID)}/verify`,
+    { method: "POST" },
+  );
+}
+
+export function listCausalVerifications(
+  id: string,
+): Promise<CausalVerification[]> {
+  return requestJSON<CausalVerification[]>(
+    `${API_BASE}/goals/${encodeURIComponent(id)}/causal-verifications`,
+  );
+}
+
 export function searchHeuristics(
   q: string,
   k?: number,
+  goalId?: string,
 ): Promise<HeuristicMatch[]> {
   const params = new URLSearchParams({ q });
   if (k != null) params.set("k", String(k));
+  // An empty goalId omits the param, which the orchestrator reads as a
+  // cross-goal (whole-corpus) search; a set goalId narrows to one goal.
+  if (goalId) params.set("goal_id", goalId);
   return requestJSON<HeuristicMatch[]>(
     `${API_BASE}/heuristics/search?${params.toString()}`,
   );

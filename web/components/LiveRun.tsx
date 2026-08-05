@@ -5,7 +5,6 @@ import {
   errorMessage,
   isExtraction,
   listGoals,
-  streamUrl,
   triggerHypothesisLoop,
   triggerSleepCycle,
   type BranchFailurePayload,
@@ -13,8 +12,9 @@ import {
   type OrchestratorEvent,
   type TripletPayload,
 } from "@/lib/orchestrator";
+import { applyReopenEvent, newReopenState } from "@/lib/reopen";
 import { getRunRecord, markCompleted, markTriggered } from "@/lib/runState";
-import { consumeStream } from "@/lib/sse";
+import { consumeRun } from "@/lib/sse";
 import { ConfidenceHistogram } from "@/components/ConfidenceHistogram";
 import { EffectReadout } from "@/components/EffectReadout";
 import { ExtractionReadout } from "@/components/ExtractionReadout";
@@ -27,7 +27,6 @@ import { Button, Callout, cn, Panel, SectionLabel } from "@/components/ui";
 // long enough only to catch the replay of a run started elsewhere.
 const IDLE_TRIGGERED_MS = 8000;
 const IDLE_UNTRIGGERED_MS = 2500;
-const RECONNECT_MS = 1500;
 
 type Phase =
   | "connecting"
@@ -113,6 +112,9 @@ export function LiveRun({ id }: { id: string }) {
 
   const handleEvent = useCallback(
     (ev: OrchestratorEvent) => {
+      // Resetting the backoff belongs here: a delivered frame is the only evidence
+      // the stream works.
+      reopenRef.current = applyReopenEvent(reopenRef.current, "frame").state;
       const append = (item: FeedItem) => {
         clearIdle();
         receivedRef.current = true;
@@ -145,11 +147,16 @@ export function LiveRun({ id }: { id: string }) {
     [id, clearIdle],
   );
 
+  // Backoff rather than a fixed delay: a run believed to still be going would
+  // otherwise pin the browser to a constant request rate for the whole page view.
+  const reopenRef = useRef(newReopenState());
   const scheduleReconnect = useCallback(() => {
     if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+    const { state, reopenAfter } = applyReopenEvent(reopenRef.current, "end");
+    reopenRef.current = state;
     reconnectTimerRef.current = setTimeout(
       () => setGeneration((g) => g + 1),
-      RECONNECT_MS,
+      reopenAfter,
     );
   }, []);
 
@@ -250,18 +257,13 @@ export function LiveRun({ id }: { id: string }) {
 
     (async () => {
       try {
-        const res = await fetch(streamUrl(id), {
-          signal: controller.signal,
-          headers: { accept: "text/event-stream" },
-        });
-        if (!res.ok || !res.body) throw new Error(`stream status ${res.status}`);
-        await consumeStream(res.body, handleEvent, controller.signal);
-        if (cancelled || controller.signal.aborted) return;
-        onStreamEnd();
+        await consumeRun(id, handleEvent, controller.signal);
       } catch {
-        if (cancelled || controller.signal.aborted) return;
-        onStreamEnd();
+        // A drop and a clean end are the same decision here: onStreamEnd reads the
+        // run's own terminal state to tell "finished" from "reconnect".
       }
+      if (cancelled || controller.signal.aborted) return;
+      onStreamEnd();
     })();
 
     return () => {
@@ -403,6 +405,7 @@ export function LiveRun({ id }: { id: string }) {
       )}
 
       <Feed
+        id={id}
         items={items}
         scale={scale}
         extracting={extracting}
@@ -486,6 +489,7 @@ function StatusPill({ phase }: { phase: Phase }) {
 }
 
 function Feed({
+  id,
   items,
   scale,
   extracting,
@@ -493,6 +497,7 @@ function Feed({
   onRun,
   running,
 }: {
+  id: string;
   items: FeedItem[];
   scale: number;
   extracting: boolean;
@@ -580,6 +585,7 @@ function Feed({
           ) : (
             <EffectReadout
               key={item.seq}
+              goalID={id}
               triplet={item.payload}
               scale={scale}
               index={idx}

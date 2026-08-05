@@ -3,6 +3,8 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 
 	"github.com/arborette/arborette/internal/datasource"
@@ -24,10 +26,34 @@ var (
 	errNonFiniteValue     = errors.New("non-finite objective value")
 )
 
+// Analyze-request validation sentinels. These are caller-fixable request-shape
+// errors (unknown kind, over-cap column/variable counts, out-of-range bin counts)
+// the handler maps to 422 before any staging, distinct from the compile sentinels
+// above (mapped to 400 by writeStageErr).
+var (
+	errAnalyzeUnknownKind      = errors.New("unsupported analyze kind")
+	errAnalyzeColumnCount      = errors.New("analyze column count out of range")
+	errAnalyzeBinCount         = errors.New("analyze quantile bin count out of range")
+	errAnalyzeMissingColumns   = errors.New("analyze request names no columns")
+	errAnalyzeMissingObjective = errors.New("analyze effect request has no aggregation")
+	errAnalyzeSampleFraction   = errors.New("analyze sample fraction out of range")
+)
+
 // allowedAgg maps a request aggregation to the SQL function emitted. Anything
 // outside this allowlist is rejected -- an aggregation name never reaches the SQL
 // string uninterpreted.
 var allowedAgg = map[string]string{
+	"avg":   "AVG",
+	"sum":   "SUM",
+	"min":   "MIN",
+	"max":   "MAX",
+	"count": "COUNT",
+}
+
+// allowedWindowAgg maps a trailing-aggregate window's function name to the SQL
+// function emitted, following allowedAgg's allowlist convention -- a window
+// aggregate name never reaches the SQL string uninterpreted.
+var allowedWindowAgg = map[string]string{
 	"avg":   "AVG",
 	"sum":   "SUM",
 	"min":   "MIN",
@@ -117,22 +143,153 @@ func (t coarseType) String() string {
 	}
 }
 
-// numericTypes is the canonical DuckDB numeric set. DECIMAL is handled by prefix
-// (DESCRIBE reports fixed-point columns as DECIMAL(p,s), common in Parquet) so an
-// exact-string match would spuriously reject them.
-var numericTypes = map[string]bool{
-	"TINYINT":   true,
-	"SMALLINT":  true,
-	"INTEGER":   true,
-	"BIGINT":    true,
-	"HUGEINT":   true,
-	"UTINYINT":  true,
-	"USMALLINT": true,
-	"UINTEGER":  true,
-	"UBIGINT":   true,
-	"UHUGEINT":  true,
-	"FLOAT":     true,
-	"DOUBLE":    true,
+// isProbeableForDistinctValues reports whether a column's type is in the
+// low-cardinality categorical surface value grounding probes: text, boolean, or
+// integer. Floating-point, fixed-point, and temporal columns are effectively
+// continuous, so they are never probed for distinct values.
+func isProbeableForDistinctValues(t string) bool {
+	if datasource.IsIntegerType(t) {
+		return true
+	}
+	switch columnCoarseType(t) {
+	case typeBoolean, typeString:
+		return true
+	default:
+		return false
+	}
+}
+
+// staticValidate rejects a request whose aggregation, operators, cast targets, or
+// literals the deterministic compiler will not emit SQL for -- everything checkable
+// without the introspected schema. It lets handleExecute return a 400 before any
+// object-store Get, so a malformed request never pays a staging download. Column
+// name/type checks intrinsically need the schema and stay post-staging in
+// compileQueryCounted; this is deliberately a subset, reusing the same sentinels so
+// the HTTP status mapping needs no new arms.
+func staticValidate(agg string, expr *domain.Expression, filters []domain.Constraint) error {
+	if _, ok := allowedAgg[strings.ToLower(agg)]; !ok {
+		return fmt.Errorf("%w: %q", errUnknownAggregation, agg)
+	}
+	if expr != nil {
+		if err := staticValidateExpr(*expr); err != nil {
+			return err
+		}
+		// The window shape guard (no window nested under a window; offset/size in
+		// range) is CGO-free domain logic reused here so the sandbox does not trust
+		// the orchestrator to have run it. Its sentinels map to no HTTP status, so the
+		// rejection is re-wrapped as a compile error the 400 mapping already covers.
+		if err := domain.ValidateWindowShape(*expr); err != nil {
+			return fmt.Errorf("%w: %v", errTypeIncompatible, err)
+		}
+	}
+	for _, f := range filters {
+		if err := staticValidateFilter(f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// staticValidateExpr walks an objective value expression for the schema-independent
+// violations -- unallowed comparison/arithmetic operators, unallowed cast targets,
+// malformed or non-finite literals -- mirroring compileExpr's structure but without
+// resolving columns or checking types (both of which need the schema).
+func staticValidateExpr(e domain.Expression) error {
+	switch e.Kind {
+	case domain.ColumnRefKind:
+		return nil
+	case domain.LiteralKind:
+		return staticValidateLiteral(e.Literal)
+	case domain.CastKind:
+		castType := strings.ToUpper(strings.TrimSpace(e.CastType))
+		if _, ok := allowedCast[castType]; !ok {
+			return fmt.Errorf("%w: %q", errUnknownCast, e.CastType)
+		}
+		return staticValidateExpr(child(e.Operand))
+	case domain.ComparisonKind:
+		if !allowedCompareOp[e.Op] {
+			return fmt.Errorf("%w: %q", errUnknownOperator, e.Op)
+		}
+		if err := staticValidateExpr(child(e.Left)); err != nil {
+			return err
+		}
+		return staticValidateExpr(child(e.Right))
+	case domain.ArithmeticKind:
+		if !allowedArithOp[e.Op] {
+			return fmt.Errorf("%w: %q", errUnknownOperator, e.Op)
+		}
+		if err := staticValidateExpr(child(e.Left)); err != nil {
+			return err
+		}
+		return staticValidateExpr(child(e.Right))
+	case domain.CaseKind:
+		if len(e.Cases) == 0 {
+			return fmt.Errorf("%w: case with no branches", errTypeIncompatible)
+		}
+		for _, br := range e.Cases {
+			if err := staticValidateExpr(child(br.When)); err != nil {
+				return err
+			}
+			if err := staticValidateExpr(child(br.Then)); err != nil {
+				return err
+			}
+		}
+		if e.Else != nil {
+			return staticValidateExpr(child(e.Else))
+		}
+		return nil
+	case domain.LagKind:
+		return staticValidateExpr(child(e.Inner))
+	case domain.TrailingAggregateKind:
+		if _, ok := allowedWindowAgg[strings.ToLower(e.WindowAgg)]; !ok {
+			return fmt.Errorf("%w: window aggregate %q", errUnknownAggregation, e.WindowAgg)
+		}
+		return staticValidateExpr(child(e.Inner))
+	default:
+		return fmt.Errorf("%w: unknown expression kind %q", errTypeIncompatible, e.Kind)
+	}
+}
+
+// staticValidateFilter checks one intervention filter for the schema-independent
+// violations: an unknown operator, an empty membership set, or a non-finite
+// threshold/operand/member literal. The column-vs-operand type coherence check
+// needs the schema and stays in compileFilter.
+func staticValidateFilter(f domain.Constraint) error {
+	switch {
+	case f.IsNumericThresholdOp():
+		if math.IsInf(f.Value, 0) || math.IsNaN(f.Value) {
+			return fmt.Errorf("%w: filter %q threshold %v", errNonFiniteValue, f.Field, f.Value)
+		}
+		return nil
+	case f.IsEqualityOp():
+		return staticValidateLiteral(f.Operand)
+	case f.IsMembershipOp():
+		if len(f.Members) == 0 {
+			return fmt.Errorf("%w: filter %q has an empty %s set", errTypeIncompatible, f.Field, f.Op)
+		}
+		for i := range f.Members {
+			if err := staticValidateLiteral(&f.Members[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", errUnknownOperator, f.Op)
+	}
+}
+
+// staticValidateLiteral rejects a malformed literal (per literalValue's one-field
+// rule) or a non-finite numeric literal, which json.Marshal could not encode and
+// which the non-finite scan guard would otherwise only catch after staging.
+func staticValidateLiteral(l *domain.LiteralValue) error {
+	val, _, err := literalValue(l)
+	if err != nil {
+		return err
+	}
+	if n, ok := val.(float64); ok && (math.IsInf(n, 0) || math.IsNaN(n)) {
+		return fmt.Errorf("%w: literal %v", errNonFiniteValue, n)
+	}
+	return nil
 }
 
 // compileQuery produces a single read-only aggregate SELECT and its bound args.
@@ -280,23 +437,22 @@ func compileFilter(col datasource.Column, f domain.Constraint) (string, []any, e
 // args because the expression is emitted before the WHERE clause and DuckDB binds
 // ? positionally.
 func compileObjective(tableFn string, cols []datasource.Column, agg string, expr domain.Expression, filters []domain.Constraint) (string, []any, error) {
-	return compileObjectiveCounted(tableFn, cols, agg, expr, filters, false)
+	return compileObjectiveCounted(tableFn, cols, agg, expr, filters, false, "", "")
 }
 
 // compileObjectiveCounted is compileObjective with an opt-in matched-row count
-// measured in the same scan. With withCount false it emits byte-identical SQL to
-// compileObjective, so the legacy single-column path is unaffected.
-func compileObjectiveCounted(tableFn string, cols []datasource.Column, agg string, expr domain.Expression, filters []domain.Constraint, withCount bool) (string, []any, error) {
+// measured in the same scan. With withCount false and no window kind it emits
+// byte-identical SQL to compileObjective, so the legacy single-column path is
+// unaffected. entityKey/timeColumn are the window bindings a windowed value
+// expression compiles against; they are empty (and unused) for a plain objective.
+func compileObjectiveCounted(tableFn string, cols []datasource.Column, agg string, expr domain.Expression, filters []domain.Constraint, withCount bool, entityKey, timeColumn string) (string, []any, error) {
 	sqlAgg, ok := allowedAgg[strings.ToLower(agg)]
 	if !ok {
 		return "", nil, fmt.Errorf("%w: %q", errUnknownAggregation, agg)
 	}
 
-	exprSQL, exprType, args, err := compileExpr(cols, expr)
-	if err != nil {
-		return "", nil, err
-	}
-	measured, err := aggregateOperand(sqlAgg, exprSQL, exprType)
+	cc := compileCtx{cols: cols, entityKey: entityKey, timeColumn: timeColumn}
+	exprSQL, exprType, exprArgs, err := compileExpr(cc, expr)
 	if err != nil {
 		return "", nil, err
 	}
@@ -305,9 +461,111 @@ func compileObjectiveCounted(tableFn string, cols []datasource.Column, agg strin
 	if err != nil {
 		return "", nil, err
 	}
-	args = append(args, filterArgs...)
 
+	// A window function cannot nest inside the objective's aggregate call, so a
+	// windowed value expression is measured in a two-level SELECT: the window over
+	// full history inside, the aggregate and intervention filters outside.
+	if domain.HasWindowKind(expr) {
+		return compileWindowedObjective(sqlAgg, exprSQL, exprType, exprArgs, tableFn, cols, predicates, filterArgs, withCount)
+	}
+
+	measured, err := aggregateOperand(sqlAgg, exprSQL, exprType)
+	if err != nil {
+		return "", nil, err
+	}
+	args := append(exprArgs, filterArgs...)
 	return aggregateSelect(sqlAgg, measured, tableFn, predicates, withCount), args, nil
+}
+
+// compileWindowedObjective assembles the two-level SELECT a windowed objective
+// requires: the value expression (carrying its window fragments) is computed in an
+// inner select over each entity's full ordered history and aliased to a
+// collision-proof column; the objective aggregate, intervention predicates, and
+// optional support count are applied in the outer select over that alias. DuckDB
+// rejects a window function nested inside an aggregate call, which is why a single
+// SELECT cannot measure it. Window-over-history (not over the filtered rows) is
+// deliberate: a row's entity-relative value is intrinsic to its history, so the same
+// row carries the same value in every segment, keeping parent/child effect sizes
+// comparable. The inner select's ? args precede the outer predicates' args, matching
+// their emission order.
+func compileWindowedObjective(sqlAgg, exprSQL string, exprType coarseType, exprArgs []any, tableFn string, cols []datasource.Column, predicates []string, filterArgs []any, withCount bool) (string, []any, error) {
+	alias := windowAlias(cols)
+	measured, err := aggregateOperand(sqlAgg, quoteIdent(alias), exprType)
+	if err != nil {
+		return "", nil, err
+	}
+	inner := "(SELECT *, " + exprSQL + " AS " + quoteIdent(alias) + " FROM " + tableFn + ")"
+	args := append(exprArgs, filterArgs...)
+	return aggregateSelect(sqlAgg, measured, inner, predicates, withCount), args, nil
+}
+
+// windowAlias returns a column alias for the windowed inner select that cannot
+// collide with a real column: user datasets are arbitrary, so a fixed literal could
+// shadow an actual column and make the outer aggregate's reference ambiguous. It
+// starts from a sentinel and suffixes an index until the name is absent from cols
+// (case-insensitive).
+func windowAlias(cols []datasource.Column) string {
+	const base = "__arborette_window"
+	candidate := base
+	for i := 0; columnExists(cols, candidate); i++ {
+		candidate = base + "_" + strconv.Itoa(i)
+	}
+	return candidate
+}
+
+func columnExists(cols []datasource.Column, name string) bool {
+	for _, c := range cols {
+		if strings.EqualFold(c.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// compileCtx carries the schema columns and the window bindings through the
+// expression compiler, so the recursive descent does not grow two extra parameters
+// at every node. entityKey and timeColumn are the raw request fields, resolved and
+// quoted only where a window node needs them.
+type compileCtx struct {
+	cols       []datasource.Column
+	entityKey  string
+	timeColumn string
+}
+
+// windowClause resolves and quotes the entity/time bindings into the PARTITION BY
+// and ORDER BY clauses every window fragment shares. Absent bindings are rejected
+// defensively -- the execute handler already refuses a windowed request without them
+// pre-staging, but the compiler must never emit a partition-less window.
+//
+// The time column alone is not a total order: tied time values leave peer rows in an
+// unspecified order that, under DuckDB's parallel file scan, can vary between the
+// independent per-segment re-executions -- so the same row could carry different
+// lag/frame values in a parent vs a child measurement, breaking the comparability
+// invariant. Every other column is appended as a deterministic tiebreaker, making
+// the order total up to fully-identical rows (which carry identical window values
+// regardless of order). It uses only real, quoted schema columns, so it works over
+// both CSV and Parquet table functions, neither of which exposes a stable synthetic
+// row id.
+func (cc compileCtx) windowClause() (partition, order string, err error) {
+	if cc.entityKey == "" || cc.timeColumn == "" {
+		return "", "", fmt.Errorf("%w: windowed expression requires entity and time bindings", errTypeIncompatible)
+	}
+	entityCol, err := resolveColumn(cc.cols, cc.entityKey)
+	if err != nil {
+		return "", "", err
+	}
+	timeCol, err := resolveColumn(cc.cols, cc.timeColumn)
+	if err != nil {
+		return "", "", err
+	}
+	orderCols := []string{quoteIdent(timeCol.Name)}
+	for _, c := range cc.cols {
+		if strings.EqualFold(c.Name, timeCol.Name) {
+			continue
+		}
+		orderCols = append(orderCols, quoteIdent(c.Name))
+	}
+	return "PARTITION BY " + quoteIdent(entityCol.Name), "ORDER BY " + strings.Join(orderCols, ", "), nil
 }
 
 // aggregateOperand adapts a compiled objective expression to its aggregation at
@@ -335,10 +593,10 @@ func aggregateOperand(sqlAgg, exprSQL string, exprType coarseType) (string, erro
 // combinations up front, so a compiled fragment cannot fail at scan time for a
 // reason the compiler could have seen. Args are appended in emission
 // (left-to-right) order to match positional binding.
-func compileExpr(cols []datasource.Column, e domain.Expression) (string, coarseType, []any, error) {
+func compileExpr(cc compileCtx, e domain.Expression) (string, coarseType, []any, error) {
 	switch e.Kind {
 	case domain.ColumnRefKind:
-		col, err := resolveColumn(cols, e.Column)
+		col, err := resolveColumn(cc.cols, e.Column)
 		if err != nil {
 			return "", 0, nil, err
 		}
@@ -357,7 +615,7 @@ func compileExpr(cols []datasource.Column, e domain.Expression) (string, coarseT
 		if !ok {
 			return "", 0, nil, fmt.Errorf("%w: %q", errUnknownCast, e.CastType)
 		}
-		operandSQL, operandType, args, err := compileExpr(cols, child(e.Operand))
+		operandSQL, operandType, args, err := compileExpr(cc, child(e.Operand))
 		if err != nil {
 			return "", 0, nil, err
 		}
@@ -370,11 +628,11 @@ func compileExpr(cols []datasource.Column, e domain.Expression) (string, coarseT
 		if !allowedCompareOp[e.Op] {
 			return "", 0, nil, fmt.Errorf("%w: %q", errUnknownOperator, e.Op)
 		}
-		leftSQL, leftType, leftArgs, err := compileExpr(cols, child(e.Left))
+		leftSQL, leftType, leftArgs, err := compileExpr(cc, child(e.Left))
 		if err != nil {
 			return "", 0, nil, err
 		}
-		rightSQL, rightType, rightArgs, err := compileExpr(cols, child(e.Right))
+		rightSQL, rightType, rightArgs, err := compileExpr(cc, child(e.Right))
 		if err != nil {
 			return "", 0, nil, err
 		}
@@ -388,11 +646,11 @@ func compileExpr(cols []datasource.Column, e domain.Expression) (string, coarseT
 		if !allowedArithOp[e.Op] {
 			return "", 0, nil, fmt.Errorf("%w: %q", errUnknownOperator, e.Op)
 		}
-		leftSQL, leftType, leftArgs, err := compileExpr(cols, child(e.Left))
+		leftSQL, leftType, leftArgs, err := compileExpr(cc, child(e.Left))
 		if err != nil {
 			return "", 0, nil, err
 		}
-		rightSQL, rightType, rightArgs, err := compileExpr(cols, child(e.Right))
+		rightSQL, rightType, rightArgs, err := compileExpr(cc, child(e.Right))
 		if err != nil {
 			return "", 0, nil, err
 		}
@@ -406,17 +664,73 @@ func compileExpr(cols []datasource.Column, e domain.Expression) (string, coarseT
 		return sql, typeNumeric, append(leftArgs, rightArgs...), nil
 
 	case domain.CaseKind:
-		return compileCase(cols, e)
+		return compileCase(cc, e)
+
+	case domain.LagKind:
+		return compileLag(cc, e)
+
+	case domain.TrailingAggregateKind:
+		return compileTrailingAggregate(cc, e)
 
 	default:
 		return "", 0, nil, fmt.Errorf("%w: unknown expression kind %q", errTypeIncompatible, e.Kind)
 	}
 }
 
+// compileLag compiles a lag window: the inner expression's value Offset rows back
+// within the entity's ordered history. The offset is a function argument, bound as
+// a ? param; the entity/time columns are schema-resolved and quoted, never request
+// text. lag preserves the inner expression's coarse type. The inner ? args precede
+// the offset arg, matching their emission order.
+func compileLag(cc compileCtx, e domain.Expression) (string, coarseType, []any, error) {
+	partition, order, err := cc.windowClause()
+	if err != nil {
+		return "", 0, nil, err
+	}
+	innerSQL, innerType, innerArgs, err := compileExpr(cc, child(e.Inner))
+	if err != nil {
+		return "", 0, nil, err
+	}
+	sql := "lag(" + innerSQL + ", ?) OVER (" + partition + " " + order + ")"
+	return sql, innerType, append(innerArgs, e.Offset), nil
+}
+
+// compileTrailingAggregate compiles a trailing-aggregate window: an allowlisted
+// aggregate of the inner expression over the WindowSize rows preceding the current
+// one within the entity's ordered history. The aggregate name comes from the
+// allowlist, never request text; avg/sum/min/max require a numeric inner (count
+// admits any). The frame bound is emitted as a range-checked integer literal
+// (validated in [1, MaxWindowSize] before compile), not a bound parameter, because
+// frame-bound parameter binding is driver-dependent while a bounded integer is
+// injection-safe. The result is always measured as numeric.
+func compileTrailingAggregate(cc compileCtx, e domain.Expression) (string, coarseType, []any, error) {
+	sqlAgg, ok := allowedWindowAgg[strings.ToLower(e.WindowAgg)]
+	if !ok {
+		return "", 0, nil, fmt.Errorf("%w: window aggregate %q", errUnknownAggregation, e.WindowAgg)
+	}
+	if e.WindowSize < 1 || e.WindowSize > domain.MaxWindowSize {
+		return "", 0, nil, fmt.Errorf("%w: trailing window size %d not in [1, %d]", errTypeIncompatible, e.WindowSize, domain.MaxWindowSize)
+	}
+	partition, order, err := cc.windowClause()
+	if err != nil {
+		return "", 0, nil, err
+	}
+	innerSQL, innerType, innerArgs, err := compileExpr(cc, child(e.Inner))
+	if err != nil {
+		return "", 0, nil, err
+	}
+	if sqlAgg != "COUNT" && innerType != typeNumeric {
+		return "", 0, nil, fmt.Errorf("%w: trailing %s over %s operand", errTypeIncompatible, sqlAgg, innerType)
+	}
+	frame := "ROWS BETWEEN " + strconv.Itoa(e.WindowSize) + " PRECEDING AND 1 PRECEDING"
+	sql := sqlAgg + "(" + innerSQL + ") OVER (" + partition + " " + order + " " + frame + ")"
+	return sql, typeNumeric, innerArgs, nil
+}
+
 // compileCase compiles a CASE/bucket node. A Comparison WHEN compiles to a 0/1
 // indicator, which DuckDB accepts as a WHEN condition (nonzero is true); every
 // THEN/ELSE must be numeric so the bucket maps to a measurable number.
-func compileCase(cols []datasource.Column, e domain.Expression) (string, coarseType, []any, error) {
+func compileCase(cc compileCtx, e domain.Expression) (string, coarseType, []any, error) {
 	if len(e.Cases) == 0 {
 		return "", 0, nil, fmt.Errorf("%w: case with no branches", errTypeIncompatible)
 	}
@@ -424,7 +738,7 @@ func compileCase(cols []datasource.Column, e domain.Expression) (string, coarseT
 	var args []any
 	b.WriteString("CASE")
 	for _, br := range e.Cases {
-		whenSQL, whenType, whenArgs, err := compileExpr(cols, child(br.When))
+		whenSQL, whenType, whenArgs, err := compileExpr(cc, child(br.When))
 		if err != nil {
 			return "", 0, nil, err
 		}
@@ -436,7 +750,7 @@ func compileCase(cols []datasource.Column, e domain.Expression) (string, coarseT
 		if whenType != typeNumeric && whenType != typeBoolean {
 			return "", 0, nil, fmt.Errorf("%w: case condition must be boolean, got %s", errTypeIncompatible, whenType)
 		}
-		thenSQL, thenType, thenArgs, err := compileExpr(cols, child(br.Then))
+		thenSQL, thenType, thenArgs, err := compileExpr(cc, child(br.Then))
 		if err != nil {
 			return "", 0, nil, err
 		}
@@ -448,7 +762,7 @@ func compileCase(cols []datasource.Column, e domain.Expression) (string, coarseT
 		args = append(args, thenArgs...)
 	}
 	if e.Else != nil {
-		elseSQL, elseType, elseArgs, err := compileExpr(cols, child(e.Else))
+		elseSQL, elseType, elseArgs, err := compileExpr(cc, child(e.Else))
 		if err != nil {
 			return "", 0, nil, err
 		}
@@ -514,13 +828,12 @@ func columnCoarseType(t string) coarseType {
 	switch {
 	case isNumeric(u):
 		return typeNumeric
-	case u == "BOOLEAN" || u == "BOOL":
+	case datasource.IsBooleanType(u):
 		return typeBoolean
 	case strings.HasPrefix(u, "VARCHAR"), strings.HasPrefix(u, "CHAR"),
 		strings.HasPrefix(u, "TEXT"), u == "BPCHAR", u == "STRING":
 		return typeString
-	case strings.HasPrefix(u, "DATE"), strings.HasPrefix(u, "TIME"),
-		strings.HasPrefix(u, "TIMESTAMP"):
+	case datasource.IsTemporalType(u):
 		return typeTemporal
 	default:
 		return typeString
@@ -557,17 +870,377 @@ func resolveColumn(cols []datasource.Column, field string) (datasource.Column, e
 	}
 }
 
-// isNumeric reports whether a DuckDB column type is aggregatable as a number,
-// including any DECIMAL(p,s).
-func isNumeric(t string) bool {
-	u := strings.ToUpper(strings.TrimSpace(t))
-	if numericTypes[u] {
-		return true
-	}
-	return strings.HasPrefix(u, "DECIMAL")
-}
+func isNumeric(t string) bool { return datasource.IsNumericType(t) }
 
 // quoteIdent double-quotes a validated identifier, escaping embedded quotes.
 func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// staticValidateAnalyze rejects an analyze request whose shape is invalid without
+// the schema: an unknown kind, a column/variable/adjustment count outside its cap, a
+// quantile bin count outside [2, maxBins], a missing objective aggregation, or a
+// sample fraction outside (0, 1]. Column existence and type checks need the schema
+// and stay in the compile step. maxColumns is the per-kind bound (2 endpoints + the
+// conditioning-set size); it derives from config, never a literal.
+func staticValidateAnalyze(req AnalyzeRequest, maxColumns, maxBins int) error {
+	switch req.Kind {
+	case AnalyzeContingency:
+		if len(req.Columns) == 0 {
+			return fmt.Errorf("%w: contingency", errAnalyzeMissingColumns)
+		}
+		if len(req.Columns) > maxColumns {
+			return fmt.Errorf("%w: %d columns exceeds cap %d", errAnalyzeColumnCount, len(req.Columns), maxColumns)
+		}
+		for _, c := range req.Columns {
+			if c.Bins != 0 && (c.Bins < 2 || c.Bins > maxBins) {
+				return fmt.Errorf("%w: %q bins %d not in [2, %d]", errAnalyzeBinCount, c.Name, c.Bins, maxBins)
+			}
+		}
+		return nil
+	case AnalyzeMoments:
+		if len(req.Variables) == 0 {
+			return fmt.Errorf("%w: moments", errAnalyzeMissingColumns)
+		}
+		if len(req.Variables) > maxColumns {
+			return fmt.Errorf("%w: %d variables exceeds cap %d", errAnalyzeColumnCount, len(req.Variables), maxColumns)
+		}
+		// The group-by conditioners are capped the same way: each adds a GROUP BY
+		// reference and a null predicate, so an unbounded list is a compile-size / DoS
+		// amplification vector even though every name is still schema-validated and
+		// quoted. The cap mirrors the endpoint/conditioning-set bound.
+		if len(req.GroupBy) > maxColumns {
+			return fmt.Errorf("%w: %d group-by columns exceeds cap %d", errAnalyzeColumnCount, len(req.GroupBy), maxColumns)
+		}
+		return nil
+	case AnalyzeStratifiedEffect, AnalyzeSampledEffect:
+		return staticValidateEffect(req, maxColumns, maxBins)
+	default:
+		return fmt.Errorf("%w: %q", errAnalyzeUnknownKind, req.Kind)
+	}
+}
+
+// staticValidateEffect checks the schema-independent shape of a stratified or
+// sampled effect request: the adjustment set (empty is the legal Z-less naive call)
+// stays within maxColumns, each binned adjustment column's bin count is in [2,
+// maxBins], the random-stratifier bin count (0 = off) is likewise, an aggregation is
+// named, and a sampled request's fraction lands in (0, 1]. The objective expression,
+// segment, and adjustment column existence/types are schema-dependent and stay in
+// the compile step.
+func staticValidateEffect(req AnalyzeRequest, maxColumns, maxBins int) error {
+	if len(req.Adjust) > maxColumns {
+		return fmt.Errorf("%w: %d adjustment columns exceeds cap %d", errAnalyzeColumnCount, len(req.Adjust), maxColumns)
+	}
+	for _, c := range req.Adjust {
+		if c.Bins != 0 && (c.Bins < 2 || c.Bins > maxBins) {
+			return fmt.Errorf("%w: %q bins %d not in [2, %d]", errAnalyzeBinCount, c.Name, c.Bins, maxBins)
+		}
+	}
+	if req.RandomStratifierBins != 0 && (req.RandomStratifierBins < 2 || req.RandomStratifierBins > maxBins) {
+		return fmt.Errorf("%w: random stratifier bins %d not in [2, %d]", errAnalyzeBinCount, req.RandomStratifierBins, maxBins)
+	}
+	if req.Aggregation == "" {
+		return fmt.Errorf("%w: %s", errAnalyzeMissingObjective, req.Kind)
+	}
+	if req.Kind == AnalyzeSampledEffect && (req.SampleFraction <= 0 || req.SampleFraction > 1) {
+		return fmt.Errorf("%w: %v not in (0, 1]", errAnalyzeSampleFraction, req.SampleFraction)
+	}
+	return nil
+}
+
+// quantileCutsSQL produces the query that computes a numeric column's bins-1
+// interior quantile cut points. Each cut is a separate scalar quantile_cont
+// aggregate (probabilities i/bins for i in 1..bins-1) so the result is a single
+// row of plain DOUBLEs, avoiding LIST scanning; the probabilities are server-derived
+// from the integer bin count, never request text, so they are injection-safe
+// literals. NULLs are excluded so the cuts describe the observed distribution.
+func quantileCutsSQL(tableFn, colName string, bins int) string {
+	col := quoteIdent(colName)
+	parts := make([]string, 0, bins-1)
+	for i := 1; i < bins; i++ {
+		p := float64(i) / float64(bins)
+		parts = append(parts, "quantile_cont("+col+", "+strconv.FormatFloat(p, 'f', 6, 64)+")")
+	}
+	return "SELECT " + strings.Join(parts, ", ") + " FROM " + tableFn + " WHERE " + col + " IS NOT NULL"
+}
+
+// binExpr builds a bucket expression assigning each row of a numeric column to a
+// quantile bucket by its cut points, returning a VARCHAR bucket label so a binned
+// column groups uniformly alongside raw categorical columns. Cut points are bound
+// as ? params (server-computed DOUBLEs, never interpolated). With no usable cuts —
+// an empty or constant column whose quantiles came back NULL — every row falls into
+// bucket "0", a single-bucket degenerate the caller's stats treat as untestable.
+func binExpr(colName string, cuts []float64) (string, []any) {
+	col := quoteIdent(colName)
+	if len(cuts) == 0 {
+		return "'0'", nil
+	}
+	var b strings.Builder
+	args := make([]any, 0, len(cuts))
+	b.WriteString("CASE")
+	for i, cut := range cuts {
+		b.WriteString(" WHEN " + col + " <= ? THEN '" + strconv.Itoa(i) + "'")
+		args = append(args, cut)
+	}
+	b.WriteString(" ELSE '" + strconv.Itoa(len(cuts)) + "' END")
+	return b.String(), args
+}
+
+// compileContingency builds the grouped count query for a contingency table: one
+// group expression per requested column (categorical columns grouped on their raw
+// value cast to VARCHAR; numeric columns bucketed via binExpr over the supplied
+// cut points), the matched-row count, and complete-case null handling (every group
+// column IS NOT NULL) plus the intervention filters. Binned columns' ? args precede
+// the filter args, matching their emission order (SELECT before WHERE). cuts maps a
+// column index to its precomputed quantile cut points; a categorical column has no
+// entry.
+func compileContingency(tableFn string, cols []datasource.Column, columns []AnalyzeColumn, filters []domain.Constraint, cuts map[int][]float64) (string, []any, error) {
+	groupExprs := make([]string, 0, len(columns))
+	nullPreds := make([]string, 0, len(columns))
+	var args []any
+	for i, c := range columns {
+		col, err := resolveColumn(cols, c.Name)
+		if err != nil {
+			return "", nil, err
+		}
+		if c.Bins > 0 {
+			if !isNumeric(col.Type) {
+				return "", nil, fmt.Errorf("%w: binned column %q (%s)", errNonNumeric, col.Name, col.Type)
+			}
+			expr, binArgs := binExpr(col.Name, cuts[i])
+			groupExprs = append(groupExprs, expr)
+			args = append(args, binArgs...)
+		} else {
+			groupExprs = append(groupExprs, "CAST("+quoteIdent(col.Name)+" AS VARCHAR)")
+		}
+		nullPreds = append(nullPreds, quoteIdent(col.Name)+" IS NOT NULL")
+	}
+
+	filterPreds, filterArgs, err := compileFilters(cols, filters)
+	if err != nil {
+		return "", nil, err
+	}
+	args = append(args, filterArgs...)
+
+	positions := make([]string, len(groupExprs))
+	for i := range positions {
+		positions[i] = strconv.Itoa(i + 1)
+	}
+	query := "SELECT " + strings.Join(groupExprs, ", ") + ", CAST(count(*) AS BIGINT) FROM " + tableFn +
+		" WHERE " + strings.Join(append(nullPreds, filterPreds...), " AND ") +
+		" GROUP BY " + strings.Join(positions, ", ")
+	return query, args, nil
+}
+
+// compileMoments builds the moment-aggregate query for a set of numeric variables,
+// optionally grouped by categorical conditioning columns (raw values — the moments
+// kind never bins). It emits, per stratum: the group key, the complete-case row
+// count, each variable's sum and sum-of-squares, and every pairwise cross-product
+// sum (i<j in variable order), all in DOUBLE space so an overflow yields +Inf the
+// scan guard catches rather than a mid-scan error. Null handling is listwise over
+// the full variable set (one shared IS NOT NULL predicate per variable and per
+// group column) so every sum in a row shares one n. Returns the query and the
+// variable count so the reader knows the cross-product layout.
+func compileMoments(tableFn string, cols []datasource.Column, variables, groupBy []string, filters []domain.Constraint) (string, []any, int, error) {
+	varCols := make([]datasource.Column, 0, len(variables))
+	nullPreds := make([]string, 0, len(variables)+len(groupBy))
+	for _, name := range variables {
+		col, err := resolveColumn(cols, name)
+		if err != nil {
+			return "", nil, 0, err
+		}
+		if !isNumeric(col.Type) {
+			return "", nil, 0, fmt.Errorf("%w: moments variable %q (%s)", errNonNumeric, col.Name, col.Type)
+		}
+		varCols = append(varCols, col)
+		nullPreds = append(nullPreds, quoteIdent(col.Name)+" IS NOT NULL")
+	}
+
+	groupExprs := make([]string, 0, len(groupBy))
+	for _, name := range groupBy {
+		col, err := resolveColumn(cols, name)
+		if err != nil {
+			return "", nil, 0, err
+		}
+		groupExprs = append(groupExprs, "CAST("+quoteIdent(col.Name)+" AS VARCHAR)")
+		nullPreds = append(nullPreds, quoteIdent(col.Name)+" IS NOT NULL")
+	}
+
+	dbl := func(c datasource.Column) string { return "CAST(" + quoteIdent(c.Name) + " AS DOUBLE)" }
+
+	selects := make([]string, 0, len(groupExprs)+1+2*len(varCols)+len(varCols)*(len(varCols)-1)/2)
+	selects = append(selects, groupExprs...)
+	selects = append(selects, "CAST(count(*) AS BIGINT)")
+	for _, c := range varCols {
+		selects = append(selects, "sum("+dbl(c)+")", "sum("+dbl(c)+" * "+dbl(c)+")")
+	}
+	for i := 0; i < len(varCols); i++ {
+		for j := i + 1; j < len(varCols); j++ {
+			selects = append(selects, "sum("+dbl(varCols[i])+" * "+dbl(varCols[j])+")")
+		}
+	}
+
+	filterPreds, filterArgs, err := compileFilters(cols, filters)
+	if err != nil {
+		return "", nil, 0, err
+	}
+
+	query := "SELECT " + strings.Join(selects, ", ") + " FROM " + tableFn
+	preds := append(nullPreds, filterPreds...)
+	if len(preds) > 0 {
+		query += " WHERE " + strings.Join(preds, " AND ")
+	}
+	if len(groupExprs) > 0 {
+		positions := make([]string, len(groupExprs))
+		for i := range positions {
+			positions[i] = strconv.Itoa(i + 1)
+		}
+		query += " GROUP BY " + strings.Join(positions, ", ")
+	}
+	return query, filterArgs, len(varCols), nil
+}
+
+// Collision-proof subquery aliases for the effect compiler. A stratified-effect
+// query computes the segment flag and objective operand once in an inner select and
+// aggregates them by conditioning stratum in the outer select, so each carries a
+// fixed alias the outer references. The inner select never emits `*`, so these
+// aliases cannot collide with a real column.
+const (
+	effectSegAlias = "__arborette_seg"
+	effectOpAlias  = "__arborette_op"
+)
+
+// compileStratifiedEffect builds the per-stratum backdoor-adjustment query for a
+// stratified_effect / sampled_effect request: an inner select computes, per row, the
+// (binned) adjustment-set key columns, the segment predicate as one boolean flag,
+// and the objective value operand; the outer select groups by the adjustment key and
+// emits, per stratum, the total complete-case count and the segment and baseline
+// arms' counts and objective aggregates. Computing the segment flag and operand once
+// in the inner select (referenced by alias in the outer) keeps every upstream-
+// influenced ? value bound exactly once and in emission order — bin cut points, then
+// the segment values, then the objective-expression literals. sampled_effect wraps
+// the inner scan in a reservoir USING SAMPLE; a positive RandomStratifierBins adds a
+// server-computed random bucket as an extra grouping term (the random-confounder
+// refutation). Reuses quoteIdent, compileExpr, aggregateOperand, compileFilters,
+// binExpr — the same injection contract as /execute and the other analyze kinds.
+func compileStratifiedEffect(tableFn string, cols []datasource.Column, req AnalyzeRequest, cuts map[int][]float64) (string, []any, error) {
+	sqlAgg, ok := allowedAgg[strings.ToLower(req.Aggregation)]
+	if !ok {
+		return "", nil, fmt.Errorf("%w: %q", errUnknownAggregation, req.Aggregation)
+	}
+	if req.ValueExpression == nil {
+		return "", nil, fmt.Errorf("%w: effect request has no value expression", errTypeIncompatible)
+	}
+	// The objective is never windowed here: a windowed finding short-circuits to
+	// unsupported_objective before any effect query, so an empty window binding is
+	// correct and a window kind would (rightly) fail to compile.
+	if domain.HasWindowKind(*req.ValueExpression) {
+		return "", nil, fmt.Errorf("%w: windowed objective is not adjustable", errTypeIncompatible)
+	}
+
+	cc := compileCtx{cols: cols}
+	exprSQL, exprType, exprArgs, err := compileExpr(cc, *req.ValueExpression)
+	if err != nil {
+		return "", nil, err
+	}
+	operand, err := aggregateOperand(sqlAgg, exprSQL, exprType)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Inner select: the (binned) adjustment key columns, the random bucket when
+	// requested, the segment flag, and the objective operand. Args accumulate in
+	// emission (left-to-right) order for positional binding.
+	var innerSelects []string
+	var innerArgs []any
+	nullPreds := make([]string, 0, len(req.Adjust))
+	groupCount := 0
+	for i, c := range req.Adjust {
+		col, err := resolveColumn(cols, c.Name)
+		if err != nil {
+			return "", nil, err
+		}
+		if c.Bins > 0 {
+			if !isNumeric(col.Type) {
+				return "", nil, fmt.Errorf("%w: binned column %q (%s)", errNonNumeric, col.Name, col.Type)
+			}
+			expr, binArgs := binExpr(col.Name, cuts[i])
+			innerSelects = append(innerSelects, expr+" AS "+quoteIdent(adjustAlias(groupCount)))
+			innerArgs = append(innerArgs, binArgs...)
+		} else {
+			innerSelects = append(innerSelects, "CAST("+quoteIdent(col.Name)+" AS VARCHAR) AS "+quoteIdent(adjustAlias(groupCount)))
+		}
+		nullPreds = append(nullPreds, quoteIdent(col.Name)+" IS NOT NULL")
+		groupCount++
+	}
+	if req.RandomStratifierBins > 0 {
+		// A server-computed integer bucket in [0, bins): random() ∈ [0,1) times the
+		// bin count, floored. The bin count is a validated integer literal, never
+		// request text, so it is injection-safe.
+		rand := "CAST(CAST(floor(random() * " + strconv.Itoa(req.RandomStratifierBins) + ") AS INTEGER) AS VARCHAR) AS " + quoteIdent(adjustAlias(groupCount))
+		innerSelects = append(innerSelects, rand)
+		groupCount++
+	}
+
+	segPreds, segArgs, err := compileFilters(cols, req.Segment)
+	if err != nil {
+		return "", nil, err
+	}
+	segment := "TRUE"
+	if len(segPreds) > 0 {
+		segment = "(" + strings.Join(segPreds, " AND ") + ")"
+	}
+	innerSelects = append(innerSelects, segment+" AS "+quoteIdent(effectSegAlias))
+	innerArgs = append(innerArgs, segArgs...)
+	innerSelects = append(innerSelects, operand+" AS "+quoteIdent(effectOpAlias))
+	innerArgs = append(innerArgs, exprArgs...)
+
+	scan := tableFn
+	if req.Kind == AnalyzeSampledEffect {
+		scan += " " + samplingClause(req.SampleFraction)
+	}
+	inner := "SELECT " + strings.Join(innerSelects, ", ") + " FROM " + scan
+	if len(nullPreds) > 0 {
+		inner += " WHERE " + strings.Join(nullPreds, " AND ")
+	}
+
+	// Outer select: the stratum key columns, then the five per-stratum measures. The
+	// segment flag and operand are referenced by alias, so no ? is re-emitted here.
+	seg := quoteIdent(effectSegAlias)
+	op := quoteIdent(effectOpAlias)
+	outerSelects := make([]string, 0, groupCount+5)
+	for i := 0; i < groupCount; i++ {
+		outerSelects = append(outerSelects, quoteIdent(adjustAlias(i)))
+	}
+	outerSelects = append(outerSelects,
+		"CAST(count(*) AS BIGINT)",
+		"CAST(count(CASE WHEN "+seg+" THEN 1 END) AS BIGINT)",
+		"CAST("+sqlAgg+"(CASE WHEN "+seg+" THEN "+op+" END) AS DOUBLE)",
+		"CAST(count(CASE WHEN NOT "+seg+" THEN 1 END) AS BIGINT)",
+		"CAST("+sqlAgg+"(CASE WHEN NOT "+seg+" THEN "+op+" END) AS DOUBLE)",
+	)
+
+	query := "SELECT " + strings.Join(outerSelects, ", ") + " FROM (" + inner + ")"
+	if groupCount > 0 {
+		positions := make([]string, groupCount)
+		for i := range positions {
+			positions[i] = strconv.Itoa(i + 1)
+		}
+		query += " GROUP BY " + strings.Join(positions, ", ")
+	}
+	return query, innerArgs, nil
+}
+
+// adjustAlias names the i-th stratum key column of the effect subquery.
+func adjustAlias(i int) string {
+	return "__arborette_g" + strconv.Itoa(i)
+}
+
+// samplingClause renders the reservoir USING SAMPLE clause for a sampled_effect
+// scan. The fraction is a validated (0, 1] server value rendered as a percentage
+// literal (never request text), so it is injection-safe; reservoir sampling draws a
+// fresh subsample per call, which is what the K-subsample stability refutation needs.
+func samplingClause(fraction float64) string {
+	pct := strconv.FormatFloat(fraction*100, 'f', 4, 64)
+	return "USING SAMPLE " + pct + "% (reservoir)"
 }

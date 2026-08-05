@@ -90,23 +90,141 @@ func TestCreateMetaHeuristicPendingLifecycle(t *testing.T) {
 		t.Fatalf("create meta-heuristic: %v", err)
 	}
 
-	pending, err := repo.ListEmbeddingPending(ctx)
+	created, err := repo.GetMetaHeuristic(ctx, mhID)
 	if err != nil {
-		t.Fatalf("list embedding pending: %v", err)
+		t.Fatalf("get meta-heuristic: %v", err)
 	}
-	if !containsID(pending, mhID) {
-		t.Fatalf("expected %s in embedding-pending list", mhID)
+	if !created.EmbeddingPending {
+		t.Fatalf("a freshly created meta-heuristic must be embedding-pending: %+v", created)
 	}
 
 	if err := repo.ClearEmbeddingPending(ctx, mhID); err != nil {
 		t.Fatalf("clear embedding pending: %v", err)
 	}
-	pending, err = repo.ListEmbeddingPending(ctx)
+	cleared, err := repo.GetMetaHeuristic(ctx, mhID)
 	if err != nil {
-		t.Fatalf("list embedding pending after clear: %v", err)
+		t.Fatalf("get meta-heuristic after clear: %v", err)
 	}
-	if containsID(pending, mhID) {
-		t.Fatalf("expected %s cleared from embedding-pending list", mhID)
+	if cleared.EmbeddingPending {
+		t.Fatalf("clearing the flag must leave the meta-heuristic not pending: %+v", cleared)
+	}
+}
+
+// TestMetaHeuristicGoalScope covers the graph side of goal scoping: a goal set at
+// create round-trips through GetMetaHeuristic and ListMetaHeuristics, a legacy
+// node created without a goal heals to a real goal on re-abstraction, and a
+// goal-less re-issue never re-blanks a node that already carries a goal.
+func TestMetaHeuristicGoalScope(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, ctx)
+	_, interventionID, _ := seedTriplet(t, ctx, repo)
+
+	// A node created with a goal carries it through both read paths.
+	scopedID, goalA := testutil.NewID(t), testutil.NewID(t)
+	if err := repo.CreateMetaHeuristic(ctx,
+		domain.MetaHeuristic{ID: scopedID, Definition: "scoped at creation", GoalID: goalA},
+		[]string{interventionID},
+	); err != nil {
+		t.Fatalf("create scoped meta-heuristic: %v", err)
+	}
+	got, err := repo.GetMetaHeuristic(ctx, scopedID)
+	if err != nil {
+		t.Fatalf("get scoped: %v", err)
+	}
+	if got.GoalID != goalA {
+		t.Fatalf("goal_id must round-trip through GetMetaHeuristic, got %q want %q", got.GoalID, goalA)
+	}
+	all, err := repo.ListMetaHeuristics(ctx)
+	if err != nil {
+		t.Fatalf("list meta-heuristics: %v", err)
+	}
+	if goalOfID(all, scopedID) != goalA {
+		t.Fatalf("goal_id must round-trip through ListMetaHeuristics, got %q", goalOfID(all, scopedID))
+	}
+
+	// A legacy node created without a goal reads back empty, heals to a real goal on
+	// re-abstraction, and is never re-blanked by a later goal-less re-issue.
+	legacyID, goalB := testutil.NewID(t), testutil.NewID(t)
+	if err := repo.CreateMetaHeuristic(ctx,
+		domain.MetaHeuristic{ID: legacyID, Definition: "legacy, no goal"},
+		[]string{interventionID},
+	); err != nil {
+		t.Fatalf("create legacy meta-heuristic: %v", err)
+	}
+	if got, _ := repo.GetMetaHeuristic(ctx, legacyID); got.GoalID != "" {
+		t.Fatalf("a legacy node must read back with an empty goal, got %q", got.GoalID)
+	}
+	if err := repo.CreateMetaHeuristic(ctx,
+		domain.MetaHeuristic{ID: legacyID, Definition: "legacy, now scoped", GoalID: goalB},
+		[]string{interventionID},
+	); err != nil {
+		t.Fatalf("re-abstract legacy meta-heuristic: %v", err)
+	}
+	if got, _ := repo.GetMetaHeuristic(ctx, legacyID); got.GoalID != goalB {
+		t.Fatalf("re-abstraction must heal the legacy node's goal, got %q want %q", got.GoalID, goalB)
+	}
+	if err := repo.CreateMetaHeuristic(ctx,
+		domain.MetaHeuristic{ID: legacyID, Definition: "goal-less re-issue"},
+		[]string{interventionID},
+	); err != nil {
+		t.Fatalf("goal-less re-issue: %v", err)
+	}
+	if got, _ := repo.GetMetaHeuristic(ctx, legacyID); got.GoalID != goalB {
+		t.Fatalf("a goal-less re-issue must not re-blank a scoped node, got %q want %q", got.GoalID, goalB)
+	}
+}
+
+func goalOfID(mhs []domain.MetaHeuristic, id string) string {
+	for _, mh := range mhs {
+		if mh.ID == id {
+			return mh.GoalID
+		}
+	}
+	return ""
+}
+
+// TestGetMetaHeuristicsBatch pins the hydration read behind a similarity search:
+// ids with no node come back absent rather than erroring, and no ids is an empty
+// answer rather than a failure. (Whether no ids also skips the round trip is not
+// observable from here — both variants return the same empty result.)
+func TestGetMetaHeuristicsBatch(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, ctx)
+	_, interventionID, _ := seedTriplet(t, ctx, repo)
+
+	presentIDs := []string{testutil.NewID(t), testutil.NewID(t)}
+	for _, id := range presentIDs {
+		if err := repo.CreateMetaHeuristic(ctx,
+			domain.MetaHeuristic{ID: id, Definition: "definition " + id},
+			[]string{interventionID},
+		); err != nil {
+			t.Fatalf("create meta-heuristic: %v", err)
+		}
+	}
+	absentID := testutil.NewID(t)
+
+	got, err := repo.GetMetaHeuristics(ctx, append(append([]string{}, presentIDs...), absentID))
+	if err != nil {
+		t.Fatalf("get meta-heuristics: %v", err)
+	}
+	if len(got) != len(presentIDs) {
+		t.Fatalf("fetched %d meta-heuristic(s), want only the %d seeded: %+v", len(got), len(presentIDs), got)
+	}
+	for _, id := range presentIDs {
+		if !containsID(got, id) {
+			t.Fatalf("expected %s in the batch result, got %+v", id, got)
+		}
+	}
+	if containsID(got, absentID) {
+		t.Fatalf("an id with no node must be absent, not fabricated: %+v", got)
+	}
+
+	empty, err := repo.GetMetaHeuristics(ctx, nil)
+	if err != nil {
+		t.Fatalf("get meta-heuristics for no ids: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("expected an empty result for no ids, got %+v", empty)
 	}
 }
 

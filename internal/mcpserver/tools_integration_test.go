@@ -37,7 +37,7 @@ func TestToolsIntegration(t *testing.T) {
 		t.Fatalf("open pool: %v", err)
 	}
 	t.Cleanup(p.Close)
-	embeddings := store.NewEmbeddingStore(p)
+	embeddings := store.NewEmbeddingStore(p, cfg.Embedding.DistanceFloor)
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
 
 	stateID, interventionID, outcomeID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
@@ -55,7 +55,7 @@ func TestToolsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("embed document: %v", err)
 	}
-	if err := embeddings.Upsert(ctx, mhID, docVec); err != nil {
+	if err := embeddings.Upsert(ctx, mhID, "", docVec); err != nil {
 		t.Fatalf("upsert embedding: %v", err)
 	}
 	if err := repo.ClearEmbeddingPending(ctx, mhID); err != nil {

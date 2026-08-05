@@ -8,7 +8,6 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -22,6 +21,7 @@ import (
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/heuristics"
 	"github.com/arborette/arborette/internal/llm"
+	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -38,21 +38,19 @@ const (
 
 // The interfaces below are the narrow contracts the Server depends on, defined
 // at the consumer so the handler layer is unit-testable with fakes and no infra.
-// cmd/orchestrator passes the concrete *llm.Client, *SandboxClient,
-// *store.GoalRegistry, *store.AuditLog, *objectstore.Client, and
-// *heuristics.Service, which satisfy them.
 
 // claudeClient is the structured-output Claude calls the loop needs, named for
 // the collaborator (the `claude` field) rather than any single method. The two
 // document methods sit here beside the tabular ones: the document intake path
 // derives extractable fields, and the extraction loop measures each field.
 type claudeClient interface {
-	GenerateEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema) (domain.EvaluationMatrix, error)
-	RepairEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema, prior domain.EvaluationMatrix, validationErr string) (domain.EvaluationMatrix, error)
+	GenerateEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema, windowed bool) (domain.EvaluationMatrix, error)
+	RepairEvaluationMatrix(ctx context.Context, goalText string, schema llm.SandboxSchema, prior domain.EvaluationMatrix, validationErr string, windowed bool) (domain.EvaluationMatrix, error)
 	ProposeInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema llm.SandboxSchema, node llm.TreeContext) (llm.Proposal, error)
 	RepairInterventionTree(ctx context.Context, goalText string, matrix domain.EvaluationMatrix, schema llm.SandboxSchema, node llm.TreeContext, prior llm.Proposal, validationErr string) (llm.Proposal, error)
 	IntrospectDocumentFields(ctx context.Context, goalText, sample string) ([]domain.TargetField, error)
 	Extract(ctx context.Context, pdf []byte, field domain.TargetField, method string) (string, float64, error)
+	ClassifyGoalIntent(ctx context.Context, goal llm.GoalIntentInput) (llm.GoalIntentResult, error)
 }
 
 // chatStreamer is the streaming Claude the agent-preview endpoint drives. It is
@@ -63,6 +61,44 @@ type chatStreamer interface {
 	Chat(ctx context.Context, system string, msgs []llm.ChatMessage, emit func(llm.ChatEvent) error) error
 }
 
+// graphRepo is the graph surface the handlers and the loop need: the triplet
+// writes the loop persists, the extraction reads and resolution writes the
+// review surface drives, and the causal reads and corrections the router routes on --
+// the finding lookup behind an explicit verify, the eligible-findings pool
+// auto-promotion ranks, and the analyst's edge correction.
+type graphRepo interface {
+	CreateState(ctx context.Context, s domain.State) error
+	CreateIntervention(ctx context.Context, i domain.Intervention) error
+	CreateOutcome(ctx context.Context, o domain.Outcome) error
+	CreatePreConditionFor(ctx context.Context, stateID, interventionID string) error
+	CreateProduced(ctx context.Context, interventionID, outcomeID string, edge domain.ProducedEdge) error
+	ListExtractionOutcomes(ctx context.Context, goalID string) ([]graph.ExtractionOutcome, error)
+	GetExtractionOutcome(ctx context.Context, outcomeID string) (graph.ExtractionOutcome, error)
+	UpdateOutcomeVerification(ctx context.Context, outcomeID string, status domain.VerificationStatus, confidence float64) error
+	CorrectOutcome(ctx context.Context, outcomeID string, value map[string]any, provenance *domain.ProvenanceLocator, status domain.VerificationStatus, confidence float64) error
+	GetCausalGraph(ctx context.Context, goalID, datasourceRef string) (domain.CausalGraph, bool, error)
+	GetIntervention(ctx context.Context, id string) (domain.Intervention, error)
+	ListEligibleFindings(ctx context.Context, goalID string) ([]graph.CausalTriplet, error)
+	CorrectCausalEdge(ctx context.Context, goalID, datasourceRef string, correction domain.EdgeCorrection) (int, []string, error)
+}
+
+// causalVerificationStore is the causal-verification surface the router reads and
+// invalidates: the analyst-facing listing, and the staleness marking a graph
+// correction triggers. The records themselves are written by the Verifier.
+type causalVerificationStore interface {
+	ListForGoal(ctx context.Context, goalID string) ([]store.CausalVerification, error)
+	MarkStale(ctx context.Context, goalID string, columns []string) ([]string, error)
+}
+
+// graphLocker is the cross-process single-flight over a (goal, data-source) key --
+// the same Postgres advisory lock discovery runs behind. A correction is a
+// read-modify-write of the whole edge set, so it has to hold that lock too: two
+// interleaved corrections would each copy forward the version they read and one
+// analyst's edit would silently vanish.
+type graphLocker interface {
+	TryAcquireDiscoveryLock(ctx context.Context, goalID, datasourceRef string) (release func(), acquired bool, err error)
+}
+
 type sandboxExecutor interface {
 	Introspect(ctx context.Context, req IntrospectRequest) (IntrospectResponse, error)
 	Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error)
@@ -71,8 +107,10 @@ type sandboxExecutor interface {
 
 type goalStore interface {
 	Insert(ctx context.Context, goal store.Goal) error
+	RegisterDataSourceRef(ctx context.Context, ref string) error
 	Get(ctx context.Context, optimizationFunctionID string) (store.Goal, error)
 	List(ctx context.Context) ([]store.Goal, error)
+	SetClaimError(ctx context.Context, optimizationFunctionID, reason string) error
 }
 
 // runStore is the run-lifecycle surface the loop and the objectives list need.
@@ -110,8 +148,21 @@ type objectStore interface {
 }
 
 type heuristicsService interface {
-	Query(ctx context.Context, stateString string, k int) ([]heuristics.Match, error)
+	Query(ctx context.Context, stateString string, k int, scope store.SearchScope) ([]heuristics.Match, error)
 	Trace(ctx context.Context, metaHeuristicID string) ([]graph.CausalTriplet, error)
+}
+
+// RouterConfig bundles the knobs that govern when verification runs: whether
+// autonomous auto-promotion is on at all (the operator kill switch), how many
+// findings it promotes and at what shrinkage level it ranks them, and how many stale
+// records one graph correction may re-dispatch. They travel as one value because
+// they are one policy, and because four bare ints and bools in a positional
+// constructor is a slot-swap waiting to happen.
+type RouterConfig struct {
+	AutoPromoteEnabled    bool
+	AutoPromoteTopN       int
+	AutoPromoteShrinkageK int
+	StaleReverifyCap      int
 }
 
 // Server is the HTTP surface of the orchestrator, holding its collaborators.
@@ -119,10 +170,12 @@ type heuristicsService interface {
 // goal like the hub; see registerHistogram for why that state is in-memory and
 // how its lifetime is serialized against the hub's.
 type Server struct {
-	repo                graph.Repository
+	repo                graphRepo
 	goals               goalStore
 	runs                runStore
 	queue               verificationQueue
+	causalVerifications causalVerificationStore
+	graphLock           graphLocker
 	audits              auditStore
 	objects             objectStore
 	heur                heuristicsService
@@ -131,13 +184,18 @@ type Server struct {
 	sandbox             sandboxExecutor
 	hub                 *Hub
 	jobs                JobLauncher
+	verifierJobs        JobLauncher
 	identity            Identity
+	router              RouterConfig
 	localImportDir      string
 	sleepCycleJobName   string
+	internalAuthToken   string
 	hitlThreshold       float64
 	blockingLoopTimeout time.Duration
 	verificationPoll    time.Duration
 	keepaliveInterval   time.Duration
+	correctionLockWait  time.Duration
+	correctionLockPoll  time.Duration
 
 	histMu     sync.Mutex
 	histograms map[string]*confidenceHistogram
@@ -146,10 +204,12 @@ type Server struct {
 // NewServer wires the server from its collaborators (infra-constructor
 // convention).
 func NewServer(
-	repo graph.Repository,
+	repo graphRepo,
 	goals goalStore,
 	runs runStore,
 	queue verificationQueue,
+	causalVerifications causalVerificationStore,
+	graphLock graphLocker,
 	audits auditStore,
 	objects objectStore,
 	heur heuristicsService,
@@ -158,8 +218,10 @@ func NewServer(
 	sandbox sandboxExecutor,
 	hub *Hub,
 	jobs JobLauncher,
+	verifierJobs JobLauncher,
 	identity Identity,
-	localImportDir, sleepCycleJobName string,
+	router RouterConfig,
+	localImportDir, sleepCycleJobName, internalAuthToken string,
 	hitlThreshold float64,
 	blockingLoopTimeout time.Duration,
 ) *Server {
@@ -168,6 +230,9 @@ func NewServer(
 		goals:               goals,
 		runs:                runs,
 		queue:               queue,
+		causalVerifications: causalVerifications,
+		graphLock:           graphLock,
+		router:              router,
 		audits:              audits,
 		objects:             objects,
 		heur:                heur,
@@ -176,18 +241,25 @@ func NewServer(
 		sandbox:             sandbox,
 		hub:                 hub,
 		jobs:                jobs,
+		verifierJobs:        verifierJobs,
 		identity:            identity,
 		localImportDir:      localImportDir,
 		sleepCycleJobName:   sleepCycleJobName,
+		internalAuthToken:   internalAuthToken,
 		hitlThreshold:       hitlThreshold,
 		blockingLoopTimeout: blockingLoopTimeout,
 		verificationPoll:    defaultVerificationPoll,
 		keepaliveInterval:   defaultKeepaliveInterval,
+		correctionLockWait:  defaultCorrectionLockWait,
+		correctionLockPoll:  defaultCorrectionLockPoll,
 		histograms:          map[string]*confidenceHistogram{},
 	}
 }
 
-// Routes returns the mux with method-prefixed patterns.
+// Routes returns the mux with method-prefixed patterns. The internal audit write
+// is the one guarded route: it is service-to-service, so it can carry a shared
+// secret no analyst has to hold. The analyst-facing routes stay open -- analyst
+// authentication is a separate concern from this internal boundary.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /goals", s.handleSubmitGoal)
@@ -200,9 +272,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /goals/{id}/verifications/{outcomeID}", s.handleResolveVerification)
 	mux.HandleFunc("GET /goals/{id}/outcomes", s.handleListOutcomes)
 	mux.HandleFunc("GET /goals/{id}/outcomes/{outcomeID}/excerpt", s.handleOutcomeExcerpt)
+	mux.HandleFunc("GET /goals/{id}/causal-graph", s.handleCausalGraph)
+	mux.HandleFunc("POST /goals/{id}/causal-graph/corrections", s.handleCausalCorrection)
+	mux.HandleFunc("POST /goals/{id}/findings/{interventionID}/verify", s.handleVerifyFinding)
+	mux.HandleFunc("GET /goals/{id}/causal-verifications", s.handleListCausalVerifications)
 	mux.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
 	mux.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)
-	mux.HandleFunc("POST /internal/audit", s.handleAudit)
+	mux.Handle("POST /internal/audit", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleAudit)))
+	mux.Handle("POST /internal/verification-events", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleVerificationEvent)))
 	return mux
 }
 
@@ -212,28 +289,12 @@ func (s *Server) lookupGoal(ctx context.Context, w http.ResponseWriter, id strin
 	goal, err := s.goals.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			writeErr(w, http.StatusNotFound, "goal not found")
+			service.WriteErr(w, http.StatusNotFound, "goal not found")
 			return store.Goal{}, false
 		}
 		log.Printf("orchestrator: get goal %q: %v", id, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return store.Goal{}, false
 	}
 	return goal, true
-}
-
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("orchestrator: encode response: %v", err)
-	}
-}
-
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, errorResponse{Error: msg})
 }

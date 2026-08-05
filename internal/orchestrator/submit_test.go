@@ -4,11 +4,94 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/arborette/arborette/internal/domain"
 )
+
+// windowBindingCols is the introspected schema parseWindowBindings resolves against:
+// a categorical entity column, a numeric and a temporal orderable column, a
+// non-orderable text column, and a case-colliding pair to exercise ambiguity.
+func windowBindingCols() []columnDTO {
+	return []columnDTO{
+		{Name: "region", Type: "VARCHAR"},
+		{Name: "order_value", Type: "DOUBLE"},
+		{Name: "ts", Type: "TIMESTAMP"},
+		{Name: "Dup", Type: "VARCHAR"},
+		{Name: "dup", Type: "VARCHAR"},
+	}
+}
+
+func windowBindingReq(entity, ts string) *http.Request {
+	form := url.Values{}
+	if entity != "" {
+		form.Set("entity_key_column", entity)
+	}
+	if ts != "" {
+		form.Set("time_column", ts)
+	}
+	// A non-nil Form makes FormValue read it directly rather than parse a body.
+	return &http.Request{Form: form}
+}
+
+func TestParseWindowBindings(t *testing.T) {
+	cols := windowBindingCols()
+
+	t.Run("neither present is unbound, no error", func(t *testing.T) {
+		e, ts, err := parseWindowBindings(windowBindingReq("", ""), cols)
+		if err != nil || e != "" || ts != "" {
+			t.Fatalf("unbound = (%q, %q, %v), want empty/empty/nil", e, ts, err)
+		}
+	})
+
+	t.Run("only one binding is rejected", func(t *testing.T) {
+		if _, _, err := parseWindowBindings(windowBindingReq("region", ""), cols); err == nil {
+			t.Fatal("lone entity_key_column must be rejected")
+		}
+		if _, _, err := parseWindowBindings(windowBindingReq("", "order_value"), cols); err == nil {
+			t.Fatal("lone time_column must be rejected")
+		}
+	})
+
+	t.Run("valid bindings resolve to the actual column names", func(t *testing.T) {
+		e, ts, err := parseWindowBindings(windowBindingReq("REGION", "order_value"), cols)
+		if err != nil {
+			t.Fatalf("valid bindings: %v", err)
+		}
+		if e != "region" || ts != "order_value" {
+			t.Fatalf("bindings resolved to (%q, %q), want (region, order_value)", e, ts)
+		}
+	})
+
+	t.Run("a temporal time column is orderable", func(t *testing.T) {
+		if _, _, err := parseWindowBindings(windowBindingReq("region", "ts"), cols); err != nil {
+			t.Fatalf("temporal time column must be orderable: %v", err)
+		}
+	})
+
+	t.Run("unknown columns are rejected", func(t *testing.T) {
+		if _, _, err := parseWindowBindings(windowBindingReq("ghost", "order_value"), cols); err == nil {
+			t.Fatal("unknown entity column must be rejected")
+		}
+		if _, _, err := parseWindowBindings(windowBindingReq("region", "ghost"), cols); err == nil {
+			t.Fatal("unknown time column must be rejected")
+		}
+	})
+
+	t.Run("a case-colliding column is ambiguous, not a silent pick", func(t *testing.T) {
+		if _, _, err := parseWindowBindings(windowBindingReq("dup", "order_value"), cols); err == nil {
+			t.Fatal("ambiguous entity column must be rejected")
+		}
+	})
+
+	t.Run("a non-orderable time column is rejected", func(t *testing.T) {
+		if _, _, err := parseWindowBindings(windowBindingReq("order_value", "region"), cols); err == nil {
+			t.Fatal("a VARCHAR time column is not orderable and must be rejected")
+		}
+	})
+}
 
 // postGoal drives a valid file-upload goal submission through the mux.
 func postGoal(t *testing.T, srv *Server) *httptest.ResponseRecorder {
@@ -88,6 +171,44 @@ func TestSubmitGoalDryRunRepairThenSuccess(t *testing.T) {
 	}
 	if goals.inserted == nil {
 		t.Fatal("goal should be persisted after a repaired objective validates")
+	}
+}
+
+// TestSubmitGoalRegistersRefBeforeSandbox proves the minted ref is registered with
+// the same ref the goal persists -- the ordering the sandbox ref-scoping depends on,
+// since the intake introspect/dry-run validate against the registry.
+func TestSubmitGoalRegistersRefBeforeSandbox(t *testing.T) {
+	goals := &fakeGoals{}
+	claude := &fakeClaude{matrix: fittedMatrix()}
+	sandbox := &fakeSandbox{introspect: revenueSchema(), execResps: []ExecuteResponse{{Value: map[string]any{"avg(revenue)": 10.0}}}}
+	srv := newTestServer(goals, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+
+	rec := postGoal(t, srv)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %q)", rec.Code, rec.Body.String())
+	}
+	if goals.inserted == nil || goals.registeredRef == "" || goals.registeredRef != goals.inserted.DataSourceRef {
+		t.Fatalf("ref must be registered with the ref the goal persists: registered=%q goal=%+v", goals.registeredRef, goals.inserted)
+	}
+}
+
+// TestSubmitGoalRegisterRefErrorIsInternalError proves a registry write failure is a
+// masked 500 that never reaches the sandbox and never persists the goal.
+func TestSubmitGoalRegisterRefErrorIsInternalError(t *testing.T) {
+	goals := &fakeGoals{registerErr: errors.New("db down")}
+	claude := &fakeClaude{matrix: fittedMatrix()}
+	sandbox := &fakeSandbox{introspect: revenueSchema()}
+	srv := newTestServer(goals, &fakeAudits{}, &fakeObjects{}, &fakeHeur{}, claude, sandbox)
+
+	rec := postGoal(t, srv)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body %q)", rec.Code, rec.Body.String())
+	}
+	if sandbox.introspectCalls != 0 {
+		t.Fatalf("sandbox introspected despite a failed ref registration (%d calls)", sandbox.introspectCalls)
+	}
+	if goals.inserted != nil {
+		t.Fatal("goal must not persist when ref registration fails")
 	}
 }
 

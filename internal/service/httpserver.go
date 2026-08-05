@@ -1,3 +1,8 @@
+// Package service holds the HTTP plumbing every service shares and none of them
+// owns: serving and graceful shutdown for the cmd/<service> mains, the bearer
+// guard, the JSON response writers the handlers answer through, and the response
+// cleanup the clients defer. A helper belongs here once a second service would
+// otherwise copy it.
 package service
 
 import (

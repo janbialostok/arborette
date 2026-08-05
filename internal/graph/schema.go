@@ -10,10 +10,10 @@ import (
 // InitSchema idempotently creates a per-label uniqueness constraint on the
 // application-assigned id property. Consuming services call it at startup. Uses
 // CREATE CONSTRAINT IF NOT EXISTS so re-running is a no-op; a future Neptune
-// implementation of Repository can make this a no-op since Neptune has no
-// schema constraints.
+// backend can implement it as a no-op outright, since Neptune has no schema
+// constraints.
 func (r *Neo4jRepository) InitSchema(ctx context.Context) error {
-	labels := []string{labelState, labelIntervention, labelOutcome, labelMetaHeuristic}
+	labels := []string{labelState, labelIntervention, labelOutcome, labelMetaHeuristic, labelDataColumn, labelCausalGraphMeta}
 	_, err := r.write(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		for _, label := range labels {
 			constraint := fmt.Sprintf(

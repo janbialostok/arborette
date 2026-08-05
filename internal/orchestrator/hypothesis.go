@@ -17,11 +17,17 @@ import (
 	"github.com/arborette/arborette/internal/llm"
 	"github.com/arborette/arborette/internal/objective"
 	"github.com/arborette/arborette/internal/sandboxclient"
+	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
 
 var (
 	errExpressionTooDeep = errors.New("objective value expression nests too deeply")
+
+	// errWindowedWithoutBindings is a repairable fit failure: the fitted objective
+	// uses a windowed value expression, but the goal bound no entity/time columns for
+	// the window to compile against, so the repair loop must strip or replace it.
+	errWindowedWithoutBindings = errors.New("objective uses a windowed value expression but the goal has no entity/time bindings")
 
 	// These live in internal/objective, shared with the Sleep-Cycle Worker.
 	errNonNumericValue    = objective.ErrNonNumericValue
@@ -64,7 +70,7 @@ func (s *Server) handleTriggerLoop(w http.ResponseWriter, r *http.Request) {
 	runID := uuid.NewString()
 	if err := s.runs.Create(r.Context(), runID, goal.OptimizationFunctionID); err != nil {
 		log.Printf("orchestrator: create run for %q: %v", goal.OptimizationFunctionID, err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	timeout := s.loopTimeoutFor(goal)
@@ -73,7 +79,7 @@ func (s *Server) handleTriggerLoop(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		s.runLoop(ctx, goal, runID)
 	}()
-	writeJSON(w, http.StatusAccepted, map[string]any{"optimization_function_id": goal.OptimizationFunctionID})
+	service.WriteJSON(w, http.StatusAccepted, map[string]any{"optimization_function_id": goal.OptimizationFunctionID})
 }
 
 // loopTimeoutFor bounds a run. A blocking-mode run waits on human review at
@@ -96,6 +102,9 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 	// the root-failure sites below set it, so a per-candidate branch failure (a
 	// separate function with no access to it) never flips the run to failed.
 	var termErr error
+	// Declared above the defer so the completion hook can read what the run measured;
+	// everything below assigns into it.
+	var run runOutcome
 	defer func() {
 		// A panic unwinds through this defer with termErr still nil; recover so a
 		// crashed run is marked failed rather than mislabeled completed, and one
@@ -127,6 +136,10 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		// of the run must not push a distribution into a run the hub is about to
 		// evict (see deregisterHistogram).
 		s.deregisterHistogram(id, hist)
+		// Route the run's output to Engine B on its own goroutine (see autoPromote for
+		// why it is one). Promotion is never allowed to change how the run ended.
+		run.succeeded = termErr == nil
+		go s.autoPromote(goal, run)
 		s.hub.Publish(id, Event{Type: "loop_complete"})
 		s.hub.Complete(id)
 	}()
@@ -146,6 +159,12 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		s.branchFailure(ctx, id, nil, err)
 		return
 	}
+	// The window bindings live on the goal, not the matrix, so Pin cannot see them;
+	// populate them here so a windowed objective compiles against the entity/time
+	// columns for the whole run.
+	obj.EntityKeyColumn = goal.EntityKeyColumn
+	obj.TimeColumn = goal.TimeColumn
+	run.objective = obj
 	log.Printf("orchestrator: hypothesis loop %q: objective: %s %s %s", id, obj.Aggregation, obj.Label, obj.Direction)
 
 	introspect, err := s.sandbox.Introspect(ctx, IntrospectRequest{DataSourceRef: goal.DataSourceRef})
@@ -158,8 +177,8 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 	schema := toSandboxSchema(introspect.Schema)
 	log.Printf("orchestrator: hypothesis loop %q: introspected %d columns", id, len(schema.Columns))
 
-	rootCandidates, err := s.proposeValidCandidates(ctx, goal, schema,
-		llm.TreeContext{IsRoot: true, Breadth: defaultBreadth})
+	rootNode := llm.TreeContext{IsRoot: true, Breadth: defaultBreadth}
+	rootCandidates, err := s.proposeValidCandidates(ctx, goal, schema, rootNode)
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: root proposal: %v", id, err)
 		termErr = err
@@ -183,19 +202,58 @@ func (s *Server) runLoop(ctx context.Context, goal store.Goal, runID string) {
 		s.branchFailure(ctx, id, nil, errNonNumericValue)
 		return
 	}
+	run.baseline, run.baselineSet = baseline, true
 	rootRowCount, _ := sandboxclient.RowCount(baseResp)
 	log.Printf("orchestrator: hypothesis loop %q: root baseline: %.4f (row_count: %d)", id, baseline, rootRowCount)
 
-	for _, cand := range rootCandidates {
-		s.processCandidate(ctx, goal, obj, schema, nil, baseline, cand, 1, hist)
+	s.expandCandidates(ctx, goal, obj, schema, rootNode, nil, baseline, rootCandidates, 1, hist)
+}
+
+// maxZeroRowReproposals bounds the zero-row retry to a single re-proposal per
+// expansion: replacement candidates are measured but never themselves re-proposed
+// on a further zero-row outcome, so the traversal always terminates.
+const maxZeroRowReproposals = 1
+
+// expandCandidates measures a set of sibling candidates at one depth, then makes a
+// single zero-row re-proposal for any whose segment matched no rows, re-entering
+// the replacements at the same depth, parent filters, and baseline as the children
+// they replace. It is shared by the root fan-out and each node's child expansion so
+// the retry behaves identically at every level. node is the proposal context the
+// re-proposal reuses. A replacement that is again zero-row is recorded and pruned
+// (the budget is spent) rather than triggering a further re-proposal.
+func (s *Server) expandCandidates(ctx context.Context, goal store.Goal, obj objective.Objective, schema llm.SandboxSchema, node llm.TreeContext, parentFilters []domain.Constraint, baseline float64, candidates []llm.CandidateIntervention, depth int, hist *confidenceHistogram) {
+	for attempt := 0; ; attempt++ {
+		var zeroRow []llm.CandidateIntervention
+		for _, c := range candidates {
+			if out := s.processCandidate(ctx, goal, obj, schema, parentFilters, baseline, c, depth, hist); out.zeroRow {
+				zeroRow = append(zeroRow, c)
+			}
+		}
+		if len(zeroRow) == 0 || attempt >= maxZeroRowReproposals {
+			return
+		}
+		candidates = s.reproposeZeroRow(ctx, goal, schema, node, zeroRow)
+		if len(candidates) == 0 {
+			return
+		}
 	}
+}
+
+// candidateOutcome is processCandidate's up-signal to its caller. zeroRow marks a
+// segment that matched no rows -- a distinct, non-fatal outcome the caller may
+// retry with a single re-proposal. A measured, branch-failed, or pruned candidate
+// returns the zero value.
+type candidateOutcome struct {
+	zeroRow bool
 }
 
 // processCandidate measures one candidate at its effective (cumulative) filter
 // set, writes the causal triplet, and — if the candidate improves the objective
 // within constraints and the depth cap is not reached — proposes and expands its
-// refinement children.
-func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj objective.Objective, schema llm.SandboxSchema, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, depth int, hist *confidenceHistogram) {
+// refinement children. It reports a zero-row segment (no rows matched) as a
+// distinct non-fatal outcome so the caller can re-propose; every other disposition
+// (measured, branch-failed, pruned) reports the zero value.
+func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj objective.Objective, schema llm.SandboxSchema, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, depth int, hist *confidenceHistogram) candidateOutcome {
 	id := goal.OptimizationFunctionID
 	effective := concatFilters(parentFilters, cand.Filters)
 	log.Printf("orchestrator: hypothesis loop %q: depth=%d candidate filters=%v", id, depth, renderConstraints(cand.Filters))
@@ -206,19 +264,31 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: depth=%d measurement failed: %v", id, depth, err)
 		s.branchFailure(ctx, id, effective, err)
-		return
+		return candidateOutcome{}
+	}
+	// The row count decides how to read the rest of the response, so it comes first.
+	// A zero-row segment supports no causal claim: it is a distinct, non-fatal
+	// outcome (no triplet, not counted) the caller may retry -- detected before the
+	// non-numeric bailout because avg/sum/min/max over an empty segment scan as SQL
+	// NULL, which NumericValue would otherwise read as a non-numeric failure. A
+	// missing count (counted == false) is a version-skew signal, not a zero-row
+	// segment: it keeps its non-fatal log below and never fires the zero-row outcome.
+	support, counted := sandboxclient.RowCount(resp)
+	if counted && support == 0 {
+		log.Printf("orchestrator: hypothesis loop %q: depth=%d zero-row segment, pruning", id, depth)
+		s.zeroRowSegment(ctx, id, effective)
+		return candidateOutcome{zeroRow: true}
 	}
 	value, ok := objective.NumericValue(resp.Value, obj.Label)
 	if !ok {
 		log.Printf("orchestrator: hypothesis loop %q: depth=%d non-numeric value", id, depth)
 		s.branchFailure(ctx, id, effective, errNonNumericValue)
-		return
+		return candidateOutcome{}
 	}
 	// A missing count is a version-skew signal worth logging, but non-fatal: the
 	// loop's job does not depend on support, so the outcome persists with 0
 	// (self-excluding from the Sleep Cycle's S* floor) rather than failing the
 	// candidate — unlike the search, where support drives pruning.
-	support, counted := sandboxclient.RowCount(resp)
 	if !counted {
 		log.Printf("orchestrator: hypothesis loop %q: sandbox returned no row count for a counted measurement", id)
 	}
@@ -228,7 +298,7 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: write triplet: %v", id, err)
 		s.branchFailure(ctx, id, effective, err)
-		return
+		return candidateOutcome{}
 	}
 	// A query measurement is verified by construction, so it lands in the top
 	// bucket; counting it keeps the live distribution spanning the whole run
@@ -237,35 +307,35 @@ func (s *Server) processCandidate(ctx context.Context, goal store.Goal, obj obje
 
 	if !objective.Improves(baseline, value, obj.Direction) {
 		log.Printf("orchestrator: hypothesis loop %q: depth=%d did not improve, pruning", id, depth)
-		return
+		return candidateOutcome{}
 	}
 	if !constraintsSatisfied(goal.EvaluationMatrix.Constraints, objectiveField(obj), value) {
 		log.Printf("orchestrator: hypothesis loop %q: depth=%d violates hard constraint, pruning", id, depth)
 		s.branchFailure(ctx, id, effective, errors.New("candidate violates a hard constraint on the objective field"))
-		return
+		return candidateOutcome{}
 	}
 	if depth >= defaultDepth {
 		log.Printf("orchestrator: hypothesis loop %q: depth=%d at depth cap, not expanding", id, depth)
-		return
+		return candidateOutcome{}
 	}
 	log.Printf("orchestrator: hypothesis loop %q: depth=%d improved, expanding", id, depth)
 
-	children, err := s.proposeValidCandidates(ctx, goal, schema, llm.TreeContext{
+	childNode := llm.TreeContext{
 		Breadth:        defaultBreadth,
 		ObjectiveLabel: obj.Label,
 		Direction:      obj.Direction,
 		ParentFilters:  effective,
 		PriorValue:     &value,
-	})
+	}
+	children, err := s.proposeValidCandidates(ctx, goal, schema, childNode)
 	if err != nil {
 		log.Printf("orchestrator: hypothesis loop %q: depth=%d child proposal failed: %v", id, depth, err)
 		s.branchFailure(ctx, id, effective, err)
-		return
+		return candidateOutcome{}
 	}
 	log.Printf("orchestrator: hypothesis loop %q: depth=%d proposing %d children", id, depth, len(children))
-	for _, c := range children {
-		s.processCandidate(ctx, goal, obj, schema, effective, value, c, depth+1, hist)
-	}
+	s.expandCandidates(ctx, goal, obj, schema, childNode, effective, value, children, depth+1, hist)
+	return candidateOutcome{}
 }
 
 // maxInlinePDFBytes bounds a PDF sent inline as a base64 document block. The
@@ -683,17 +753,34 @@ func (s *Server) branchFailure(ctx context.Context, id string, filters []domain.
 	s.hub.Publish(id, Event{Type: "branch_failure", Payload: map[string]any{"error": cause.Error()}})
 }
 
-// proposeValidCandidates proposes one node's candidates and repairs any that
-// reference columns absent from the schema, re-proposing only the invalid ones
-// against the naming error. Earlier-round valid candidates accumulate and are never
-// re-proposed, so no candidate is dropped or duplicated. A transport error from the
-// initial proposal is returned as-is, so callers keep the terminal-at-root /
-// non-terminal-in-child distinction; a repair-call transport error is best-effort —
-// it keeps the candidates already validated and records the fault as a branch
-// failure rather than sinking the run. After the repair bound, still-invalid
-// candidates are dropped and a branch failure naming the unknown columns is recorded
-// (siblings continue); if none remain valid, the returned slice is empty and that
-// branch stops expanding.
+// zeroRowSegment records a zero-row-segment audit event and emits a distinct SSE
+// event. It is deliberately separate from branchFailure so a segment that simply
+// matched no rows is never confused with a measurement failure: it is non-fatal,
+// writes no triplet, and is not counted in the run's confidence distribution
+// (an empty segment supports no causal claim, so it carries no value). Siblings
+// continue, and the caller may make one re-proposal in its place.
+func (s *Server) zeroRowSegment(ctx context.Context, id string, filters []domain.Constraint) {
+	if err := s.recordAudit(ctx, "hypothesis_zero_row_segment", "outcome", map[string]any{
+		"optimization_function_id": id,
+		"filters":                  filters,
+	}); err != nil {
+		log.Printf("orchestrator: append audit: %v", err)
+	}
+	s.hub.Publish(id, Event{Type: "zero_row_segment", Payload: map[string]any{"filters": renderConstraints(filters)}})
+}
+
+// proposeValidCandidates proposes one node's candidates and repairs any that fail
+// grounding — a filter column absent from the schema or an equality/membership
+// value absent from the column's known value set — re-proposing only the invalid
+// ones against the offending columns and values. Earlier-round valid candidates
+// accumulate and are never re-proposed, so no candidate is dropped or duplicated. A
+// transport error from the initial proposal is returned as-is, so callers keep the
+// terminal-at-root / non-terminal-in-child distinction; a repair-call transport
+// error is best-effort — it keeps the candidates already validated and records the
+// fault as a branch failure rather than sinking the run. After the repair bound,
+// still-invalid candidates are dropped and a branch failure naming the unknown
+// columns and values is recorded (siblings continue); if none remain valid, the
+// returned slice is empty and that branch stops expanding.
 func (s *Server) proposeValidCandidates(ctx context.Context, goal store.Goal, schema llm.SandboxSchema, node llm.TreeContext) ([]llm.CandidateIntervention, error) {
 	id := goal.OptimizationFunctionID
 	proposal, err := s.claude.ProposeInterventionTree(ctx, goal.GoalText, goal.EvaluationMatrix, schema, node)
@@ -701,49 +788,92 @@ func (s *Server) proposeValidCandidates(ctx context.Context, goal store.Goal, sc
 		return nil, err
 	}
 	cols := columnNames(schema)
-	valid, invalid, unknown := splitByColumns(proposal.Candidates, cols)
+	vals := columnValues(schema)
+	valid, invalid, unknownCols, unknownVals := splitByGrounding(proposal.Candidates, cols, vals)
 
 	for attempts := 0; len(invalid) > 0 && attempts < maxProposalRepairs; attempts++ {
 		repaired, rerr := s.claude.RepairInterventionTree(ctx, goal.GoalText, goal.EvaluationMatrix, schema, node,
-			llm.Proposal{Candidates: invalid}, unknownColumnsMessage(unknown))
+			llm.Proposal{Candidates: invalid}, groundingErrorMessage(unknownCols, unknownVals))
 		if rerr != nil {
 			log.Printf("orchestrator: hypothesis loop %q: repair intervention tree: %v", id, rerr)
 			s.branchFailure(ctx, id, node.ParentFilters, rerr)
 			return valid, nil
 		}
-		newValid, newInvalid, newUnknown := splitByColumns(repaired.Candidates, cols)
+		newValid, newInvalid, newCols, newVals := splitByGrounding(repaired.Candidates, cols, vals)
 		valid = append(valid, newValid...)
-		invalid, unknown = newInvalid, newUnknown
+		invalid, unknownCols, unknownVals = newInvalid, newCols, newVals
 	}
 
 	if len(invalid) > 0 {
 		s.branchFailure(ctx, id, node.ParentFilters,
-			fmt.Errorf("dropped %d candidate(s) referencing unknown columns: %s", len(invalid), strings.Join(unknown, ", ")))
+			fmt.Errorf("dropped %d candidate(s) that failed grounding: %s", len(invalid), groundingErrorMessage(unknownCols, unknownVals)))
 	}
 	return valid, nil
 }
 
-// splitByColumns partitions candidates into those whose filter columns all exist in
-// the schema and those referencing at least one unknown column, collecting the
-// unknown column names (deduplicated, first-seen) for the repair prompt.
-func splitByColumns(candidates []llm.CandidateIntervention, columns []string) (valid, invalid []llm.CandidateIntervention, unknown []string) {
-	seen := map[string]bool{}
+// reproposeZeroRow makes the one allowed re-proposal for candidates whose segments
+// matched zero rows, seeding RepairInterventionTree with the empty candidates and a
+// message naming their filter sets. Replacements pass the same grounding
+// post-checks as any proposal; those that fail grounding are dropped -- there is no
+// further repair, the budget is this single call. A transport error yields no
+// replacements and is recorded as a branch failure, matching proposeValidCandidates'
+// best-effort repair posture.
+func (s *Server) reproposeZeroRow(ctx context.Context, goal store.Goal, schema llm.SandboxSchema, node llm.TreeContext, zeroRow []llm.CandidateIntervention) []llm.CandidateIntervention {
+	id := goal.OptimizationFunctionID
+	repaired, err := s.claude.RepairInterventionTree(ctx, goal.GoalText, goal.EvaluationMatrix, schema, node,
+		llm.Proposal{Candidates: zeroRow}, zeroRowReproposalMessage(zeroRow))
+	if err != nil {
+		log.Printf("orchestrator: hypothesis loop %q: zero-row re-proposal: %v", id, err)
+		s.branchFailure(ctx, id, node.ParentFilters, err)
+		return nil
+	}
+	valid, _, _, _ := splitByGrounding(repaired.Candidates, columnNames(schema), columnValues(schema))
+	log.Printf("orchestrator: hypothesis loop %q: zero-row re-proposal returned %d replacement(s)", id, len(valid))
+	return valid
+}
+
+func zeroRowReproposalMessage(zeroRow []llm.CandidateIntervention) string {
+	sets := make([]string, 0, len(zeroRow))
+	for _, c := range zeroRow {
+		sets = append(sets, "{"+strings.Join(renderConstraints(c.Filters), ", ")+"}")
+	}
+	return "these candidate filter sets matched zero rows: " + strings.Join(sets, "; ") +
+		"; propose different candidates whose segments contain rows"
+}
+
+// splitByGrounding partitions candidates into those fully grounded in the schema —
+// every filter column known and every equality/membership value drawn from its
+// column's listed value set — and those referencing at least one unknown column or
+// value, collecting both offender lists (deduplicated, first-seen) for the repair
+// prompt. A candidate with any unknown column or value is invalid; the two lists
+// are gathered independently so the repair message can name each concern.
+func splitByGrounding(candidates []llm.CandidateIntervention, columns []string, values map[string][]string) (valid, invalid []llm.CandidateIntervention, unknownCols, unknownVals []string) {
+	seenCol := map[string]bool{}
+	seenVal := map[string]bool{}
 	for _, cand := range candidates {
-		miss := domain.UnknownFilterColumns(cand.Filters, columns)
-		if len(miss) == 0 {
+		missCols := domain.UnknownFilterColumns(cand.Filters, columns)
+		missVals := domain.UnknownFilterValues(cand.Filters, values)
+		if len(missCols) == 0 && len(missVals) == 0 {
 			valid = append(valid, cand)
 			continue
 		}
 		invalid = append(invalid, cand)
-		for _, u := range miss {
+		for _, u := range missCols {
 			key := strings.ToLower(u)
-			if !seen[key] {
-				seen[key] = true
-				unknown = append(unknown, u)
+			if !seenCol[key] {
+				seenCol[key] = true
+				unknownCols = append(unknownCols, u)
+			}
+		}
+		for _, u := range missVals {
+			key := strings.ToLower(u)
+			if !seenVal[key] {
+				seenVal[key] = true
+				unknownVals = append(unknownVals, u)
 			}
 		}
 	}
-	return valid, invalid, unknown
+	return valid, invalid, unknownCols, unknownVals
 }
 
 func columnNames(schema llm.SandboxSchema) []string {
@@ -754,16 +884,48 @@ func columnNames(schema llm.SandboxSchema) []string {
 	return names
 }
 
+// columnValues maps each value-constrained column to its listed distinct values,
+// keyed by the column's exact name. High-cardinality/continuous columns (nil
+// DistinctValues) are omitted, so the value post-check skips them.
+func columnValues(schema llm.SandboxSchema) map[string][]string {
+	values := map[string][]string{}
+	for _, c := range schema.Columns {
+		if len(c.DistinctValues) > 0 {
+			values[c.Name] = c.DistinctValues
+		}
+	}
+	return values
+}
+
+// groundingErrorMessage assembles the repair-prompt validation error from the
+// unknown-column and unknown-value offender lists, naming only the concerns that
+// actually occurred.
+func groundingErrorMessage(unknownCols, unknownVals []string) string {
+	var parts []string
+	if len(unknownCols) > 0 {
+		parts = append(parts, unknownColumnsMessage(unknownCols))
+	}
+	if len(unknownVals) > 0 {
+		parts = append(parts, unknownValuesMessage(unknownVals))
+	}
+	return strings.Join(parts, " ")
+}
+
 func unknownColumnsMessage(unknown []string) string {
 	return "these filter columns are not in the schema: " + strings.Join(unknown, ", ") +
 		"; re-propose using only columns from the Available columns list"
+}
+
+func unknownValuesMessage(unknown []string) string {
+	return "these filter values are not present in their column: " + strings.Join(unknown, ", ") +
+		"; re-propose using only values from each column's listed value set"
 }
 
 // dryRunObjective validates a fitted matrix by executing its pinned objective
 // against the sandbox with no filters — the same request the root baseline runs,
 // pinned identically. A nil return means the objective compiles and measures; a
 // non-nil error is either a pin failure or the sandbox's execute error.
-func (s *Server) dryRunObjective(ctx context.Context, ref string, matrix domain.EvaluationMatrix) error {
+func (s *Server) dryRunObjective(ctx context.Context, ref string, matrix domain.EvaluationMatrix, entityKey, timeColumn string) error {
 	obj, err := objective.Pin(matrix)
 	if err != nil {
 		return err
@@ -774,6 +936,20 @@ func (s *Server) dryRunObjective(ctx context.Context, ref string, matrix domain.
 	if domain.ExpressionDepth(obj.Expr) > domain.MaxObjectiveExpressionDepth {
 		return fmt.Errorf("%w (max %d)", errExpressionTooDeep, domain.MaxObjectiveExpressionDepth)
 	}
+	// A malformed window (nested, or an out-of-range offset/size) and a windowed
+	// objective on a goal that bound no entity/time columns are both repairable
+	// fit failures the repair loop can strip or replace, so they are validation
+	// failures rather than sandbox faults. The bindings come from the submitted
+	// request (the goal row does not exist yet), so without threading them a valid
+	// windowed goal would dry-run bindings-less and 422 spuriously.
+	if err := domain.ValidateWindowShape(obj.Expr); err != nil {
+		return err
+	}
+	if domain.HasWindowKind(obj.Expr) && (entityKey == "" || timeColumn == "") {
+		return errWindowedWithoutBindings
+	}
+	obj.EntityKeyColumn = entityKey
+	obj.TimeColumn = timeColumn
 	_, err = s.sandbox.Execute(ctx, objective.ExecuteRequestFor(ref, obj, nil))
 	return err
 }
@@ -783,7 +959,9 @@ func (s *Server) dryRunObjective(ctx context.Context, ref string, matrix domain.
 // sandbox 400 compile/type error. A sandbox 4xx≠400, 5xx, or transport error is a
 // fault, not an unfixable objective.
 func isObjectiveValidationFailure(err error) bool {
-	if errors.Is(err, errNoObjective) || errors.Is(err, errMissingAggregation) || errors.Is(err, errExpressionTooDeep) {
+	if errors.Is(err, errNoObjective) || errors.Is(err, errMissingAggregation) || errors.Is(err, errExpressionTooDeep) ||
+		errors.Is(err, errWindowedWithoutBindings) ||
+		errors.Is(err, domain.ErrWindowNested) || errors.Is(err, domain.ErrWindowBounds) {
 		return true
 	}
 	var se *SandboxError
@@ -844,7 +1022,7 @@ func concatFilters(parent, added []domain.Constraint) []domain.Constraint {
 func toSandboxSchema(schema schemaDTO) llm.SandboxSchema {
 	cols := make([]llm.SandboxColumn, 0, len(schema.Columns))
 	for _, c := range schema.Columns {
-		cols = append(cols, llm.SandboxColumn{Name: c.Name, Type: c.Type})
+		cols = append(cols, llm.SandboxColumn{Name: c.Name, Type: c.Type, DistinctValues: c.DistinctValues})
 	}
 	return llm.SandboxSchema{Columns: cols}
 }

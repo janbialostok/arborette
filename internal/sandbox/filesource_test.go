@@ -65,6 +65,25 @@ func makeParquet(t *testing.T) []byte {
 	return b
 }
 
+// equalStringSet compares two string slices as sets: DISTINCT does not guarantee
+// row order, so the distinct-value probe's output is order-independent.
+func equalStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	seen := make(map[string]int, len(got))
+	for _, g := range got {
+		seen[g]++
+	}
+	for _, w := range want {
+		if seen[w] == 0 {
+			return false
+		}
+		seen[w]--
+	}
+	return true
+}
+
 func sandboxTempDirs(t *testing.T) []string {
 	t.Helper()
 	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "arborette-sandbox-*"))
@@ -89,20 +108,30 @@ func TestIntrospectAndExecute(t *testing.T) {
 	for _, f := range formats {
 		t.Run(f.name, func(t *testing.T) {
 			ref := putObject(t, ctx, client, f.ext, f.body)
-			src := NewFileSource(client, ref, 1<<20, "1GiB")
+			src := NewFileSource(client, nil, ref, 1<<20, "1GiB", 50)
 
 			schema, err := src.Introspect(ctx)
 			if err != nil {
 				t.Fatalf("introspect: %v", err)
 			}
 			got := map[string]bool{}
+			values := map[string][]string{}
 			for _, c := range schema.Columns {
 				got[c.Name] = true
+				values[c.Name] = c.DistinctValues
 			}
 			for _, want := range []string{"qty", "amount", "name"} {
 				if !got[want] {
 					t.Fatalf("introspect missing column %q: %+v", want, schema.Columns)
 				}
+			}
+			// A low-cardinality categorical column returns its distinct values under
+			// the cap; a floating-point column is continuous and returns none.
+			if !equalStringSet(values["name"], []string{"a", "b", "c"}) {
+				t.Fatalf("expected name distinct values {a,b,c}, got %v", values["name"])
+			}
+			if values["amount"] != nil {
+				t.Fatalf("expected no distinct values for a floating-point column, got %v", values["amount"])
 			}
 
 			// avg(amount) where qty > 1 -> avg(20, 30) = 25.
@@ -135,12 +164,101 @@ func TestIntrospectAndExecute(t *testing.T) {
 	}
 }
 
+// TestDistinctValueProbeCapAndNulls pins the probe's cardinality boundary and NULL
+// handling: a column at exactly the cap stays eligible, a column one over returns
+// nil (ineligible), and NULLs are excluded from the set so a NULL never becomes a
+// grounding value.
+func TestDistinctValueProbeCapAndNulls(t *testing.T) {
+	ctx := context.Background()
+	client := newTestClient(t, ctx)
+	// low: 2 distinct (== cap). high: 3 distinct (> cap). nullable: 2 non-NULL
+	// distinct plus one empty field (read as NULL).
+	const fixture = "low,high,nullable\na,x,p\na,y,\nb,z,q\n"
+	ref := putObject(t, ctx, client, ".csv", []byte(fixture))
+	src := NewFileSource(client, nil, ref, 1<<20, "1GiB", 2)
+
+	schema, err := src.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	values := map[string][]string{}
+	for _, c := range schema.Columns {
+		values[c.Name] = c.DistinctValues
+	}
+	if !equalStringSet(values["low"], []string{"a", "b"}) {
+		t.Fatalf("a column at the cap must return its values, got %v", values["low"])
+	}
+	if values["high"] != nil {
+		t.Fatalf("a column over the cap must return nil, got %v", values["high"])
+	}
+	if !equalStringSet(values["nullable"], []string{"p", "q"}) {
+		t.Fatalf("NULLs must be excluded from the distinct set, got %v", values["nullable"])
+	}
+}
+
+// TestIntrospectQuantileCuts pins the opt-in threshold probe: off by default (so
+// every existing caller's response is unchanged), bins-1 interior cuts per numeric
+// column when asked, nothing for a categorical column, and nothing for a constant
+// column whose quantiles are all the same value — the degenerate case a consumer
+// must not mistake for a usable boundary.
+func TestIntrospectQuantileCuts(t *testing.T) {
+	ctx := context.Background()
+	client := newTestClient(t, ctx)
+	// spread varies across every quantile; flat is constant; name is categorical.
+	const fixture = "spread,flat,name\n1,7,a\n2,7,b\n3,7,c\n4,7,d\n"
+	ref := putObject(t, ctx, client, ".csv", []byte(fixture))
+	src := NewFileSource(client, nil, ref, 1<<20, "1GiB", 50)
+
+	unprobed, err := src.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	for _, c := range unprobed.Columns {
+		if c.QuantileCuts != nil {
+			t.Fatalf("a caller that did not ask for cuts must get none, got %v for %q", c.QuantileCuts, c.Name)
+		}
+	}
+
+	probed, err := src.IntrospectQuantiles(ctx, 4)
+	if err != nil {
+		t.Fatalf("introspect with quantiles: %v", err)
+	}
+	cuts := map[string][]float64{}
+	for _, c := range probed.Columns {
+		cuts[c.Name] = c.QuantileCuts
+	}
+	if len(cuts["spread"]) != 3 {
+		t.Fatalf("4 bins must yield 3 interior cuts, got %v", cuts["spread"])
+	}
+	if !sortedAscending(cuts["spread"]) {
+		t.Fatalf("cuts must be ascending, got %v", cuts["spread"])
+	}
+	if cuts["name"] != nil {
+		t.Fatalf("a categorical column has no quantiles, got %v", cuts["name"])
+	}
+	// A constant column's cuts are all one value, which bins nothing: three
+	// boundaries at 7 describe a single population, so the predicates derived from
+	// them would be a tautology and its empty complement.
+	if len(cuts["flat"]) > 0 && cuts["flat"][0] != cuts["flat"][len(cuts["flat"])-1] {
+		t.Fatalf("a constant column cannot yield distinct cuts, got %v", cuts["flat"])
+	}
+}
+
+func sortedAscending(vs []float64) bool {
+	for i := 1; i < len(vs); i++ {
+		if vs[i] < vs[i-1] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestServerEndpoints(t *testing.T) {
 	ctx := context.Background()
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(csvFixture))
 
-	ts := httptest.NewServer(NewServer(client, 1<<20, "1GiB").Routes())
+	ts := httptest.NewServer(NewServer(client, nil, nil, testLimiter(), 1<<20, 1<<20, "1GiB", 50, 4, 32).Routes())
 	defer ts.Close()
 
 	post := func(t *testing.T, path, body string) (int, map[string]any) {
@@ -206,7 +324,7 @@ func TestExecuteExpression(t *testing.T) {
 	ctx := context.Background()
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(exprCSV))
-	src := NewFileSource(client, ref, 1<<20, "1GiB")
+	src := NewFileSource(client, nil, ref, 1<<20, "1GiB", 50)
 
 	// avg over a boolean column: (1 + 0 + 1) / 3.
 	v, err := src.Execute(ctx, "avg", domain.Target{}, ptrExpr(col("flag")), nil)
@@ -242,7 +360,7 @@ func TestExecuteLegacyNonFinite(t *testing.T) {
 	ctx := context.Background()
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte("val\n1.0\ninf\n3.0\n"))
-	src := NewFileSource(client, ref, 1<<20, "1GiB")
+	src := NewFileSource(client, nil, ref, 1<<20, "1GiB", 50)
 	if _, err := src.Execute(ctx, "avg", domain.Target{Field: "val"}, nil, nil); !errors.Is(err, errNonFiniteValue) {
 		t.Fatalf("expected errNonFiniteValue for legacy avg over inf column, got %v", err)
 	}
@@ -256,7 +374,7 @@ func TestServerExecuteExpression(t *testing.T) {
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(exprCSV))
 
-	ts := httptest.NewServer(NewServer(client, 1<<20, "1GiB").Routes())
+	ts := httptest.NewServer(NewServer(client, nil, nil, testLimiter(), 1<<20, 1<<20, "1GiB", 50, 4, 32).Routes())
 	defer ts.Close()
 
 	post := func(t *testing.T, body string) (int, map[string]any) {
@@ -297,7 +415,7 @@ func TestOverLimitRejected(t *testing.T) {
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(csvFixture))
 
-	src := NewFileSource(client, ref, 4, "1GiB")
+	src := NewFileSource(client, nil, ref, 4, "1GiB", 50)
 	if _, err := src.Introspect(ctx); !errors.Is(err, errObjectTooLarge) {
 		t.Fatalf("expected errObjectTooLarge, got %v", err)
 	}
@@ -307,7 +425,7 @@ func TestTempDirCleanup(t *testing.T) {
 	ctx := context.Background()
 	client := newTestClient(t, ctx)
 	ref := putObject(t, ctx, client, ".csv", []byte(csvFixture))
-	src := NewFileSource(client, ref, 1<<20, "1GiB")
+	src := NewFileSource(client, nil, ref, 1<<20, "1GiB", 50)
 
 	before := len(sandboxTempDirs(t))
 

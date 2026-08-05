@@ -149,6 +149,12 @@ func TestHandleChatBindsGoalToSession(t *testing.T) {
 	if !strings.Contains(chat.system, "cost") {
 		t.Fatalf("system prompt did not carry the matrix constraints: %q", chat.system)
 	}
+	// The agent must scope heuristic retrieval to this goal, or cross-goal search
+	// floods it with unrelated runs' heuristics: the prompt carries the goal id and
+	// directs it to the get_optimized_heuristics goal_id argument.
+	if !strings.Contains(chat.system, "g1") || !strings.Contains(chat.system, "goal_id") {
+		t.Fatalf("system prompt did not direct the agent to scope get_optimized_heuristics to the goal: %q", chat.system)
+	}
 	if len(chat.msgs) != 1 || chat.msgs[0].Role != llm.RoleUser || chat.msgs[0].Content != "hi" {
 		t.Fatalf("transcript not forwarded: %+v", chat.msgs)
 	}

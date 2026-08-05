@@ -1,4 +1,6 @@
+import { formatNumber, shortId } from "@/lib/format";
 import type { QueryTripletPayload } from "@/lib/orchestrator";
+import { VerifyFindingButton } from "@/components/VerifyFindingButton";
 import { cn } from "@/components/ui";
 
 // EffectReadout renders one causal triplet as a diverging effect-size bar:
@@ -9,12 +11,16 @@ import { cn } from "@/components/ui";
 // by whether the delta is an improvement (green) or a regression (coral) — for a
 // minimize objective a negative delta is the improvement. The segment's filters
 // render as predicate chips so the card shows which segment was measured, not just
-// the delta.
+// the delta. The delta itself is a measured association — verifying it is what
+// decides whether the segment caused it or merely moved with it — so each card
+// carries the affordance to ask.
 export function EffectReadout({
+  goalID,
   triplet,
   scale,
   index,
 }: {
+  goalID: string;
   triplet: QueryTripletPayload;
   scale: number;
   index: number;
@@ -45,7 +51,7 @@ export function EffectReadout({
           )}
         >
           {effect_size > 0 ? "+" : ""}
-          {fmt(effect_size)}
+          {formatNumber(effect_size)}
         </span>
       </div>
 
@@ -79,27 +85,22 @@ export function EffectReadout({
 
       <div className="flex items-center justify-between font-mono text-xs tabular">
         <span className="text-faint">
-          base <span className="text-muted">{fmt(baseline)}</span>
+          base <span className="text-muted">{formatNumber(baseline)}</span>
         </span>
         <span className="text-faint" aria-hidden>
           →
         </span>
         <span className="text-faint">
-          value <span className="text-fg">{fmt(value)}</span>
+          value <span className="text-fg">{formatNumber(value)}</span>
         </span>
+      </div>
+
+      <div className="mt-3 border-t border-line pt-3">
+        <VerifyFindingButton
+          goalID={goalID}
+          interventionID={triplet.intervention_id}
+        />
       </div>
     </div>
   );
-}
-
-function shortId(id: string): string {
-  return id.length > 8 ? id.slice(0, 8) : id;
-}
-
-function fmt(n: number): string {
-  if (!Number.isFinite(n)) return "—";
-  if (Number.isInteger(n)) return n.toLocaleString("en-US");
-  const abs = Math.abs(n);
-  const digits = abs >= 100 ? 1 : abs >= 1 ? 2 : 4;
-  return n.toLocaleString("en-US", { maximumFractionDigits: digits });
 }

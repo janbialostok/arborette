@@ -2,7 +2,9 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -15,6 +17,9 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/arborette/arborette/internal/datasource"
+	"github.com/arborette/arborette/internal/domain"
+	"github.com/arborette/arborette/internal/llm"
+	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
 
@@ -73,6 +78,63 @@ func parseReviewSettings(r *http.Request) (reviewSettings, error) {
 	return settings, nil
 }
 
+// parseWindowBindings reads the optional entity-key/time-column window bindings off
+// the registration form and validates them against the introspected schema: both or
+// neither must be present, each must resolve to exactly one column
+// (case-insensitive, mirroring the sandbox's own field resolution), and the time
+// column must be orderable (temporal or numeric). It returns the resolved actual
+// column names so they persist and compile against the exact schema spelling, or an
+// analyst-fixable error the caller maps to 422.
+func parseWindowBindings(r *http.Request, cols []columnDTO) (entityKey, timeColumn string, err error) {
+	entity := strings.TrimSpace(r.FormValue("entity_key_column"))
+	ts := strings.TrimSpace(r.FormValue("time_column"))
+	if entity == "" && ts == "" {
+		return "", "", nil
+	}
+	if entity == "" || ts == "" {
+		return "", "", errors.New("entity_key_column and time_column must be provided together")
+	}
+	entityCol, ok := resolveSchemaColumn(cols, entity)
+	if !ok {
+		return "", "", fmt.Errorf("entity_key_column %q does not resolve to a unique column in the data source", entity)
+	}
+	timeCol, ok := resolveSchemaColumn(cols, ts)
+	if !ok {
+		return "", "", fmt.Errorf("time_column %q does not resolve to a unique column in the data source", ts)
+	}
+	if !isOrderableColumnType(timeCol.Type) {
+		return "", "", fmt.Errorf("time_column %q must be a temporal or numeric column, not %s", ts, timeCol.Type)
+	}
+	return entityCol.Name, timeCol.Name, nil
+}
+
+// resolveSchemaColumn resolves a request field to its single introspected column
+// under case-insensitive matching, reporting false when no column or more than one
+// column matches (a case-colliding schema is ambiguous, not a silent pick) —
+// mirroring the sandbox compiler's resolveColumn semantics.
+func resolveSchemaColumn(cols []columnDTO, field string) (columnDTO, bool) {
+	var match columnDTO
+	found := 0
+	for _, c := range cols {
+		if strings.EqualFold(c.Name, field) {
+			match = c
+			found++
+		}
+	}
+	if found != 1 {
+		return columnDTO{}, false
+	}
+	return match, true
+}
+
+// isOrderableColumnType reports whether a DuckDB column type can back a window's
+// ORDER BY: a numeric or temporal type. The classification is the shared one, so
+// the orchestrator rejects a non-orderable time column at registration on the same
+// terms the compiler will apply when it runs.
+func isOrderableColumnType(t string) bool {
+	return datasource.IsNumericType(t) || datasource.IsTemporalType(t)
+}
+
 // handleSubmitGoal registers an analyst goal: it ingests the data source into the
 // object store, introspects the source as a precondition, fits the Evaluation
 // Matrix to that schema, validates the fitted objective by a dry-run against the
@@ -83,23 +145,35 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(maxUploadMemory); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid or oversized multipart form")
+		service.WriteErr(w, http.StatusBadRequest, "invalid or oversized multipart form")
 		return
 	}
 	goal := strings.TrimSpace(r.FormValue("goal"))
 	if goal == "" {
-		writeErr(w, http.StatusBadRequest, "goal is required")
+		service.WriteErr(w, http.StatusBadRequest, "goal is required")
 		return
 	}
 	review, err := parseReviewSettings(r)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		service.WriteErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	ref, err := s.ingest(r)
 	if err != nil {
 		s.writeIngestErr(w, err)
+		return
+	}
+
+	// Register the minted ref immediately -- this is the single choke point covering
+	// upload, local-import, and document goals -- and before the intake introspect
+	// and dry-run below, which the Sandbox validates against the registry. Skipping
+	// it would 404 every intake, since those sandbox calls precede goals.Insert. A
+	// row orphaned by a later intake failure is harmless: it names an object the
+	// orchestrator itself staged.
+	if err := s.goals.RegisterDataSourceRef(ctx, ref); err != nil {
+		log.Printf("orchestrator: register data source ref: %v", err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -121,35 +195,51 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	schema := toSandboxSchema(introspect.Schema)
 
-	matrix, err := s.claude.GenerateEvaluationMatrix(ctx, goal, schema)
+	// Window bindings are validated against the introspected schema before fitting:
+	// both-or-neither, each resolving to a unique column, and an orderable time
+	// column. A binding failure is analyst-fixable, so it is a 422 like an unfittable
+	// objective. The resolved actual names persist so they compile against the exact
+	// schema spelling.
+	entityKey, timeColumn, err := parseWindowBindings(r, introspect.Schema.Columns)
+	if err != nil {
+		service.WriteErr(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	// Window kinds are reachable only when the goal bound its entity/time columns, so
+	// availability rides that binding into the fitting prompt and the dry-run.
+	windowed := entityKey != ""
+
+	matrix, err := s.claude.GenerateEvaluationMatrix(ctx, goal, schema, windowed)
 	if err != nil {
 		log.Printf("orchestrator: generate evaluation matrix: %v", err)
-		writeErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
+		service.WriteErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
 		return
 	}
 
 	// Validate the fitted objective by executing it against the sandbox with no
 	// filters (the exact request the root baseline will run). A sandbox fault
 	// (pre- or post-repair) is surfaced as-is, never labeled an unfixable objective.
-	verr := s.dryRunObjective(ctx, ref, matrix)
+	verr := s.dryRunObjective(ctx, ref, matrix, entityKey, timeColumn)
 	for attempts := 0; isObjectiveValidationFailure(verr) && attempts < maxObjectiveRepairs; attempts++ {
-		repaired, rerr := s.claude.RepairEvaluationMatrix(ctx, goal, schema, matrix, verr.Error())
+		repaired, rerr := s.claude.RepairEvaluationMatrix(ctx, goal, schema, matrix, verr.Error(), windowed)
 		if rerr != nil {
 			log.Printf("orchestrator: repair evaluation matrix: %v", rerr)
-			writeErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
+			service.WriteErr(w, http.StatusBadGateway, "evaluation matrix generation failed")
 			return
 		}
 		matrix = repaired
-		verr = s.dryRunObjective(ctx, ref, matrix)
+		verr = s.dryRunObjective(ctx, ref, matrix, entityKey, timeColumn)
 	}
 	if isObjectiveValidationFailure(verr) {
-		writeErr(w, http.StatusUnprocessableEntity, "could not fit the goal to the data source: "+verr.Error())
+		service.WriteErr(w, http.StatusUnprocessableEntity, "could not fit the goal to the data source: "+verr.Error())
 		return
 	}
 	if verr != nil {
 		s.writeIntakeErr(w, verr)
 		return
 	}
+
+	intent := s.classifyIntent(ctx, goal, schema)
 
 	optID := uuid.NewString()
 	if err := s.goals.Insert(ctx, store.Goal{
@@ -159,20 +249,110 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		DataSourceRef:          ref,
 		ConfidenceThreshold:    review.threshold,
 		EpochMode:              review.epochMode,
+		EntityKeyColumn:        entityKey,
+		TimeColumn:             timeColumn,
+		Track:                  intent.track,
+		Claim:                  intent.claim,
+		ClaimError:             intent.claimError,
 	}); err != nil {
 		log.Printf("orchestrator: insert goal: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
 	if err := s.recordAudit(ctx, "goal_submit", "goal", map[string]any{
 		"optimization_function_id": optID,
 		"data_source_ref":          ref,
+		"track":                    intent.track,
+		"rationale":                intent.rationale,
 	}); err != nil {
 		log.Printf("orchestrator: append audit: %v", err)
 	}
+	s.reportIntent(ctx, optID, intent)
 
-	writeJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+	service.WriteJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+}
+
+// goalIntent is the classified routing decision as the goal row records it: the
+// track, the canonical JSON of the validated claim (nil unless the verify track
+// produced a claim that grounds in the schema), and the cannot-construct reason when
+// it did not.
+//
+// rationale is the model's stated reasoning and failure is why the classifier could
+// not answer at all; they are separate fields rather than one because they read
+// differently to an analyst -- a rationale explains a routing decision, a failure
+// explains its absence -- and a single field would put a parse error under a key
+// labelled "rationale".
+type goalIntent struct {
+	track      string
+	claim      []byte
+	claimError string
+	rationale  string
+	failure    string
+	auditEvent string
+}
+
+// classifyIntent asks Claude which track the goal belongs to and, on the verify
+// track, validates the extracted claim against the introspected schema with the same
+// deterministic column and value checks a Phase-1 proposal passes.
+//
+// It never fails registration. A classification fault falls open to the explore
+// track: the classifier is an accelerator, and a goal that cannot be classified is
+// still a goal worth running observationally. A claim that fails validation is the
+// distinct cannot-construct outcome — the goal registers on the verify track with no
+// claim and the validation reason recorded, which says the claim could not be built
+// rather than that it was tested and found unsupported.
+func (s *Server) classifyIntent(ctx context.Context, goal string, schema llm.SandboxSchema) goalIntent {
+	result, err := s.claude.ClassifyGoalIntent(ctx, llm.GoalIntentInput{GoalText: goal, Schema: schema})
+	if err != nil {
+		log.Printf("orchestrator: classify goal intent: %v", err)
+		return goalIntent{track: store.TrackExplore, auditEvent: "goal_intent_classification_failed", failure: err.Error()}
+	}
+	if result.Track != store.TrackVerify || result.Claim == nil {
+		return goalIntent{track: store.TrackExplore, rationale: result.Rationale}
+	}
+
+	if reason := domain.ClaimGroundingError(result.Claim.Filters, columnNames(schema), columnValues(schema)); reason != "" {
+		return goalIntent{
+			track:      store.TrackVerify,
+			claimError: reason,
+			rationale:  result.Rationale,
+			auditEvent: "goal_claim_construction_failed",
+		}
+	}
+	encoded, err := json.Marshal(result.Claim)
+	if err != nil {
+		log.Printf("orchestrator: encode goal claim: %v", err)
+		return goalIntent{track: store.TrackExplore, auditEvent: "goal_intent_classification_failed", failure: err.Error()}
+	}
+	return goalIntent{track: store.TrackVerify, claim: encoded, rationale: result.Rationale}
+}
+
+// reportIntent records the classification outcomes worth a trail: a fallen-open
+// classification and a claim that could not be constructed. The SSE frame is
+// published live-only -- a goal has no stream at registration, and creating hub
+// state for a run that does not exist would leak it.
+func (s *Server) reportIntent(ctx context.Context, optID string, intent goalIntent) {
+	if intent.auditEvent == "" {
+		return
+	}
+	// A cannot-construct goal reports the validation reason; a fallen-open
+	// classification reports why the classifier could not answer.
+	reason := intent.claimError
+	if reason == "" {
+		reason = intent.failure
+	}
+	detail := map[string]any{
+		"optimization_function_id": optID,
+		"track":                    intent.track,
+		"reason":                   reason,
+	}
+	if err := s.recordAudit(ctx, intent.auditEvent, "goal", detail); err != nil {
+		log.Printf("orchestrator: append audit: %v", err)
+	}
+	if intent.claimError != "" {
+		s.hub.PublishLive(optID, Event{Type: domain.ClaimConstructionFailed, Payload: map[string]any{"reason": intent.claimError}})
+	}
 }
 
 // submitDocumentGoal completes registration for a document source: it derives the
@@ -186,11 +366,11 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 	fields, err := s.claude.IntrospectDocumentFields(ctx, goal, sample)
 	if err != nil {
 		log.Printf("orchestrator: introspect document fields: %v", err)
-		writeErr(w, http.StatusBadGateway, "document field introspection failed")
+		service.WriteErr(w, http.StatusBadGateway, "document field introspection failed")
 		return
 	}
 	if len(fields) == 0 {
-		writeErr(w, http.StatusUnprocessableEntity, "could not identify any extractable fields for the goal in this document")
+		service.WriteErr(w, http.StatusUnprocessableEntity, "could not identify any extractable fields for the goal in this document")
 		return
 	}
 
@@ -204,7 +384,7 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 		EpochMode:              review.epochMode,
 	}); err != nil {
 		log.Printf("orchestrator: insert goal: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -215,15 +395,23 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 		log.Printf("orchestrator: append audit: %v", err)
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+	service.WriteJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
 }
 
 // goalListItemDTO is the web-UI projection of a goal plus its latest run status
 // (or a synthetic "no run").
+//
+// Track and ClaimError are the goal's routing outcome, not its run's. They are on the
+// read path because otherwise nothing can read them: a verify-track goal whose claim
+// could not be built records the reason at registration, and a reason no client can
+// fetch tells the analyst nothing. ClaimError is omitempty, so an ordinary goal's
+// projection is unchanged.
 type goalListItemDTO struct {
 	OptimizationFunctionID string    `json:"optimization_function_id"`
 	GoalText               string    `json:"goal_text"`
 	CreatedAt              time.Time `json:"created_at"`
+	Track                  string    `json:"track"`
+	ClaimError             string    `json:"claim_error,omitempty"`
 	Status                 string    `json:"status"`
 	FailureReason          string    `json:"failure_reason,omitempty"`
 }
@@ -236,7 +424,7 @@ func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
 	goals, err := s.goals.List(ctx)
 	if err != nil {
 		log.Printf("orchestrator: list goals: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -247,7 +435,7 @@ func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
 	latest, err := s.runs.LatestByGoal(ctx, ids)
 	if err != nil {
 		log.Printf("orchestrator: latest runs by goal: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -257,6 +445,8 @@ func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
 			OptimizationFunctionID: g.OptimizationFunctionID,
 			GoalText:               g.GoalText,
 			CreatedAt:              g.CreatedAt,
+			Track:                  g.Track,
+			ClaimError:             g.ClaimError,
 			Status:                 "no run",
 		}
 		if run, ok := latest[g.OptimizationFunctionID]; ok {
@@ -267,7 +457,7 @@ func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, item)
 	}
-	writeJSON(w, http.StatusOK, out)
+	service.WriteJSON(w, http.StatusOK, out)
 }
 
 // ingest resolves the request's data source to an object-store ref via one of
@@ -358,7 +548,7 @@ func (s *Server) writeIntakeErr(w http.ResponseWriter, err error) {
 		return
 	}
 	log.Printf("orchestrator: intake sandbox call: %v", err)
-	writeErr(w, http.StatusBadGateway, "sandbox unavailable")
+	service.WriteErr(w, http.StatusBadGateway, "sandbox unavailable")
 }
 
 // writeSandboxStatus maps a sandbox fault to a status for whichever phase hit
@@ -368,12 +558,12 @@ func (s *Server) writeIntakeErr(w http.ResponseWriter, err error) {
 func writeSandboxStatus(w http.ResponseWriter, se *SandboxError, phase string) {
 	switch se.Status {
 	case http.StatusBadRequest:
-		writeErr(w, http.StatusBadRequest, se.Message)
+		service.WriteErr(w, http.StatusBadRequest, se.Message)
 	case http.StatusNotFound:
-		writeErr(w, http.StatusNotFound, se.Message)
+		service.WriteErr(w, http.StatusNotFound, se.Message)
 	default:
 		log.Printf("orchestrator: sandbox fault during %s: %v", phase, se)
-		writeErr(w, http.StatusBadGateway, "sandbox unavailable")
+		service.WriteErr(w, http.StatusBadGateway, "sandbox unavailable")
 	}
 }
 
@@ -383,11 +573,11 @@ func (s *Server) writeIngestErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errNoSource), errors.Is(err, errBothSources),
 		errors.Is(err, errPathEscape), errors.Is(err, errNoImportDir):
-		writeErr(w, http.StatusBadRequest, err.Error())
+		service.WriteErr(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, os.ErrNotExist):
-		writeErr(w, http.StatusNotFound, "data source not found")
+		service.WriteErr(w, http.StatusNotFound, "data source not found")
 	default:
 		log.Printf("orchestrator: ingest data source: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 	}
 }

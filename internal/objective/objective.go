@@ -31,12 +31,17 @@ var (
 // one aggregation over one value expression, with the direction that decides what
 // "improvement" means. Label is the rendered key the measured value is carried
 // under end to end. Pinning it once is what makes value comparisons meaningful —
-// every value compared is the same measurement.
+// every value compared is the same measurement. EntityKeyColumn and TimeColumn are
+// the window bindings a windowed value expression compiles against; both empty for
+// a plain aggregate objective. They live on the goal, not the matrix, so Pin cannot
+// set them — the caller populates them after pinning.
 type Objective struct {
-	Aggregation string
-	Expr        domain.Expression
-	Label       string
-	Direction   domain.TargetDirection
+	Aggregation     string
+	Expr            domain.Expression
+	Label           string
+	Direction       domain.TargetDirection
+	EntityKeyColumn string
+	TimeColumn      string
 }
 
 // Pin fixes the objective from the Evaluation Matrix's first target: the
@@ -69,6 +74,8 @@ func ExecuteRequestFor(dataSourceRef string, obj Objective, filters []domain.Con
 		Target:          domain.Target{Direction: obj.Direction},
 		ValueExpression: &obj.Expr,
 		ObjectiveLabel:  obj.Label,
+		EntityKeyColumn: obj.EntityKeyColumn,
+		TimeColumn:      obj.TimeColumn,
 		Filters:         filters,
 	}
 }

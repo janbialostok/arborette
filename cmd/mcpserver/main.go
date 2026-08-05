@@ -7,6 +7,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -15,9 +16,16 @@ import (
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/heuristics"
 	"github.com/arborette/arborette/internal/mcpserver"
+	"github.com/arborette/arborette/internal/orchestratorclient"
 	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
+
+// goalSubmitTimeout bounds a single goal-submission proxy call so an MCP tool
+// invocation cannot block forever on a stalled Orchestrator. It is far longer
+// than the client's own default because registration fits an Evaluation Matrix
+// to the data source through Claude before it answers.
+const goalSubmitTimeout = 2 * time.Minute
 
 func main() {
 	ctx := context.Background()
@@ -43,14 +51,22 @@ func main() {
 	if err := store.ValidateEmbeddingDimension(ctx, pool, cfg.Embedding.Dimension); err != nil {
 		log.Fatalf("mcpserver: %v", err)
 	}
+	if err := store.ValidateDistanceFloor(cfg.Embedding.DistanceFloor); err != nil {
+		log.Fatalf("mcpserver: %v", err)
+	}
+	if err := store.ValidateVectorExtensionVersion(ctx, pool); err != nil {
+		log.Fatalf("mcpserver: %v", err)
+	}
 
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
-	queries := heuristics.NewService(provider, store.NewEmbeddingStore(pool), repo)
+	queries := heuristics.NewService(provider, store.NewEmbeddingStore(pool, cfg.Embedding.DistanceFloor), repo)
 	log.Printf("mcpserver: wired neo4j, postgres, heuristics query service (dim=%d), serving HTTP on :%s", provider.Dimensions(), cfg.MCP.Port)
 
-	orchClient := mcpserver.NewOrchestratorClient(cfg.MCP.OrchestratorURL, nil)
+	// No internal secret: this server reaches only the analyst-facing /goals route.
+	orchClient := orchestratorclient.NewClient(cfg.MCP.OrchestratorURL, "",
+		&http.Client{Timeout: goalSubmitTimeout})
 	srv := mcp.NewServer(&mcp.Implementation{Name: "arborette-mcp", Version: "0.1.0"}, nil)
-	mcpserver.RegisterTools(srv, queries, orchClient)
+	mcpserver.RegisterTools(srv, queries, repo, orchClient)
 
 	// A configured public URL is the operator declaring this server internet-
 	// reachable, and this process is the only one that sees that declaration and

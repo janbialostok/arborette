@@ -1,9 +1,11 @@
 # Local-dev stack: four infra services, a completion-gated init chain
-# (db-bootstrap -> migrate), three long-running Go services, the Next.js web UI,
-# and the sleepcycle one-shot job (profile "jobs", so `make up` skips it). The
-# init chain provisions runtime roles and applies migrations before any service
-# authenticates; embedding-consuming services additionally wait for the model
-# pull. See .env.example for the variables .env must supply.
+# (db-bootstrap -> migrate), four long-running Go services (including the
+# Sleep-Cycle Worker in serve mode, which the orchestrator's HTTP launcher drives),
+# the Next.js web UI, and the sleepcycle one-shot job (profile "jobs", so `make up`
+# skips it -- it exercises the AWS Batch seam). The init chain provisions runtime
+# roles and applies migrations before any service authenticates; embedding-consuming
+# services additionally wait for the model pull. See .env.example for the variables
+# .env must supply.
 
 # Hostnames point at compose service names; passwords/creds come from .env via
 # env_file. environment wins over env_file, so these hostnames always apply.
@@ -36,7 +38,10 @@ services:
       start_period: 30s
 
   postgres:
-    image: pgvector/pgvector:pg16
+    # Pinned to a >= 0.8.0 tag: goal-scoped retrieval sets hnsw.iterative_scan,
+    # which pgvector added in 0.8.0. ValidateVectorExtensionVersion fails startup
+    # against an older extension.
+    image: pgvector/pgvector:0.8.1-pg16
     environment:
       POSTGRES_USER: ${POSTGRES_OWNER_USER}
       POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD}
@@ -132,6 +137,13 @@ services:
     env_file: [.env]
     environment:
       <<: *app-environment
+      # Selects the HTTP launcher so the Phase-2 trigger dispatches to the
+      # sleepcycle-serve worker (full URL, /runs included). Set here, not in .env,
+      # so it always applies: compose environment wins over env_file.
+      SLEEPCYCLE_WORKER_URL: http://sleepcycle-serve:8084/runs
+      # Selects the verifier HTTP launcher the same way (full URL, /verifications
+      # included). Wired here for the verifier-dispatch path a later shell adds.
+      VERIFIER_WORKER_URL: http://verifier-serve:8085/verifications
     ports:
       - "8080:8080"
     volumes:
@@ -163,19 +175,27 @@ services:
         condition: service_completed_successfully
       minio:
         condition: service_healthy
+      # The sandbox hard-depends on Postgres for the data-source ref registry.
+      postgres:
+        condition: service_healthy
 
   # One-shot job, not a long-running service: the profile keeps `make up` from
-  # starting it. Run it per goal with
+  # starting it. This block exercises the AWS Batch seam -- the production path is
+  # a scheduler invoking the same binary with -goal. Run it per goal with
   #   docker compose run --rm sleepcycle -goal <optimization_function_id>
+  # The long-running serve alternative (`make up` starts it) is sleepcycle-serve.
   sleepcycle:
     profiles: ["jobs"]
-    build:
+    # Anchored so the serve variant below reuses the same image and wait-for graph:
+    # a new startup dependency edited here applies to both, instead of silently
+    # drifting between the two.
+    build: &sleepcycle-build
       context: .
       dockerfile: cmd/sleepcycle/Dockerfile
     env_file: [.env]
     environment:
       <<: *app-environment
-    depends_on:
+    depends_on: &sleepcycle-depends
       migrate:
         condition: service_completed_successfully
       ollama-pull:
@@ -186,6 +206,56 @@ services:
         condition: service_started
       orchestrator:
         condition: service_started
+
+  # The Sleep-Cycle Worker in serve mode: same image and wiring as the one-shot
+  # sleepcycle job, but long-running (one cycle per POST /runs) so the orchestrator's
+  # HTTP launcher can drive Phase 2. Un-profiled, so `make up` starts it.
+  sleepcycle-serve:
+    build: *sleepcycle-build
+    command: ["-serve"]
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    ports:
+      - "8084:8084"
+    depends_on: *sleepcycle-depends
+
+  # One-shot Verifier job (profile "jobs", so `make up` skips it): runs a single
+  # causal discovery for a (goal, data-source) and exits, exercising the AWS Batch
+  # seam. Run it with:
+  #   docker compose run --rm verifier -goal <id> -datasource <ref>
+  # The long-running serve alternative (`make up` starts it) is verifier-serve.
+  verifier:
+    profiles: ["jobs"]
+    # Anchored so the serve variant below reuses the same image and wait-for graph.
+    build: &verifier-build
+      context: .
+      dockerfile: cmd/verifier/Dockerfile
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    depends_on: &verifier-depends
+      migrate:
+        condition: service_completed_successfully
+      neo4j:
+        condition: service_healthy
+      sandbox:
+        condition: service_started
+      orchestrator:
+        condition: service_started
+
+  # The Verifier in serve mode: same image and wiring as the one-shot job, but
+  # long-running (one discovery per POST /verifications) so the orchestrator's HTTP
+  # launcher can drive it. Un-profiled, so `make up` starts it.
+  verifier-serve:
+    build: *verifier-build
+    command: ["-serve"]
+    env_file: [.env]
+    environment:
+      <<: *app-environment
+    ports:
+      - "8085:8085"
+    depends_on: *verifier-depends
 
   mcpserver:
     build:

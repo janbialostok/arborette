@@ -1,4 +1,4 @@
-.PHONY: build test up down sleep-cycle migrate-up migrate-down web-dev web-build
+.PHONY: build test up down sleep-cycle discover migrate-up migrate-down web-dev web-build
 
 # Host env for runs that talk to the compose stack from the host (not from
 # inside the network): the published ports on localhost.
@@ -22,11 +22,20 @@ up:
 down:
 	docker compose down
 
-# One-shot job (compose profile "jobs"), so `make up` does not start it. --build
-# keeps a stale image from silently running previous code:
+# One-shot Sleep Cycle (the AWS Batch seam), compose profile "jobs" so `make up`
+# does not start it -- `make up` instead runs the sleepcycle-serve service, which
+# the orchestrator's HTTP launcher drives per goal. This target is for exercising
+# the Batch path directly; --build keeps a stale image from running previous code:
 #   make sleep-cycle GOAL=<optimization_function_id>
 sleep-cycle:
 	docker compose run --rm --build sleepcycle -goal $(GOAL)
+
+# One-shot causal discovery (the AWS Batch seam), compose profile "jobs" so `make
+# up` does not start it -- `make up` instead runs the verifier-serve service. This
+# target exercises the Batch path directly:
+#   make discover GOAL=<optimization_function_id> DATASOURCE=<data_source_ref>
+discover:
+	docker compose run --rm --build verifier -goal $(GOAL) -datasource $(DATASOURCE)
 
 migrate-up:
 	set -a; . ./.env; set +a; $(HOST_ENV) go run ./cmd/migrate up

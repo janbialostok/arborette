@@ -218,13 +218,13 @@ func TestBlockingModeWaitsForTheVerdict(t *testing.T) {
 				claude.extractCalls, len(extractionMethods))
 		}
 		found := false
-		for _, r := range audits.records {
+		for _, r := range audits.records() {
 			if r.Action == "hypothesis_branch_failure" {
 				found = true
 			}
 		}
 		if !found {
-			t.Fatalf("the degradation must be recorded, not silent: %+v", audits.records)
+			t.Fatalf("the degradation must be recorded, not silent: %+v", audits.records())
 		}
 	})
 
@@ -406,12 +406,12 @@ func TestExpiredBlockingWaitIsAudited(t *testing.T) {
 	srv.runLoop(ctx, goal, "run-doc")
 
 	found := false
-	for _, r := range audits.records {
+	for _, r := range audits.records() {
 		if r.Action == "hypothesis_branch_failure" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("the branch failure must be recorded despite the dead context: %+v", audits.records)
+		t.Fatalf("the branch failure must be recorded despite the dead context: %+v", audits.records())
 	}
 }

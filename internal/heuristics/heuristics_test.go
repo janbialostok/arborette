@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/arborette/arborette/internal/domain"
@@ -34,7 +35,7 @@ func TestQueryAndTrace(t *testing.T) {
 		t.Fatalf("open pool: %v", err)
 	}
 	t.Cleanup(p.Close)
-	embeddings := store.NewEmbeddingStore(p)
+	embeddings := store.NewEmbeddingStore(p, cfg.Embedding.DistanceFloor)
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
 
 	// Seed a full triplet and a Meta-Heuristic abstracted from the intervention.
@@ -54,7 +55,7 @@ func TestQueryAndTrace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("embed document: %v", err)
 	}
-	if err := embeddings.Upsert(ctx, mhID, docVec); err != nil {
+	if err := embeddings.Upsert(ctx, mhID, "", docVec); err != nil {
 		t.Fatalf("upsert embedding: %v", err)
 	}
 	if err := repo.ClearEmbeddingPending(ctx, mhID); err != nil {
@@ -63,7 +64,7 @@ func TestQueryAndTrace(t *testing.T) {
 
 	svc := heuristics.NewService(provider, embeddings, repo)
 
-	matches, err := svc.Query(ctx, "latency climbing above the threshold", 1)
+	matches, err := svc.Query(ctx, "latency climbing above the threshold", 1, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -127,7 +128,7 @@ type fakeEmbeddings struct {
 	deleteErrFor map[string]error
 }
 
-func (f *fakeEmbeddings) SimilaritySearch(ctx context.Context, _ []float32, _ int) ([]string, error) {
+func (f *fakeEmbeddings) SimilaritySearch(ctx context.Context, _ []float32, _ int, _ store.SearchScope) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -152,28 +153,39 @@ func (f *fakeEmbeddings) Delete(ctx context.Context, nodeID string) error {
 	return nil
 }
 
-// fakeRepo resolves only the ids in present, and reports every other id the way
-// the Neo4j repository does -- ErrNotFound wrapped in context, so the caller is
-// forced to unwrap rather than compare against the bare sentinel.
+// fakeRepo resolves only the ids in present, omitting every other id from the
+// result the way the batched Neo4j read does. lookups counts the calls, which is
+// what pins hydration at one graph round trip per query.
+//
+// It always answers in reverse, because Neo4j's own batch order is arbitrary and
+// returning the requested order would be the one arrangement in which a caller
+// that forgot to re-key by id still looks correct. Every test here is therefore
+// also an ordering test.
 type fakeRepo struct {
 	present  map[string]domain.MetaHeuristic
 	failWith error
-	// onLookup runs before each answer, so a test can cancel the request context
-	// partway through the batch the way a disconnecting client would.
+	lookups  int
+	// onLookup runs before the answer, so a test can cancel the request context
+	// the way a disconnecting client would.
 	onLookup func()
 }
 
-func (f *fakeRepo) GetMetaHeuristic(_ context.Context, id string) (domain.MetaHeuristic, error) {
+func (f *fakeRepo) GetMetaHeuristics(_ context.Context, ids []string) ([]domain.MetaHeuristic, error) {
+	f.lookups++
 	if f.onLookup != nil {
 		f.onLookup()
 	}
 	if f.failWith != nil {
-		return domain.MetaHeuristic{}, fmt.Errorf("get MetaHeuristic %q: %w", id, f.failWith)
+		return nil, fmt.Errorf("get %d MetaHeuristics: %w", len(ids), f.failWith)
 	}
-	if mh, ok := f.present[id]; ok {
-		return mh, nil
+	out := make([]domain.MetaHeuristic, 0, len(ids))
+	for _, id := range ids {
+		if mh, ok := f.present[id]; ok {
+			out = append(out, mh)
+		}
 	}
-	return domain.MetaHeuristic{}, fmt.Errorf("get MetaHeuristic %q: %w", id, graph.ErrNotFound)
+	slices.Reverse(out)
+	return out, nil
 }
 
 func (f *fakeRepo) TraceCausalChain(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
@@ -191,7 +203,7 @@ func TestQuerySkipsAndRetiresOrphanedEmbedding(t *testing.T) {
 	}}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	matches, err := svc.Query(context.Background(), "any state", 3)
+	matches, err := svc.Query(context.Background(), "any state", 3, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -203,6 +215,33 @@ func TestQuerySkipsAndRetiresOrphanedEmbedding(t *testing.T) {
 	}
 }
 
+// TestQueryHydratesTheBatchInRankOrder catches the two ways the batched read can
+// go wrong: reverting to a per-id fetch, and re-assembling from the batch result
+// instead of the ranked ids, which hands back a ranking that is not one.
+func TestQueryHydratesTheBatchInRankOrder(t *testing.T) {
+	embeddings := &fakeEmbeddings{hits: []string{"nearest", "middle", "farthest"}}
+	repo := &fakeRepo{present: map[string]domain.MetaHeuristic{
+		"nearest": {ID: "nearest"}, "middle": {ID: "middle"}, "farthest": {ID: "farthest"},
+	}}
+	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
+
+	matches, err := svc.Query(context.Background(), "any state", 3, store.SearchScope{CrossGoal: true})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	got := make([]string, 0, len(matches))
+	for _, m := range matches {
+		got = append(got, m.MetaHeuristic.ID)
+	}
+	want := []string{"nearest", "middle", "farthest"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("match order = %v, want the similarity order %v", got, want)
+	}
+	if repo.lookups != 1 {
+		t.Fatalf("graph lookups = %d, want exactly 1 for the whole batch", repo.lookups)
+	}
+}
+
 // TestQueryKeepsOrphansWhenNothingResolves is the guard against the cascade. An
 // empty-but-healthy graph reports every id as not-found, and treating that as
 // per-row drift would delete the whole table -- unrecoverably, since resume keys
@@ -211,7 +250,7 @@ func TestQueryKeepsOrphansWhenNothingResolves(t *testing.T) {
 	embeddings := &fakeEmbeddings{hits: []string{"orphan-a", "orphan-b"}}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, &fakeRepo{})
 
-	matches, err := svc.Query(context.Background(), "any state", 2)
+	matches, err := svc.Query(context.Background(), "any state", 2, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -231,7 +270,7 @@ func TestQueryPropagatesGraphFailure(t *testing.T) {
 	repo := &fakeRepo{failWith: errors.New("connection refused")}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	if _, err := svc.Query(context.Background(), "any state", 1); err == nil {
+	if _, err := svc.Query(context.Background(), "any state", 1, store.SearchScope{CrossGoal: true}); err == nil {
 		t.Fatal("expected a transport failure to propagate")
 	}
 	if len(embeddings.deleted) != 0 {
@@ -248,7 +287,7 @@ func TestQuerySurvivesRetireFailure(t *testing.T) {
 	repo := &fakeRepo{present: map[string]domain.MetaHeuristic{"live-a": {ID: "live-a"}}}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	matches, err := svc.Query(context.Background(), "any state", 2)
+	matches, err := svc.Query(context.Background(), "any state", 2, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("expected the search to survive a failed retire, got %v", err)
 	}
@@ -272,7 +311,7 @@ func TestQueryRetiresRestOfBatchAfterOneFailure(t *testing.T) {
 	repo := &fakeRepo{present: map[string]domain.MetaHeuristic{"live-a": {ID: "live-a"}}}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	matches, err := svc.Query(context.Background(), "any state", 3)
+	matches, err := svc.Query(context.Background(), "any state", 3, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -301,7 +340,7 @@ func TestQueryRetiresAfterRequestCancelled(t *testing.T) {
 	}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, repo)
 
-	if _, err := svc.Query(ctx, "any state", 2); err != nil {
+	if _, err := svc.Query(ctx, "any state", 2, store.SearchScope{CrossGoal: true}); err != nil {
 		t.Fatalf("query: %v", err)
 	}
 	if len(embeddings.deleted) != 1 || embeddings.deleted[0] != "orphan" {
@@ -315,7 +354,7 @@ func TestQueryEmptyCorpus(t *testing.T) {
 	embeddings := &fakeEmbeddings{}
 	svc := heuristics.NewService(fakeProvider{}, embeddings, &fakeRepo{})
 
-	matches, err := svc.Query(context.Background(), "any state", 10)
+	matches, err := svc.Query(context.Background(), "any state", 10, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -333,7 +372,7 @@ func TestQueryPropagatesPreSearchFailures(t *testing.T) {
 	t.Run("embed", func(t *testing.T) {
 		embeddings := &fakeEmbeddings{hits: []string{"live-a"}}
 		svc := heuristics.NewService(fakeProvider{embedErr: errors.New("ollama down")}, embeddings, &fakeRepo{})
-		if _, err := svc.Query(context.Background(), "any state", 1); err == nil {
+		if _, err := svc.Query(context.Background(), "any state", 1, store.SearchScope{CrossGoal: true}); err == nil {
 			t.Fatal("expected an embed failure to propagate")
 		}
 		if len(embeddings.attempted) != 0 {
@@ -343,7 +382,7 @@ func TestQueryPropagatesPreSearchFailures(t *testing.T) {
 	t.Run("similarity search", func(t *testing.T) {
 		embeddings := &fakeEmbeddings{searchErr: errors.New("pgvector down")}
 		svc := heuristics.NewService(fakeProvider{}, embeddings, &fakeRepo{})
-		if _, err := svc.Query(context.Background(), "any state", 1); err == nil {
+		if _, err := svc.Query(context.Background(), "any state", 1, store.SearchScope{CrossGoal: true}); err == nil {
 			t.Fatal("expected a similarity-search failure to propagate")
 		}
 		if len(embeddings.attempted) != 0 {

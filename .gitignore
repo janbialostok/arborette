@@ -1,9 +1,12 @@
 # Secrets
 .env
 
-# Build output
+# Build output. /orchestrator is anchored on purpose: a bare `orchestrator`
+# would also match the internal/ and cmd/ directories of that name, which
+# silently breaks staging and gitignore-respecting search inside them.
 /out/
 *.exe
+/orchestrator
 
 # Web UI (Node/Next.js) build artifacts
 /web/node_modules/
@@ -20,7 +23,3 @@
 
 # Editor/OS
 .DS_Store
-
-orchestrator
-
-

@@ -10,17 +10,23 @@ import (
 )
 
 // fakeCompleter is a stand-in for the LLM backend API call, so parsing and
-// schema construction are exercised without a real API.
+// schema construction are exercised without a real API. It records the system
+// and user prompts it was handed so a fencing test can assert what actually
+// reached the backend.
 type fakeCompleter struct {
-	text string
-	err  error
+	text      string
+	err       error
+	gotSystem string
+	gotUser   string
 }
 
-func (f *fakeCompleter) complete(_ context.Context, _, _ string, _ map[string]any) (string, error) {
+func (f *fakeCompleter) complete(_ context.Context, system, user string, _ map[string]any) (string, error) {
+	f.gotSystem, f.gotUser = system, user
 	return f.text, f.err
 }
 
-func (f *fakeCompleter) completeWithPDF(_ context.Context, _ string, _ []byte, _ string, _ map[string]any) (string, error) {
+func (f *fakeCompleter) completeWithPDF(_ context.Context, system string, _ []byte, instruction string, _ map[string]any) (string, error) {
+	f.gotSystem, f.gotUser = system, instruction
 	return f.text, f.err
 }
 
@@ -33,7 +39,7 @@ func TestGenerateEvaluationMatrix(t *testing.T) {
 	c := &client{backend: &fakeCompleter{text: body}}
 
 	schema := SandboxSchema{Columns: []SandboxColumn{{Name: "revenue", Type: "DOUBLE"}, {Name: "cost", Type: "DOUBLE"}}}
-	matrix, err := c.GenerateEvaluationMatrix(context.Background(), "grow revenue without overspending", schema)
+	matrix, err := c.GenerateEvaluationMatrix(context.Background(), "grow revenue without overspending", schema, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -54,7 +60,7 @@ func TestGenerateEvaluationMatrixSkipsLeadingThinkingBlock(t *testing.T) {
 		`"value":"{\"kind\":\"column_ref\",\"column\":\"latency\"}"}],"constraints":[]}`
 	c := &client{backend: &fakeCompleter{text: body}}
 
-	matrix, err := c.GenerateEvaluationMatrix(context.Background(), "cut latency", SandboxSchema{})
+	matrix, err := c.GenerateEvaluationMatrix(context.Background(), "cut latency", SandboxSchema{}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -74,7 +80,7 @@ func TestRepairEvaluationMatrix(t *testing.T) {
 		Right: &domain.Expression{Kind: domain.LiteralKind, Literal: &domain.LiteralValue{Bool: &tru}}}
 	prior := domain.EvaluationMatrix{Targets: []domain.Target{{Direction: domain.Maximize, Aggregation: "avg", Value: &priorExpr}}}
 	schema := SandboxSchema{Columns: []SandboxColumn{{Name: "Transported", Type: "BOOLEAN"}}}
-	matrix, err := c.RepairEvaluationMatrix(context.Background(), "grow revenue", schema, prior, "numeric aggregation over non-numeric column")
+	matrix, err := c.RepairEvaluationMatrix(context.Background(), "grow revenue", schema, prior, "numeric aggregation over non-numeric column", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -86,7 +92,7 @@ func TestRepairEvaluationMatrix(t *testing.T) {
 func TestGenerateEvaluationMatrixMalformedValueErrors(t *testing.T) {
 	body := `{"targets":[{"direction":"maximize","aggregation":"avg","value":"not json"}],"constraints":[]}`
 	c := &client{backend: &fakeCompleter{text: body}}
-	if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}); err == nil {
+	if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}, false); err == nil {
 		t.Fatalf("expected an error for a malformed value expression string")
 	}
 }
@@ -94,7 +100,7 @@ func TestGenerateEvaluationMatrixMalformedValueErrors(t *testing.T) {
 func TestGenerateEvaluationMatrixObjectValueErrors(t *testing.T) {
 	body := `{"targets":[{"direction":"maximize","aggregation":"avg","value":{"kind":"column_ref","column":"revenue"}}],"constraints":[]}`
 	c := &client{backend: &fakeCompleter{text: body}}
-	if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}); err == nil {
+	if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}, false); err == nil {
 		t.Fatalf("expected an error for an object-shaped value expression")
 	}
 }
@@ -254,7 +260,7 @@ func TestCompleteMapsStopReasons(t *testing.T) {
 			if tc.err != nil {
 				fake := &fakeCompleter{text: "{}", err: tc.err}
 				c := &client{backend: fake}
-				_, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{})
+				_, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}, false)
 				if err == nil {
 					t.Fatalf("expected an error")
 				}
@@ -266,7 +272,7 @@ func TestCompleteMapsStopReasons(t *testing.T) {
 func TestGenerateEvaluationMatrixPropagatesRequestError(t *testing.T) {
 	fake := &fakeCompleter{err: errors.New("boom")}
 	c := &client{backend: fake}
-	if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}); err == nil {
+	if _, err := c.GenerateEvaluationMatrix(context.Background(), "goal", SandboxSchema{}, false); err == nil {
 		t.Fatalf("expected an error when the request fails")
 	}
 }

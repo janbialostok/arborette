@@ -15,6 +15,7 @@ import (
 	"github.com/arborette/arborette/internal/llm"
 	"github.com/arborette/arborette/internal/objectstore"
 	"github.com/arborette/arborette/internal/orchestrator"
+	"github.com/arborette/arborette/internal/sandboxclient"
 	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
 )
@@ -43,6 +44,12 @@ func main() {
 	if err := store.ValidateEmbeddingDimension(ctx, pool, cfg.Embedding.Dimension); err != nil {
 		log.Fatalf("orchestrator: %v", err)
 	}
+	if err := store.ValidateDistanceFloor(cfg.Embedding.DistanceFloor); err != nil {
+		log.Fatalf("orchestrator: %v", err)
+	}
+	if err := store.ValidateVectorExtensionVersion(ctx, pool); err != nil {
+		log.Fatalf("orchestrator: %v", err)
+	}
 
 	objects, err := objectstore.NewClient(ctx, cfg.S3.Endpoint, cfg.S3.Region, cfg.S3.Bucket, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.PathStyle)
 	if err != nil {
@@ -57,14 +64,14 @@ func main() {
 	runs := store.NewRuns(pool)
 	queue := store.NewVerificationQueue(pool)
 	audits := store.NewAuditLog(pool)
-	embeddings := store.NewEmbeddingStore(pool)
+	embeddings := store.NewEmbeddingStore(pool, cfg.Embedding.DistanceFloor)
 	heur := heuristics.NewService(provider, embeddings, repo)
 	claude, err := llm.NewClient(cfg.LLM)
 	if err != nil {
 		log.Fatalf("orchestrator: llm client: %v", err)
 	}
 	chat := llm.NewChatClient(cfg.LLM.Anthropic.APIKey, cfg.LLM.Anthropic.ChatModel, cfg.MCP.PublicURL, cfg.MCP.AuthorizationToken)
-	sandbox := orchestrator.NewSandboxClient(cfg.Orchestrator.SandboxURL, nil)
+	sandbox := sandboxclient.NewClient(cfg.Orchestrator.SandboxURL, cfg.Orchestrator.InternalAuthToken, nil)
 
 	// Runs whose loop was abandoned by a prior crash or shutdown never ran their
 	// terminal write; settle them to failed at boot so they don't strand at
@@ -76,11 +83,48 @@ func main() {
 		log.Printf("orchestrator: reconciled %d orphaned run(s) to failed", n)
 	}
 
+	// A configured worker URL selects the HTTP launcher (a worker in serve mode);
+	// empty keeps the logging stub, so the AWS Batch seam stays the production path.
+	var launcher orchestrator.JobLauncher
+	if url := cfg.Orchestrator.SleepCycleWorkerURL; url != "" {
+		launcher = orchestrator.NewHTTPLauncher(url, cfg.Orchestrator.InternalAuthToken, nil)
+		log.Printf("orchestrator: wired HTTP sleep-cycle launcher -> %s", url)
+	} else {
+		launcher = orchestrator.StubLauncher{}
+		log.Printf("orchestrator: wired stub sleep-cycle launcher (no worker URL configured)")
+	}
+
+	// The verifier launcher is selected the same way (its differently-pathed endpoint
+	// reuses the HTTPLauncher unchanged), and carries every router dispatch: the
+	// explicit verify affordance, auto-promotion, and correction-triggered
+	// re-verification.
+	var verifierLauncher orchestrator.JobLauncher
+	if url := cfg.Orchestrator.VerifierWorkerURL; url != "" {
+		verifierLauncher = orchestrator.NewHTTPLauncher(url, cfg.Orchestrator.InternalAuthToken, nil)
+		log.Printf("orchestrator: wired HTTP verifier launcher -> %s", url)
+	} else {
+		verifierLauncher = orchestrator.StubLauncher{}
+		log.Printf("orchestrator: wired stub verifier launcher (no verifier URL configured)")
+	}
+
+	// The verification records are read here and written by the Verifier, so the
+	// accounting knobs it enforces are its own; this store only lists and invalidates.
+	causalVerifications := store.NewCausalVerifications(pool, cfg.Verifier.LeaseTTL,
+		cfg.Verifier.InflightCap, cfg.Verifier.VerificationBudget)
+
 	srv := orchestrator.NewServer(
-		repo, goals, runs, queue, audits, objects, heur, claude, chat, sandbox,
-		orchestrator.NewHub(), orchestrator.StubLauncher{},
+		repo, goals, runs, queue, causalVerifications, store.NewAdvisoryLock(pool),
+		audits, objects, heur, claude, chat, sandbox,
+		orchestrator.NewHub(), launcher, verifierLauncher,
 		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID},
+		orchestrator.RouterConfig{
+			AutoPromoteEnabled:    cfg.Orchestrator.AutoPromoteEnabled,
+			AutoPromoteTopN:       cfg.Orchestrator.AutoPromoteTopN,
+			AutoPromoteShrinkageK: cfg.Orchestrator.AutoPromoteShrinkageK,
+			StaleReverifyCap:      cfg.Orchestrator.StaleReverifyCap,
+		},
 		cfg.Orchestrator.LocalImportDir, cfg.Orchestrator.SleepCycleJobName,
+		cfg.Orchestrator.InternalAuthToken,
 		cfg.Orchestrator.HITLConfidenceThreshold, cfg.Orchestrator.BlockingLoopTimeout,
 	)
 

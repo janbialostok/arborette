@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/arborette/arborette/internal/service"
 )
 
 // handleStream streams a run's progress as Server-Sent Events. It subscribes to
@@ -15,7 +17,7 @@ import (
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		service.WriteErr(w, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
 	// Resolve the goal before subscribing, as the other /goals/{id} handlers do.

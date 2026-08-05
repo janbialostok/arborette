@@ -256,13 +256,13 @@ func TestRunDocumentLoopExtractErrorIsNonTerminal(t *testing.T) {
 		t.Fatalf("extract calls = %d, want %d (one per root method, no expansion)", claude.extractCalls, len(extractionMethods))
 	}
 	found := false
-	for _, r := range audits.records {
+	for _, r := range audits.records() {
 		if r.Action == "hypothesis_branch_failure" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected a hypothesis_branch_failure audit for the failed extraction: %+v", audits.records)
+		t.Fatalf("expected a hypothesis_branch_failure audit for the failed extraction: %+v", audits.records())
 	}
 	assertOneStatus(t, runs, store.RunCompleted, "")
 }

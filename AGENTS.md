@@ -62,16 +62,38 @@
   embeddings whose fixture node was seeded by an earlier run. When judging drift,
   filter fixture definitions out first; when verifying against the live stack,
   expect to restore the corpus after every gate run.
+- `make test` sources `.env`, so a test that asserts a config default by leaving
+  the variable unset passes under a bare `go test` and fails the moment an operator
+  sets it. Clear the variable explicitly (`t.Setenv(key, "")`) rather than assuming
+  absence. The existing knob tests survive only because the `.env` values happen to
+  equal the defaults they assert — do not read that as the pattern to copy.
 - Audit records carry their detail as `map[string]any`, so a nil slice or a typed
   nil pointer stored in one is never `== nil`. Assert on content (length, a
   specific id) rather than `detail["k"] != nil`, which passes even when the value
   is the nil the assertion means to catch.
+- `audit_log` is a shared table read by ops queries. Key its `detail` map with the
+  codebase-wide vocabulary — `optimization_function_id` for the goal id,
+  `data_source_ref` for the source — even when a new service's own wire DTO spells
+  the same value differently (e.g. the verifier's `POST /verifications` body uses
+  `goal_id`/`datasource_ref`). The wire contract and the audit-detail schema are
+  separate concerns; a dashboard keyed on `detail->>'optimization_function_id'`
+  must match every engine's rows.
 - A test double that ignores its `context.Context` cannot catch a context bug. The
   real pools and drivers fail a call on a cancelled context, so a fake that does
   not is why a handler passing the wrong context (the request's, where a detached
   one is required) reads as correct. Have doubles that stand in for a store return
   `ctx.Err()` when the context is done — the moment they do, a test asserting the
   wrong thing fails loudly rather than passing for the wrong reason.
+- Work that outlives the function under test needs guarded doubles and `-race`. A
+  completed hypothesis run hands its output to auto-promotion on its own goroutine,
+  launched from `runLoop`'s deferred closure, so it is still running when `runLoop`
+  returns and the test reads its assertions. Every double that goroutine touches
+  (`fakeAudits`, `fakeLauncher`, the graph repo) must therefore be mutex-guarded and
+  read through an accessor rather than by touching the field. `make test` does **not**
+  pass `-race`, so a race here is invisible to the declared gate — run
+  `go test -race ./internal/orchestrator` directly when touching promotion, the run
+  lifecycle, or any double they share.
+
 - Scripted-response test doubles (`fakeSandbox`, `fakeClaude`) return a nil error /
   empty success once their scripted slice is exhausted. A test for a bounded retry
   loop must therefore script one failure per attempt **plus** the initial one
@@ -85,14 +107,20 @@
   compose container already holds 8080), sourcing `.env` for credentials — then
   `curl` the endpoint. Boot-time work (migrations already applied, reconciliation
   sweeps) runs too, so the local process exercises the real startup path.
-- The Sleep-Cycle Worker is a one-shot job behind the compose `jobs` profile, so
+- The one-shot Sleep-Cycle Worker is a job behind the compose `jobs` profile, so
   `make up` neither builds nor starts it, and a bare `docker compose run` reuses
   whatever image already exists — `make sleep-cycle GOAL=<id>` passes `--build` for
-  exactly that reason. The REST/UI trigger (`POST /goals/{id}/sleep-cycle`) is
-  backed by `StubLauncher` locally: it logs, audits, returns 202, and runs nothing,
-  so `make sleep-cycle` is the only way to execute a run against the local stack.
-  To run it from the host instead, use the same overrides as the HTTP smoke-test
-  plus `ORCHESTRATOR_URL=http://localhost:8080` (it reaches the audit table only
+  exactly that reason. The REST/UI trigger (`POST /goals/{id}/sleep-cycle`) is real
+  locally: compose sets `SLEEPCYCLE_WORKER_URL`, selecting `HTTPLauncher`, which
+  POSTs to the always-on `sleepcycle-serve` service (:8084, async 202, per-goal
+  409 guard). `StubLauncher` (logs, audits, runs nothing) is only the fallback
+  when that env var is unset. `sleepcycle-serve` is a long-lived compose service,
+  so a worker code change needs `docker compose up -d --build sleepcycle-serve`
+  to take effect there — the same applies to `verifier-serve` (:8085), which
+  `make up` also starts and which every completed Phase-1 run reaches through
+  auto-promotion. To run the one-shot worker from the host instead, use the
+  same overrides as the HTTP smoke-test plus
+  `ORCHESTRATOR_URL=http://localhost:8080` (it reaches the audit table only
   through that API) and `-goal <optimization_function_id>`; it exits when the run
   finishes rather than serving.
 - To preview or smoke-test a `web/` frontend change against the live stack, run
@@ -103,5 +131,18 @@
   through `make web-dev`, not the :8083 container.
 - The frontend has its own unit suites under `web/lib/` (vitest, no infrastructure
   needed) with no Make target: run them with `npm test` from `web/`. They cover the
-  typed orchestrator client, the SSE frame parser, and the pure logic behind the
-  review, chat, and histogram views.
+  typed orchestrator client, the SSE frame parser and stream-reopen policy, and the
+  pure logic behind each view — every non-trivial rule belongs in `web/lib/` for
+  exactly this reason, since the project writes no component tests.
+
+## Planning Artifacts
+
+- `.turbo/` is **tracked**, not ignored: `specs/`, `plans/`, `shells/`, and the running
+  `improvements.md` backlog are all committed. A commit that implements a shell carries
+  its own plan at `status: done` and deletes the shell it consumed, so the plan file is
+  the durable record of what shipped — if the implementation departs from the plan (a
+  deferral that was actually done, a scope line that no longer holds), correct the plan
+  in the same commit rather than leaving it describing the opposite.
+- `improvements.md` is the backlog for work deliberately skipped. Entries state the
+  problem, the mechanism, and the fix — not the session that found them. Prefer
+  correcting an existing entry over appending a near-duplicate.

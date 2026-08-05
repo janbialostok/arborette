@@ -93,13 +93,13 @@ func TestResolveVerificationConfirm(t *testing.T) {
 	if entry := queue.entry(testOutcomeID); entry.Status != store.QueueResolved || entry.Resolution != store.ResolutionConfirmed {
 		t.Fatalf("queue entry = %+v, want resolved/confirmed", entry)
 	}
-	if len(audits.records) != 1 || audits.records[0].Action != "hitl_verification_resolution" {
-		t.Fatalf("expected one resolution audit record: %+v", audits.records)
+	if len(audits.records()) != 1 || audits.records()[0].Action != "hitl_verification_resolution" {
+		t.Fatalf("expected one resolution audit record: %+v", audits.records())
 	}
-	if _, repaired := audits.records[0].Detail["repair"]; repaired {
+	if _, repaired := audits.records()[0].Detail["repair"]; repaired {
 		t.Fatal("a first-time resolution must not be audited as a repair")
 	}
-	detail := audits.records[0].Detail
+	detail := audits.records()[0].Detail
 	if detail["action"] != string(store.ResolutionConfirmed) || detail["outcome_id"] != testOutcomeID {
 		t.Fatalf("audit detail must identify the verdict and its outcome: %+v", detail)
 	}
@@ -121,8 +121,8 @@ func TestResolveVerificationAuditsTheCorrectedValue(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
 	}
-	if len(auditLog.records) != 1 || auditLog.records[0].Detail["corrected_value"] != "99.50" {
-		t.Fatalf("the correction must be recorded in the audit detail: %+v", auditLog.records)
+	if len(auditLog.records()) != 1 || auditLog.records()[0].Detail["corrected_value"] != "99.50" {
+		t.Fatalf("the correction must be recorded in the audit detail: %+v", auditLog.records())
 	}
 }
 
@@ -225,8 +225,8 @@ func TestResolveVerificationRepairsAStrandedResolution(t *testing.T) {
 		if len(repo.verifications) != 1 || repo.verifications[0].status != domain.VerificationConfirmed {
 			t.Fatalf("the repair must complete the write-through: %+v", repo.verifications)
 		}
-		if len(auditLog.records) != 1 || auditLog.records[0].Detail["repair"] != true {
-			t.Fatalf("a repair must be audited and marked as one: %+v", auditLog.records)
+		if len(auditLog.records()) != 1 || auditLog.records()[0].Detail["repair"] != true {
+			t.Fatalf("a repair must be audited and marked as one: %+v", auditLog.records())
 		}
 	})
 
@@ -731,8 +731,8 @@ func TestResolveVerificationSurvivesClientDisconnect(t *testing.T) {
 		if len(repo.verifications) != 1 {
 			t.Fatalf("the graph write must have landed for this case to mean anything: %+v", repo.verifications)
 		}
-		if len(auditLog.records) != 1 || auditLog.records[0].Action != "hitl_verification_resolution" {
-			t.Fatalf("a resolution that reached the graph must still be audited: %+v", auditLog.records)
+		if len(auditLog.records()) != 1 || auditLog.records()[0].Action != "hitl_verification_resolution" {
+			t.Fatalf("a resolution that reached the graph must still be audited: %+v", auditLog.records())
 		}
 	})
 

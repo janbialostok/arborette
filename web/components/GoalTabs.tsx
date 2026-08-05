@@ -3,12 +3,14 @@
 import { useState } from "react";
 import { chatUrl } from "@/lib/orchestrator";
 import { AgentChat } from "@/components/AgentChat";
+import { CausalTab } from "@/components/CausalTab";
 import { LiveRun } from "@/components/LiveRun";
 import { VerificationQueue } from "@/components/VerificationQueue";
 import { cn } from "@/components/ui";
 
 const TABS = [
   { id: "run", label: "Run" },
+  { id: "causal", label: "Causal" },
   { id: "verify", label: "Verify" },
   { id: "agent", label: "Preview agent" },
 ] as const;
@@ -26,8 +28,8 @@ export function GoalTabs({
   // The run is always mounted, however the page was opened: it owns the live
   // subscription, and a stream joined late misses everything the replay buffer
   // has already dropped — so it is rendered unconditionally and never consults
-  // this set. The other two mount on first visit and stay mounted, so switching
-  // away never costs their loaded state.
+  // this set. The others mount on first visit and stay mounted, so switching away
+  // never costs their loaded state.
   const [visited, setVisited] = useState<Set<TabID>>(
     () => new Set<TabID>([toTab(initialTab)]),
   );
@@ -70,6 +72,13 @@ export function GoalTabs({
       <div className={cn(tab !== "run" && "hidden")}>
         <LiveRun id={id} />
       </div>
+      {/* Kept mounted once visited because it owns a stream subscription: unmounting
+          it would drop the verdicts a post-run verify publishes. */}
+      {visited.has("causal") && (
+        <div className={cn(tab !== "causal" && "hidden")}>
+          <CausalTab id={id} />
+        </div>
+      )}
       {visited.has("verify") && (
         <div className={cn(tab !== "verify" && "hidden")}>
           <VerificationQueue id={id} />

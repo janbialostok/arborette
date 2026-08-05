@@ -13,10 +13,14 @@ type SandboxSchema struct {
 	Columns []SandboxColumn
 }
 
-// SandboxColumn is one introspected column name and its type.
+// SandboxColumn is one introspected column name and its type. DistinctValues is
+// the column's value set when it is a low-cardinality categorical column, nil
+// otherwise; the tree-proposal prompt grounds filter values on it, and the
+// deterministic post-check rejects proposals naming a value outside it.
 type SandboxColumn struct {
-	Name string
-	Type string
+	Name           string
+	Type           string
+	DistinctValues []string
 }
 
 // TreeContext carries the fixed objective and the parent's cumulative filter
@@ -125,6 +129,65 @@ func metaHeuristicSchema() map[string]any {
 			"ontological": stringProp(),
 		}, "concrete", "ontological")),
 	}, "definition", "ontology_terms")
+}
+
+// orientCausalEdgesSchema is the structured-output schema for OrientCausalEdges: an
+// array of per-edge decisions, each an echoed edge id (a plain string, matched
+// deterministically after decode), a direction enum over the small fixed set, and a
+// confidence number. The edge list is prompt-grounded data, not schema, so the
+// schema stays flat and static (one small enum, no recursion, no per-edge variance)
+// and inside the constrained-decoding ceiling.
+func orientCausalEdgesSchema() map[string]any {
+	return object(props{
+		"decisions": arrayOf(object(props{
+			"edge_id":    stringProp(),
+			"decision":   enumSchema([]any{OrientFirstCausesSecond, OrientSecondCausesFirst, OrientAbstain}),
+			"confidence": map[string]any{"type": "number"},
+		}, "edge_id", "decision", "confidence")),
+	}, "decisions")
+}
+
+// classifyGoalIntentSchema is the structured-output schema for ClassifyGoalIntent:
+// the routing track and the claim extracted with it. Only the two fixed enums
+// (track, claimed direction) stay strict; the claim's filter conjunction rides as a
+// JSON-encoded string, because filter columns and values are a dataset-sized growing
+// set and that is the axis the constrained-decoding grammar has a ceiling on. The
+// string is parsed and validated deterministically after generation, which also
+// keeps this schema static per code version and so statically cacheable.
+func classifyGoalIntentSchema() map[string]any {
+	return object(props{
+		"track":           enumSchema([]any{TrackExplore, TrackVerify}),
+		"rationale":       stringProp(),
+		"claim_filters":   stringProp(),
+		"claim_direction": enumSchema([]any{claimIncrease, claimDecrease, ""}),
+	}, "track", "rationale", "claim_filters", "claim_direction")
+}
+
+// critiqueAtomsSchema is the structured-output schema for CritiqueAtoms: the columns
+// a search must not segment on and an optional ranking of the ones worth trying
+// first. Both ride as JSON-encoded strings rather than schema'd arrays, because a
+// column set is dataset-sized and growing — the axis the constrained-decoding
+// grammar has a ceiling on — and both are grounded to the real columns
+// deterministically after generation, which keeps this schema static per code
+// version and so statically cacheable.
+func critiqueAtomsSchema() map[string]any {
+	return object(props{
+		"excluded_columns": stringProp(),
+		"ranked_columns":   stringProp(),
+		"rationale":        stringProp(),
+	}, "excluded_columns", "ranked_columns", "rationale")
+}
+
+// groundHeuristicSchema is the structured-output schema for GroundHeuristic: the
+// filter conjunction the heuristic re-expresses to on this data source, plus the
+// mapping rationale. The conjunction is a JSON-encoded string for the same reason
+// the extracted claim's is — dataset-sized filter columns and values — leaving the
+// schema flat, static, and free of enums.
+func groundHeuristicSchema() map[string]any {
+	return object(props{
+		"filters":   stringProp(),
+		"rationale": stringProp(),
+	}, "filters", "rationale")
 }
 
 // constraintItem is the schema for one matrix hard-constraint. The field is a plain

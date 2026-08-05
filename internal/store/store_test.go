@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -41,11 +42,11 @@ func TestVectorRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
 	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
-	embeddings := store.NewEmbeddingStore(p)
+	embeddings := store.NewEmbeddingStore(p, 2)
 
 	nodeID := testutil.NewID(t)
 	want := vec768(0.5)
-	if err := embeddings.Upsert(ctx, nodeID, want); err != nil {
+	if err := embeddings.Upsert(ctx, nodeID, "", want); err != nil {
 		t.Fatalf("upsert embedding: %v", err)
 	}
 
@@ -84,23 +85,24 @@ func TestSimilaritySearchRankingAndLimit(t *testing.T) {
 	cfg := setup(t, ctx)
 	testutil.TruncateEmbeddings(t, ctx, cfg)
 	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
-	embeddings := store.NewEmbeddingStore(p)
+	// A generous floor keeps this test about ranking and the k cap, not the floor.
+	embeddings := store.NewEmbeddingStore(p, 2)
 
 	query := oneHot(map[int]float32{0: 1})
 	nearID := testutil.NewID(t) // identical direction -> distance 0
 	midID := testutil.NewID(t)  // 45 degrees
 	farID := testutil.NewID(t)  // orthogonal -> distance 1
-	if err := embeddings.Upsert(ctx, nearID, oneHot(map[int]float32{0: 1})); err != nil {
+	if err := embeddings.Upsert(ctx, nearID, "", oneHot(map[int]float32{0: 1})); err != nil {
 		t.Fatalf("upsert near: %v", err)
 	}
-	if err := embeddings.Upsert(ctx, midID, oneHot(map[int]float32{0: 1, 1: 1})); err != nil {
+	if err := embeddings.Upsert(ctx, midID, "", oneHot(map[int]float32{0: 1, 1: 1})); err != nil {
 		t.Fatalf("upsert mid: %v", err)
 	}
-	if err := embeddings.Upsert(ctx, farID, oneHot(map[int]float32{1: 1})); err != nil {
+	if err := embeddings.Upsert(ctx, farID, "", oneHot(map[int]float32{1: 1})); err != nil {
 		t.Fatalf("upsert far: %v", err)
 	}
 
-	got, err := embeddings.SimilaritySearch(ctx, query, 2)
+	got, err := embeddings.SimilaritySearch(ctx, query, 2, store.SearchScope{CrossGoal: true})
 	if err != nil {
 		t.Fatalf("similarity search: %v", err)
 	}
@@ -109,6 +111,220 @@ func TestSimilaritySearchRankingAndLimit(t *testing.T) {
 	}
 	if got[0] != nearID || got[1] != midID {
 		t.Fatalf("expected [near, mid] by cosine distance, got %v", got)
+	}
+}
+
+// TestSearchScopeFiltersByGoal: a goal-scoped search returns only that goal's
+// rows, while a cross-goal search returns every row including the NULL-goal
+// legacy corpus that binds no goal parameter at all.
+func TestSearchScopeFiltersByGoal(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	testutil.TruncateEmbeddings(t, ctx, cfg)
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	embeddings := store.NewEmbeddingStore(p, 2)
+
+	goalA, goalB := testutil.NewID(t), testutil.NewID(t)
+	aID, bID, legacyID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	v := oneHot(map[int]float32{0: 1})
+	for id, goal := range map[string]string{aID: goalA, bID: goalB, legacyID: ""} {
+		if err := embeddings.Upsert(ctx, id, goal, v); err != nil {
+			t.Fatalf("upsert %q: %v", id, err)
+		}
+	}
+
+	scoped, err := embeddings.SimilaritySearch(ctx, v, 10, store.SearchScope{GoalID: goalA})
+	if err != nil {
+		t.Fatalf("goal-scoped search: %v", err)
+	}
+	if len(scoped) != 1 || scoped[0] != aID {
+		t.Fatalf("goal-scoped search must return only goalA's row, got %v", scoped)
+	}
+
+	cross, err := embeddings.SimilaritySearch(ctx, v, 10, store.SearchScope{CrossGoal: true})
+	if err != nil {
+		t.Fatalf("cross-goal search: %v", err)
+	}
+	if len(cross) != 3 {
+		t.Fatalf("cross-goal search must return every row including the NULL-goal legacy one, got %v", cross)
+	}
+}
+
+// TestDistanceFloorExcludesDistantRows: a row beyond the floor is dropped, and a
+// query distant from everything returns empty rather than the corpus ranked by
+// how distant it is.
+func TestDistanceFloorExcludesDistantRows(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	testutil.TruncateEmbeddings(t, ctx, cfg)
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	embeddings := store.NewEmbeddingStore(p, 0.5)
+
+	nearID, farID := testutil.NewID(t), testutil.NewID(t)
+	if err := embeddings.Upsert(ctx, nearID, "", oneHot(map[int]float32{0: 1})); err != nil {
+		t.Fatalf("upsert near: %v", err)
+	}
+	if err := embeddings.Upsert(ctx, farID, "", oneHot(map[int]float32{1: 1})); err != nil {
+		t.Fatalf("upsert far: %v", err)
+	}
+
+	// Query aligned with near (distance 0); far is orthogonal (distance 1 > 0.5).
+	got, err := embeddings.SimilaritySearch(ctx, oneHot(map[int]float32{0: 1}), 10, store.SearchScope{CrossGoal: true})
+	if err != nil {
+		t.Fatalf("similarity search: %v", err)
+	}
+	if len(got) != 1 || got[0] != nearID {
+		t.Fatalf("the floor must drop the orthogonal row, got %v", got)
+	}
+
+	// A query orthogonal to every stored row is beyond the floor from all of them.
+	empty, err := embeddings.SimilaritySearch(ctx, oneHot(map[int]float32{500: 1}), 10, store.SearchScope{CrossGoal: true})
+	if err != nil {
+		t.Fatalf("distant search: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("a query beyond the floor from everything must return empty, got %v", empty)
+	}
+}
+
+// TestUpsertNullGoalThenRepaired: an empty goalID writes SQL NULL, and a later
+// re-embed under a real goal repairs the row without a goal-less caller ever
+// re-blanking it.
+func TestUpsertNullGoalThenRepaired(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	testutil.TruncateEmbeddings(t, ctx, cfg)
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	embeddings := store.NewEmbeddingStore(p, 2)
+
+	nodeID := testutil.NewID(t)
+	if err := embeddings.Upsert(ctx, nodeID, "", vec768(0.2)); err != nil {
+		t.Fatalf("upsert null-goal: %v", err)
+	}
+	if goal := goalOf(t, ctx, embeddings, nodeID); goal != "" {
+		t.Fatalf("empty goalID must write NULL, got %q", goal)
+	}
+
+	realGoal := testutil.NewID(t)
+	if err := embeddings.Upsert(ctx, nodeID, realGoal, vec768(0.3)); err != nil {
+		t.Fatalf("re-upsert with a real goal: %v", err)
+	}
+	if goal := goalOf(t, ctx, embeddings, nodeID); goal != realGoal {
+		t.Fatalf("a re-embed under a real goal must repair the NULL row, got %q want %q", goal, realGoal)
+	}
+
+	// A goal-less re-embed must never re-blank the now-populated goal.
+	if err := embeddings.Upsert(ctx, nodeID, "", vec768(0.4)); err != nil {
+		t.Fatalf("goal-less re-upsert: %v", err)
+	}
+	if goal := goalOf(t, ctx, embeddings, nodeID); goal != realGoal {
+		t.Fatalf("a goal-less re-embed must not re-blank a populated goal, got %q", goal)
+	}
+}
+
+// TestSetGoalIDRepairsOnlyNullRows pins the goal-repair write's guard directly at
+// the store: SetGoalID populates a NULL-goal row but never overwrites a row that
+// already carries a goal (WHERE goal_id IS NULL), and is a harmless no-op on an
+// absent node. This is the discriminating test for the reconcile goal-repair arm
+// that the fake cannot model.
+func TestSetGoalIDRepairsOnlyNullRows(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	testutil.TruncateEmbeddings(t, ctx, cfg)
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	embeddings := store.NewEmbeddingStore(p, 2)
+
+	nodeID := testutil.NewID(t)
+	if err := embeddings.Upsert(ctx, nodeID, "", vec768(0.2)); err != nil {
+		t.Fatalf("seed null-goal row: %v", err)
+	}
+
+	firstGoal := testutil.NewID(t)
+	if err := embeddings.SetGoalID(ctx, nodeID, firstGoal); err != nil {
+		t.Fatalf("set goal on a NULL row: %v", err)
+	}
+	if goal := goalOf(t, ctx, embeddings, nodeID); goal != firstGoal {
+		t.Fatalf("SetGoalID must populate a NULL row, got %q want %q", goal, firstGoal)
+	}
+
+	// A second SetGoalID must not overwrite the populated goal.
+	secondGoal := testutil.NewID(t)
+	if err := embeddings.SetGoalID(ctx, nodeID, secondGoal); err != nil {
+		t.Fatalf("second set goal: %v", err)
+	}
+	if goal := goalOf(t, ctx, embeddings, nodeID); goal != firstGoal {
+		t.Fatalf("SetGoalID must never overwrite a populated goal, got %q want %q", goal, firstGoal)
+	}
+
+	// An absent node is a no-op, not an error.
+	if err := embeddings.SetGoalID(ctx, testutil.NewID(t), firstGoal); err != nil {
+		t.Fatalf("SetGoalID on an absent node must be a no-op, got %v", err)
+	}
+}
+
+// goalOf reads the persisted goal_id of one node via ListNodeRefs (empty string
+// for a NULL row, per the store's COALESCE).
+func goalOf(t *testing.T, ctx context.Context, e *store.EmbeddingStore, nodeID string) string {
+	t.Helper()
+	refs, err := e.ListNodeRefs(ctx)
+	if err != nil {
+		t.Fatalf("list node refs: %v", err)
+	}
+	for _, ref := range refs {
+		if ref.NodeID == nodeID {
+			return ref.GoalID
+		}
+	}
+	t.Fatalf("node %q has no embedding row", nodeID)
+	return ""
+}
+
+// TestGoalScopedRecallUnderFiltering: a goal-scoped search returns all of a
+// minority goal's in-floor rows up to k even when the corpus is dominated by
+// another goal. enable_seqscan is disabled on a single-connection pool so the
+// query takes the hnsw path -- exercising the iterative_scan wrapping rather than
+// an exact seq-scan filter. At fixture scale hnsw already covers the whole table,
+// so this pins the goal-filter recall; a true under-return needs a large corpus.
+func TestGoalScopedRecallUnderFiltering(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	testutil.TruncateEmbeddings(t, ctx, cfg)
+
+	// One connection so a session-level SET persists into the store's own search
+	// transaction, which the store manages and does not expose.
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN()+" pool_max_conns=1")
+	if _, err := p.Exec(ctx, "SET enable_seqscan = off"); err != nil {
+		t.Fatalf("disable seqscan: %v", err)
+	}
+	embeddings := store.NewEmbeddingStore(p, 2)
+
+	minorityGoal, majorityGoal := testutil.NewID(t), testutil.NewID(t)
+	query := oneHot(map[int]float32{0: 1})
+	minority := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		id := testutil.NewID(t)
+		minority[id] = true
+		if err := embeddings.Upsert(ctx, id, minorityGoal, query); err != nil {
+			t.Fatalf("upsert minority: %v", err)
+		}
+	}
+	for i := 0; i < 50; i++ {
+		if err := embeddings.Upsert(ctx, testutil.NewID(t), majorityGoal, query); err != nil {
+			t.Fatalf("upsert majority: %v", err)
+		}
+	}
+
+	got, err := embeddings.SimilaritySearch(ctx, query, 3, store.SearchScope{GoalID: minorityGoal})
+	if err != nil {
+		t.Fatalf("goal-scoped search: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("goal-scoped search must recall all %d minority rows, got %d: %v", len(minority), len(got), got)
+	}
+	for _, id := range got {
+		if !minority[id] {
+			t.Fatalf("goal-scoped search returned a non-minority row %q", id)
+		}
 	}
 }
 
@@ -125,6 +341,18 @@ func TestValidateEmbeddingDimension(t *testing.T) {
 	}
 	if err := store.ValidateEmbeddingDimension(ctx, p, 999); err == nil {
 		t.Fatal("expected a mismatch error for dimension 999")
+	}
+}
+
+func TestValidateVectorExtensionVersion(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
+
+	// The test container is pinned to a >= 0.8.0 pgvector, so the query-and-parse
+	// wrapper must read a real version and accept it.
+	if err := store.ValidateVectorExtensionVersion(ctx, p); err != nil {
+		t.Fatalf("the pinned pgvector (>= 0.8.0) must pass the version check: %v", err)
 	}
 }
 
@@ -223,6 +451,46 @@ func TestGoalRegistryGrants(t *testing.T) {
 	}
 }
 
+// TestDataSourceRegistry round-trips the ref registry the sandbox scopes requests
+// against and pins its grant boundary: the orchestrator writes refs (idempotently),
+// the service role (the sandbox's runtime role) may only read them to validate, and
+// an unknown ref reads false rather than erroring.
+func TestDataSourceRegistry(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+
+	orchestrator := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	orchReg := store.NewGoalRegistry(orchestrator)
+
+	ref := "datasources/" + testutil.NewID(t) + "/orders.csv"
+
+	if exists, err := orchReg.DataSourceRefExists(ctx, ref); err != nil || exists {
+		t.Fatalf("unregistered ref: exists=%v err=%v, want false/nil", exists, err)
+	}
+	if err := orchReg.RegisterDataSourceRef(ctx, ref); err != nil {
+		t.Fatalf("orchestrator register ref: %v", err)
+	}
+	// Re-registering the same ref is a no-op (ON CONFLICT DO NOTHING), which every
+	// run after the first goal registration relies on.
+	if err := orchReg.RegisterDataSourceRef(ctx, ref); err != nil {
+		t.Fatalf("re-register ref must be idempotent: %v", err)
+	}
+	if exists, err := orchReg.DataSourceRefExists(ctx, ref); err != nil || !exists {
+		t.Fatalf("registered ref: exists=%v err=%v, want true/nil", exists, err)
+	}
+
+	// The service role reads the registry to validate, exactly as the wired sandbox
+	// does; it holds SELECT but not INSERT.
+	service := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	svcReg := store.NewGoalRegistry(service)
+	if exists, err := svcReg.DataSourceRefExists(ctx, ref); err != nil || !exists {
+		t.Fatalf("service validate registered ref: exists=%v err=%v, want true/nil", exists, err)
+	}
+	if err := svcReg.RegisterDataSourceRef(ctx, "datasources/"+testutil.NewID(t)+"/x.csv"); err == nil {
+		t.Fatal("expected service INSERT on data_source_registry to be denied")
+	}
+}
+
 func TestGoalRegistryDocumentGoal(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
@@ -283,6 +551,139 @@ func TestGoalRegistryDocumentGoal(t *testing.T) {
 		t.Fatalf("tabular goal not listed with its matrix: %+v", g)
 	}
 }
+
+// TestGoalRegistryWindowBindings round-trips the entity-key/time-column window
+// bindings: a goal that binds them reads them back verbatim, and a goal that binds
+// neither reads them back as empty strings (the COALESCE of their NULL columns).
+func TestGoalRegistryWindowBindings(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	registry := store.NewGoalRegistry(p)
+
+	boundID := testutil.NewID(t)
+	if err := registry.Insert(ctx, store.Goal{
+		OptimizationFunctionID: boundID,
+		GoalText:               "flag anomalous velocity",
+		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "amount", Direction: domain.Maximize, Aggregation: "avg"}}},
+		DataSourceRef:          "s3://arborette/txns.csv",
+		EntityKeyColumn:        "account_id",
+		TimeColumn:             "ts",
+	}); err != nil {
+		t.Fatalf("insert windowed goal: %v", err)
+	}
+	got, err := registry.Get(ctx, boundID)
+	if err != nil {
+		t.Fatalf("get windowed goal: %v", err)
+	}
+	if got.EntityKeyColumn != "account_id" || got.TimeColumn != "ts" {
+		t.Fatalf("window bindings round-trip mismatch: entity=%q time=%q", got.EntityKeyColumn, got.TimeColumn)
+	}
+
+	// A goal with no bindings reads both back as empty (NULL columns COALESCEd).
+	unboundID := testutil.NewID(t)
+	if err := registry.Insert(ctx, store.Goal{
+		OptimizationFunctionID: unboundID,
+		GoalText:               "grow revenue",
+		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
+		DataSourceRef:          "s3://arborette/data.csv",
+	}); err != nil {
+		t.Fatalf("insert unbound goal: %v", err)
+	}
+	got, err = registry.Get(ctx, unboundID)
+	if err != nil {
+		t.Fatalf("get unbound goal: %v", err)
+	}
+	if got.EntityKeyColumn != "" || got.TimeColumn != "" {
+		t.Fatalf("unbound goal must read empty bindings, got entity=%q time=%q", got.EntityKeyColumn, got.TimeColumn)
+	}
+}
+
+// TestGoalRegistryTrackAndClaim round-trips the routing track and the extracted
+// claim: a verify-track goal reads back the claim document byte-identically (the
+// Verifier decodes exactly what intake validated), a goal registered with no track
+// falls to explore rather than an empty string, and SetClaimError records the
+// cannot-construct reason the Verifier reports at dispatch time.
+func TestGoalRegistryTrackAndClaim(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	registry := store.NewGoalRegistry(p)
+
+	claim, err := json.Marshal(domain.ClaimSpec{
+		Filters:   []domain.Constraint{{Field: "tier", Op: domain.Equal, Operand: &domain.LiteralValue{String: strPtr("gold")}}},
+		Direction: domain.Maximize,
+	})
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	verifyID := testutil.NewID(t)
+	if err := registry.Insert(ctx, store.Goal{
+		OptimizationFunctionID: verifyID,
+		GoalText:               "do gold-tier accounts spend more?",
+		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
+		DataSourceRef:          "s3://arborette/data.csv",
+		Track:                  store.TrackVerify,
+		Claim:                  claim,
+	}); err != nil {
+		t.Fatalf("insert verify goal: %v", err)
+	}
+	got, err := registry.Get(ctx, verifyID)
+	if err != nil {
+		t.Fatalf("get verify goal: %v", err)
+	}
+	if got.Track != store.TrackVerify {
+		t.Fatalf("track = %q, want verify", got.Track)
+	}
+	var decoded domain.ClaimSpec
+	if err := json.Unmarshal(got.Claim, &decoded); err != nil {
+		t.Fatalf("stored claim does not decode: %v (%s)", err, got.Claim)
+	}
+	if len(decoded.Filters) != 1 || decoded.Filters[0].Field != "tier" || decoded.Direction != domain.Maximize {
+		t.Fatalf("claim round-trip mismatch: %+v", decoded)
+	}
+	if got.ClaimError != "" {
+		t.Fatalf("a constructed claim carries no error, got %q", got.ClaimError)
+	}
+
+	// A goal inserted with no track defaults to explore: the column list is explicit,
+	// so the SQL DEFAULT never fires and Insert has to supply it.
+	exploreID := seedGoal(t, ctx, p)
+	got, err = registry.Get(ctx, exploreID)
+	if err != nil {
+		t.Fatalf("get default-track goal: %v", err)
+	}
+	if got.Track != store.TrackExplore {
+		t.Fatalf("track = %q, want the explore default", got.Track)
+	}
+	if got.Claim != nil {
+		t.Fatalf("an explore goal carries no claim, got %s", got.Claim)
+	}
+
+	const reason = "the claim names filter columns that are not in the data source: region"
+	if err := registry.SetClaimError(ctx, exploreID, reason); err != nil {
+		t.Fatalf("set claim error: %v", err)
+	}
+	got, err = registry.Get(ctx, exploreID)
+	if err != nil {
+		t.Fatalf("get after set claim error: %v", err)
+	}
+	if got.ClaimError != reason {
+		t.Fatalf("claim error = %q, want the recorded reason", got.ClaimError)
+	}
+
+	goals, err := registry.List(ctx)
+	if err != nil {
+		t.Fatalf("list goals: %v", err)
+	}
+	for _, g := range goals {
+		if g.Track == "" {
+			t.Fatalf("goal %q listed with an empty track", g.OptimizationFunctionID)
+		}
+	}
+}
+
+func strPtr(s string) *string { return &s }
 
 // seedGoal inserts a minimal registered goal a run row can reference, returning
 // its id.
@@ -530,12 +931,12 @@ func TestEmbeddingGrants(t *testing.T) {
 
 	// service: SELECT/INSERT/UPDATE/DELETE on embeddings.
 	service := pool(t, ctx, cfg.Postgres.ServiceDSN())
-	embeddings := store.NewEmbeddingStore(service)
+	embeddings := store.NewEmbeddingStore(service, 2)
 	nodeID := testutil.NewID(t)
-	if err := embeddings.Upsert(ctx, nodeID, vec768(0.2)); err != nil {
+	if err := embeddings.Upsert(ctx, nodeID, "", vec768(0.2)); err != nil {
 		t.Fatalf("service upsert embedding: %v", err)
 	}
-	if err := embeddings.Upsert(ctx, nodeID, vec768(0.3)); err != nil {
+	if err := embeddings.Upsert(ctx, nodeID, "", vec768(0.3)); err != nil {
 		t.Fatalf("service update embedding: %v", err)
 	}
 	if err := embeddings.Delete(ctx, nodeID); err != nil {
@@ -549,10 +950,10 @@ func TestEmbeddingGrants(t *testing.T) {
 	// Both seams retire on read as different roles, so DELETE has to reach each
 	// one or the repair only logs.
 	orphanID := testutil.NewID(t)
-	if err := embeddings.Upsert(ctx, orphanID, vec768(0.4)); err != nil {
+	if err := embeddings.Upsert(ctx, orphanID, "", vec768(0.4)); err != nil {
 		t.Fatalf("seed orphan embedding: %v", err)
 	}
-	if err := store.NewEmbeddingStore(orchestrator).Delete(ctx, orphanID); err != nil {
+	if err := store.NewEmbeddingStore(orchestrator, 2).Delete(ctx, orphanID); err != nil {
 		t.Fatalf("orchestrator delete embedding: %v", err)
 	}
 	if err := orchestrator.QueryRow(ctx,
@@ -572,5 +973,93 @@ func TestEmbeddingGrants(t *testing.T) {
 		pgvector.NewVector(vec768(0.5)), nodeID,
 	); err == nil {
 		t.Fatal("expected orchestrator UPDATE on embeddings to be denied")
+	}
+}
+
+// TestSimilaritySearchScoredCarriesDistances pins the scored variant on the axis
+// the plain one cannot cover: the distance that ranked each hit. A consumer that
+// weights knowledge by how close it is reads that number directly, so a wrong
+// column or a wrong ordering would silently mis-weight every prior derived from it.
+//
+// The goal-scoped arm is asserted too, because that branch binds the goal against a
+// uuid column — the one shape that fails at bind time rather than returning a wrong
+// answer, and therefore the one a fake collaborator can never catch.
+func TestSimilaritySearchScoredCarriesDistances(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	testutil.TruncateEmbeddings(t, ctx, cfg)
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	embeddings := store.NewEmbeddingStore(p, 2)
+
+	goalID := testutil.NewID(t)
+	nearID, midID := testutil.NewID(t), testutil.NewID(t)
+	if err := embeddings.Upsert(ctx, nearID, goalID, oneHot(map[int]float32{0: 1})); err != nil {
+		t.Fatalf("upsert near: %v", err)
+	}
+	if err := embeddings.Upsert(ctx, midID, goalID, oneHot(map[int]float32{0: 1, 1: 1})); err != nil {
+		t.Fatalf("upsert mid: %v", err)
+	}
+
+	query := oneHot(map[int]float32{0: 1})
+	scored, err := embeddings.SimilaritySearchScored(ctx, query, 10, store.SearchScope{GoalID: goalID})
+	if err != nil {
+		t.Fatalf("scored similarity search: %v", err)
+	}
+	if len(scored) != 2 {
+		t.Fatalf("scored search returned %d hits, want both goal rows", len(scored))
+	}
+	if scored[0].NodeID != nearID || scored[1].NodeID != midID {
+		t.Fatalf("hits must be ordered by distance, got %+v", scored)
+	}
+	// An identical direction is cosine distance 0; a 45-degree one is 1 - cos(45°).
+	if scored[0].Distance > 1e-6 {
+		t.Fatalf("an exact-direction match must have distance ~0, got %v", scored[0].Distance)
+	}
+	if scored[1].Distance <= scored[0].Distance || scored[1].Distance > 1 {
+		t.Fatalf("a 45-degree hit must sit between the exact match and orthogonal, got %v", scored[1].Distance)
+	}
+}
+
+// TestSimilaritySearchScoredHonoursFloorAndLimit: the scored variant is the one
+// implementation behind both entry points, so the floor and the k cap it enforces
+// are what the unscored caller gets too.
+func TestSimilaritySearchScoredHonoursFloorAndLimit(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	testutil.TruncateEmbeddings(t, ctx, cfg)
+	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
+	embeddings := store.NewEmbeddingStore(p, 0.5)
+
+	nearID, midID, farID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	if err := embeddings.Upsert(ctx, nearID, "", oneHot(map[int]float32{0: 1})); err != nil {
+		t.Fatalf("upsert near: %v", err)
+	}
+	if err := embeddings.Upsert(ctx, midID, "", oneHot(map[int]float32{0: 1, 1: 1})); err != nil {
+		t.Fatalf("upsert mid: %v", err)
+	}
+	if err := embeddings.Upsert(ctx, farID, "", oneHot(map[int]float32{1: 1})); err != nil {
+		t.Fatalf("upsert far: %v", err)
+	}
+
+	query := oneHot(map[int]float32{0: 1})
+	scored, err := embeddings.SimilaritySearchScored(ctx, query, 10, store.SearchScope{CrossGoal: true})
+	if err != nil {
+		t.Fatalf("scored similarity search: %v", err)
+	}
+	for _, ref := range scored {
+		if ref.NodeID == farID {
+			t.Fatalf("the floor must drop the orthogonal row, got %+v", scored)
+		}
+		if ref.Distance > 0.5 {
+			t.Fatalf("a hit beyond the floor was returned: %+v", ref)
+		}
+	}
+
+	capped, err := embeddings.SimilaritySearchScored(ctx, query, 1, store.SearchScope{CrossGoal: true})
+	if err != nil {
+		t.Fatalf("capped scored search: %v", err)
+	}
+	if len(capped) != 1 || capped[0].NodeID != nearID {
+		t.Fatalf("k must cap the scored result at the nearest hit, got %+v", capped)
 	}
 }

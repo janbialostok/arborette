@@ -42,6 +42,14 @@ func cmp(op string, left, right domain.Expression) domain.Expression {
 	return domain.Expression{Kind: domain.ComparisonKind, Op: op, Left: ptrExpr(left), Right: ptrExpr(right)}
 }
 
+func lagExpr(inner domain.Expression, offset int) domain.Expression {
+	return domain.Expression{Kind: domain.LagKind, Inner: ptrExpr(inner), Offset: offset}
+}
+
+func trailingExpr(agg string, inner domain.Expression, size int) domain.Expression {
+	return domain.Expression{Kind: domain.TrailingAggregateKind, WindowAgg: agg, Inner: ptrExpr(inner), WindowSize: size}
+}
+
 func target(field string) domain.Target {
 	return domain.Target{Field: field, Direction: domain.Maximize}
 }
@@ -440,6 +448,136 @@ func TestCompileFiltersRejections(t *testing.T) {
 				t.Fatalf("error = %v, want %v", err, c.want)
 			}
 		})
+	}
+}
+
+// TestCompileWindowedObjective proves a windowed value expression compiles to the
+// two-level subquery: the window over each entity's full history in the inner
+// select, the objective aggregate plus intervention filters and support count in
+// the outer select. The frame bound is a range-checked integer literal (never a
+// bound param, which is driver-dependent), while the intervention threshold binds
+// as ?, and the entity/time columns are schema-resolved and quoted.
+func TestCompileWindowedObjective(t *testing.T) {
+	// A velocity signal: amount over the account's trailing 5-row average amount.
+	velocity := domain.Expression{Kind: domain.ArithmeticKind, Op: "/",
+		Left:  ptrExpr(col("amount")),
+		Right: ptrExpr(trailingExpr("avg", col("amount"), 5))}
+	filters := []domain.Constraint{{Field: "qty", Op: domain.GreaterThan, Value: 1}}
+
+	sql, args, err := compileObjectiveCounted(testTableFn, testCols(), "avg", velocity, filters, true, "name", "created")
+	if err != nil {
+		t.Fatalf("windowed compile: %v", err)
+	}
+	if !strings.Contains(sql, `OVER (PARTITION BY "name" ORDER BY "created", `) ||
+		!strings.Contains(sql, `ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING)`) {
+		t.Fatalf("window fragment missing or malformed: %q", sql)
+	}
+	// The ORDER BY must carry EVERY other schema column after the time column, so the
+	// order is total up to fully-identical rows — a partial tiebreaker leaves tied
+	// rows slottable differently across re-executions. Pinning the exact, complete
+	// list also discriminates the time column not being duplicated. testCols() order
+	// is [amount, qty, price, name, created, flag] with time=created.
+	if !strings.Contains(sql, `ORDER BY "created", "amount", "qty", "price", "name", "flag"`) {
+		t.Fatalf("window ORDER BY must append every other column as a deterministic tiebreaker: %q", sql)
+	}
+	// The window is computed in an inner select over the raw table; the intervention
+	// filter and support count apply in the outer select over that subquery.
+	if !strings.Contains(sql, "FROM (SELECT *, ") {
+		t.Fatalf("windowed objective must use the inner-select subquery form: %q", sql)
+	}
+	aliasIdx := strings.Index(sql, " AS ")
+	whereIdx := strings.Index(sql, `WHERE "qty" > ?`)
+	if aliasIdx < 0 || whereIdx < 0 || whereIdx < aliasIdx {
+		t.Fatalf("the filter must apply in the outer select, after the aliased window: %q", sql)
+	}
+	if !strings.Contains(sql, "CAST(count(*) AS BIGINT)") {
+		t.Fatalf("support count must ride the outer select: %q", sql)
+	}
+	// Only the intervention threshold is bound; the frame size is a literal, not a ?.
+	if strings.Count(sql, "?") != 1 {
+		t.Fatalf("expected exactly one bound placeholder (the filter threshold): %q", sql)
+	}
+	if len(args) != 1 || args[0].(float64) != 1 {
+		t.Fatalf("only the filter threshold binds as an arg: %v", args)
+	}
+}
+
+// TestCompileWindowedLagBindsOffset proves a lag window compiles with its offset
+// bound as a ? param (a function argument, which binds fine) and its entity/time
+// columns quoted.
+func TestCompileWindowedLagBindsOffset(t *testing.T) {
+	// A prior-value indicator: amount greater than its value 3 rows back.
+	rising := cmp(">", col("amount"), lagExpr(col("amount"), 3))
+	sql, args, err := compileObjectiveCounted(testTableFn, testCols(), "avg", rising, nil, false, "name", "created")
+	if err != nil {
+		t.Fatalf("lag compile: %v", err)
+	}
+	if !strings.Contains(sql, `lag("amount", ?) OVER (PARTITION BY "name" ORDER BY "created", `) {
+		t.Fatalf("lag fragment missing or malformed: %q", sql)
+	}
+	if len(args) != 1 || args[0].(int) != 3 {
+		t.Fatalf("lag offset must bind as an arg, got %v", args)
+	}
+}
+
+// TestCompileWindowRejections is the threat pass on the widened window surface: a
+// malicious entity/time column is rejected by schema resolution (never quoted into
+// SQL), a non-allowlisted window aggregate is rejected, and a windowed expression
+// without bindings is rejected at compile.
+func TestCompileWindowRejections(t *testing.T) {
+	trailing := trailingExpr("avg", col("amount"), 5)
+	cases := []struct {
+		name       string
+		expr       domain.Expression
+		entityKey  string
+		timeColumn string
+		want       error
+	}{
+		{"injection entity column", trailing, `x"); DROP TABLE users; --`, "created", errUnknownField},
+		{"injection time column", trailing, "name", `x"); DROP TABLE users; --`, errUnknownField},
+		{"unknown entity column", trailing, "ghost", "created", errUnknownField},
+		{"non-allowlisted window aggregate", trailingExpr("median", col("amount"), 5), "name", "created", errUnknownAggregation},
+		{"missing bindings", trailing, "", "", errTypeIncompatible},
+		{"trailing over non-numeric inner", trailingExpr("avg", col("name"), 5), "name", "created", errTypeIncompatible},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sql, _, err := compileObjectiveCounted(testTableFn, testCols(), "avg", c.expr, nil, false, c.entityKey, c.timeColumn)
+			if !errors.Is(err, c.want) {
+				t.Fatalf("error = %v, want %v", err, c.want)
+			}
+			// A rejected request emits no SQL, so no malicious identifier text can leak.
+			if strings.Contains(sql, "DROP TABLE") {
+				t.Fatalf("malicious identifier text reached the SQL string: %q", sql)
+			}
+		})
+	}
+}
+
+// TestStaticValidateWindowShape proves the schema-independent guards reject a
+// nested window and an out-of-range offset/size before staging, mapping to the
+// compile-error sentinel the 400 status arm already covers.
+func TestStaticValidateWindowShape(t *testing.T) {
+	cases := []struct {
+		name string
+		expr domain.Expression
+	}{
+		{"nested window", trailingExpr("avg", lagExpr(col("amount"), 1), 5)},
+		{"zero offset", lagExpr(col("amount"), 0)},
+		{"over-cap window size", trailingExpr("avg", col("amount"), domain.MaxWindowSize+1)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := staticValidate("avg", &c.expr, nil); !errors.Is(err, errTypeIncompatible) {
+				t.Fatalf("error = %v, want errTypeIncompatible", err)
+			}
+		})
+	}
+	// A valid windowed expression passes the schema-independent guards; bindings are
+	// checked elsewhere (the execute handler and the compiler's window clause).
+	valid := trailingExpr("avg", col("amount"), 5)
+	if err := staticValidate("avg", &valid, nil); err != nil {
+		t.Fatalf("valid windowed expression must pass static validation: %v", err)
 	}
 }
 

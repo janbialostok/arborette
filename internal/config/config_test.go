@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -167,5 +168,141 @@ func TestMaxPublicationsFallback(t *testing.T) {
 	}
 	if cfg.SleepCycle.MaxPublications != 20 {
 		t.Fatalf("unparseable = %v, want the 20 default", cfg.SleepCycle.MaxPublications)
+	}
+}
+
+// TestInternalAuthTokenIsOneSecret pins that the service verifying the internal
+// shared secret and the job presenting it read the same variable, and that it
+// takes no default. Giving either side a name of its own compiles and passes
+// every other test, and the mismatch it produces is silent — see the field docs
+// in config.go for what silently stops happening.
+func TestInternalAuthTokenIsOneSecret(t *testing.T) {
+	setPostgresEnv(t)
+
+	// Cleared rather than assumed absent: the integration target sources .env,
+	// where an operator who minted a token has one set.
+	t.Setenv("INTERNAL_AUTH_TOKEN", "")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Orchestrator.InternalAuthToken != "" || cfg.SleepCycle.InternalAuthToken != "" {
+		t.Fatalf("unset = %q/%q, want empty on both sides (a secret takes no default)",
+			cfg.Orchestrator.InternalAuthToken, cfg.SleepCycle.InternalAuthToken)
+	}
+
+	t.Setenv("INTERNAL_AUTH_TOKEN", "s3cret")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Orchestrator.InternalAuthToken != "s3cret" || cfg.SleepCycle.InternalAuthToken != "s3cret" ||
+		cfg.Sandbox.InternalAuthToken != "s3cret" {
+		t.Fatalf("orchestrator = %q, sleepcycle = %q, sandbox = %q, want all three to read INTERNAL_AUTH_TOKEN",
+			cfg.Orchestrator.InternalAuthToken, cfg.SleepCycle.InternalAuthToken, cfg.Sandbox.InternalAuthToken)
+	}
+}
+
+// TestSandboxCacheAndLimitDefaults pins the staging-cache and boundary knobs' env
+// wiring and defaults, so a typo in an env name would fall back invisibly.
+func TestSandboxCacheAndLimitDefaults(t *testing.T) {
+	setPostgresEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Sandbox.StageCacheDir != "" {
+		t.Fatalf("StageCacheDir unset = %q, want empty (boot-time temp dir)", cfg.Sandbox.StageCacheDir)
+	}
+	if cfg.Sandbox.StageCacheMaxBytes != 2<<30 {
+		t.Fatalf("StageCacheMaxBytes = %d, want the 2GiB default", cfg.Sandbox.StageCacheMaxBytes)
+	}
+	if cfg.Sandbox.ExecuteConcurrency != 8 {
+		t.Fatalf("ExecuteConcurrency = %d, want the 8 default", cfg.Sandbox.ExecuteConcurrency)
+	}
+	if cfg.Sandbox.MaxBodyBytes != 1<<20 {
+		t.Fatalf("MaxBodyBytes = %d, want the 1MiB default", cfg.Sandbox.MaxBodyBytes)
+	}
+
+	t.Setenv("SANDBOX_STAGE_CACHE_DIR", "/var/cache/arborette")
+	t.Setenv("SANDBOX_STAGE_CACHE_MAX_BYTES", "0")
+	t.Setenv("SANDBOX_EXECUTE_CONCURRENCY", "4")
+	t.Setenv("SANDBOX_MAX_BODY_BYTES", "2048")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Sandbox.StageCacheDir != "/var/cache/arborette" {
+		t.Fatalf("StageCacheDir override = %q", cfg.Sandbox.StageCacheDir)
+	}
+	if cfg.Sandbox.StageCacheMaxBytes != 0 {
+		t.Fatalf("StageCacheMaxBytes override = %d, want 0 (cache disabled)", cfg.Sandbox.StageCacheMaxBytes)
+	}
+	if cfg.Sandbox.ExecuteConcurrency != 4 {
+		t.Fatalf("ExecuteConcurrency override = %d, want 4", cfg.Sandbox.ExecuteConcurrency)
+	}
+	if cfg.Sandbox.MaxBodyBytes != 2048 {
+		t.Fatalf("MaxBodyBytes override = %d, want 2048", cfg.Sandbox.MaxBodyBytes)
+	}
+}
+
+// TestSleepCyclePolicyKnobs pins the env wiring for the knowledge-guided policy: a
+// typo in a name falls back to the default invisibly.
+//
+// Two matter beyond the pattern. The default policy is what the calibration
+// regression justifies, so a silent revert to the beam must fail here. And the
+// cross-goal knob is a kill switch — a typo'd name means an operator's attempt to
+// narrow retrieval does nothing at all, with no error to notice.
+func TestSleepCyclePolicyKnobs(t *testing.T) {
+	setPostgresEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SleepCycle.Policy != "uct" {
+		t.Fatalf("default policy = %q, want the knowledge-guided default", cfg.SleepCycle.Policy)
+	}
+	if cfg.SleepCycle.SchemaAtoms {
+		t.Fatalf("schema atoms must be off by default, got %v", cfg.SleepCycle.SchemaAtoms)
+	}
+	if !cfg.SleepCycle.CrossGoalGrounding {
+		t.Fatalf("cross-goal grounding must be on by default, got %v", cfg.SleepCycle.CrossGoalGrounding)
+	}
+	if cfg.SleepCycle.UCTExploration != math.Sqrt2 {
+		t.Fatalf("default exploration = %v, want sqrt(2)", cfg.SleepCycle.UCTExploration)
+	}
+	if cfg.SleepCycle.CausalMultiplierScale != 1.0 {
+		t.Fatalf("default causal scale = %v, want 1.0", cfg.SleepCycle.CausalMultiplierScale)
+	}
+	if cfg.SleepCycle.GroundingFraction != 0.3 {
+		t.Fatalf("default grounding fraction = %v, want 0.3", cfg.SleepCycle.GroundingFraction)
+	}
+	if cfg.SleepCycle.RetrievalK != 8 {
+		t.Fatalf("default retrieval k = %d, want 8", cfg.SleepCycle.RetrievalK)
+	}
+	if cfg.SleepCycle.QuantileBins != 3 {
+		t.Fatalf("default quantile bins = %d, want 3", cfg.SleepCycle.QuantileBins)
+	}
+
+	t.Setenv("SLEEPCYCLE_POLICY", "beam")
+	t.Setenv("SLEEPCYCLE_SEARCH_SCHEMA_ATOMS", "true")
+	t.Setenv("SLEEPCYCLE_SEARCH_UCT_EXPLORATION", "2.5")
+	t.Setenv("SLEEPCYCLE_SEARCH_CAUSAL_MULTIPLIER_SCALE", "0")
+	t.Setenv("SLEEPCYCLE_SEARCH_GROUNDING_FRACTION", "0.75")
+	t.Setenv("SLEEPCYCLE_SEARCH_RETRIEVAL_K", "12")
+	t.Setenv("SLEEPCYCLE_SEARCH_QUANTILE_BINS", "5")
+	t.Setenv("SLEEPCYCLE_SEARCH_CROSS_GOAL_GROUNDING", "false")
+
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	got := cfg.SleepCycle
+	if got.Policy != "beam" || !got.SchemaAtoms || got.UCTExploration != 2.5 ||
+		got.CausalMultiplierScale != 0 || got.GroundingFraction != 0.75 ||
+		got.RetrievalK != 12 || got.QuantileBins != 5 || got.CrossGoalGrounding {
+		t.Fatalf("every knob must read from its own variable, got %+v", got)
 	}
 }

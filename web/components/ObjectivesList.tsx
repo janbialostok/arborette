@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { errorMessage, listGoals, type GoalListItem } from "@/lib/orchestrator";
+import { formatTimestamp } from "@/lib/format";
 import {
   Badge,
   Callout,
@@ -107,7 +108,7 @@ function ObjectiveRow({ goal }: { goal: GoalListItem }) {
         </span>
       )}
       <span className="font-mono text-[11px] text-faint">
-        {formatCreatedAt(goal.created_at)}
+        {formatTimestamp(goal.created_at)}
       </span>
     </Link>
   );
@@ -125,9 +126,4 @@ function StatusBadge({ status }: { status: string }) {
       {status || "unknown"}
     </Badge>
   );
-}
-
-function formatCreatedAt(iso: string): string {
-  const date = new Date(iso);
-  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString();
 }

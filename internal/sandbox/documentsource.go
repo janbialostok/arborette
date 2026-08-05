@@ -24,19 +24,22 @@ const documentSampleMaxRunes = 4000
 
 // DocumentSource reads a single document object (a PDF today) out of the object
 // store and answers introspection over its extracted per-page text. It mirrors
-// FileSource's primitive-arg constructor and stateless-per-request staging, but
-// carries no DuckDB engine: a document has no tabular schema, only ordered
-// per-page plain text that both the intake sample and provenance search read.
+// FileSource's primitive-arg constructor, but carries no DuckDB engine: a document
+// has no tabular schema, only ordered per-page plain text that both the intake
+// sample and provenance search read. Like FileSource it is stateless in semantics;
+// the optional cache is a pure performance layer over the immutable ref (a PDF
+// caches its raw staged bytes, no conversion). A nil cache stages per-request.
 type DocumentSource struct {
 	objects        *objectstore.Client
+	cache          *StageCache
 	dataSourceRef  string
 	maxObjectBytes int64
 }
 
-// NewDocumentSource builds a DocumentSource for one object-store ref.
-// maxObjectBytes caps the staged copy.
-func NewDocumentSource(objects *objectstore.Client, dataSourceRef string, maxObjectBytes int64) *DocumentSource {
-	return &DocumentSource{objects: objects, dataSourceRef: dataSourceRef, maxObjectBytes: maxObjectBytes}
+// NewDocumentSource builds a DocumentSource for one object-store ref. cache is
+// optional (nil ⇒ per-request staging). maxObjectBytes caps the staged copy.
+func NewDocumentSource(objects *objectstore.Client, cache *StageCache, dataSourceRef string, maxObjectBytes int64) *DocumentSource {
+	return &DocumentSource{objects: objects, cache: cache, dataSourceRef: dataSourceRef, maxObjectBytes: maxObjectBytes}
 }
 
 var _ datasource.DataSource = (*DocumentSource)(nil)
@@ -70,11 +73,45 @@ func (s *DocumentSource) Pages(ctx context.Context) ([]string, error) {
 	}
 	defer os.RemoveAll(dir)
 
-	stagedPath := filepath.Join(dir, "source.pdf")
-	if err := stageBoundedObject(ctx, s.objects, s.dataSourceRef, stagedPath, s.maxObjectBytes); err != nil {
+	stagedPath, release, err := s.stageDocument(ctx, dir)
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	return pdfPages(stagedPath)
+}
+
+// stageDocument resolves the staged PDF path from the cache when configured, else a
+// fresh per-request download into dir. The returned release is always non-nil (a
+// no-op for the per-request and bypass paths) so the caller defers it uniformly.
+// The cached artifact is the raw PDF bytes -- pdf.Open reads by content, so the
+// extension-less cache path parses identically to a .pdf-suffixed temp file.
+func (s *DocumentSource) stageDocument(ctx context.Context, dir string) (string, func(), error) {
+	// perRequest stages the raw PDF into the request's own temp dir -- the fallback
+	// when the cache is disabled or bypasses.
+	perRequest := func() (string, func(), error) {
+		staged := filepath.Join(dir, "source.pdf")
+		if err := stageBoundedObject(ctx, s.objects, s.dataSourceRef, staged, s.maxObjectBytes); err != nil {
+			return "", nil, err
+		}
+		return staged, func() {}, nil
+	}
+
+	if s.cache == nil {
+		return perRequest()
+	}
+
+	fill := func(ctx context.Context, _, dest string) error {
+		return stageBoundedObject(ctx, s.objects, s.dataSourceRef, dest, s.maxObjectBytes)
+	}
+	cachePath, release, err := s.cache.Acquire(ctx, s.dataSourceRef, s.maxObjectBytes, fill)
+	if errors.Is(err, errCacheBypass) {
+		return perRequest()
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	return cachePath, release, nil
 }
 
 // pdfPages reads a staged PDF into ordered per-page plain text. Fonts are cached

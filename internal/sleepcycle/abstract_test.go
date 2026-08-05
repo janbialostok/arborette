@@ -6,6 +6,7 @@ import (
 
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/sandboxclient"
+	"github.com/arborette/arborette/internal/store"
 )
 
 // leakyHarness scripts a winning run whose schema exposes a column name the
@@ -153,11 +154,12 @@ func TestGetMetaHeuristicThreeWayBranch(t *testing.T) {
 	})
 }
 
-// TestResumePassSettlesPendingNodes: a node left flagged by a mid-write crash is
-// finished on the next run, whichever goal triggered it.
-func TestResumePassSettlesPendingNodes(t *testing.T) {
+// TestReconcilePassSettlesPendingNodes: a node left flagged by a mid-write crash
+// (no embedding row) is finished on the next run, whichever goal triggered it,
+// and the embed carries the node's own goal so the healed row is goal-visible.
+func TestReconcilePassSettlesPendingNodes(t *testing.T) {
 	h := newHarness(t, testConfig())
-	h.repo.pending = []domain.MetaHeuristic{{ID: "mh-orphan", Definition: "left behind", EmbeddingPending: true}}
+	h.repo.metaHeuristics = []domain.MetaHeuristic{{ID: "mh-orphan", Definition: "left behind", GoalID: "g-orphan", EmbeddingPending: true}}
 
 	if err := h.run(t); err != nil {
 		t.Fatalf("run: %v", err)
@@ -165,29 +167,104 @@ func TestResumePassSettlesPendingNodes(t *testing.T) {
 	if len(h.embeddings.upserted) != 1 || h.embeddings.upserted[0] != "mh-orphan" {
 		t.Fatalf("the pending node must be re-embedded: %+v", h.embeddings.upserted)
 	}
+	if h.embeddings.upsertGoal["mh-orphan"] != "g-orphan" {
+		t.Fatalf("the re-embed must carry the node's goal: %+v", h.embeddings.upsertGoal)
+	}
 	if len(h.repo.cleared) != 1 || h.repo.cleared[0] != "mh-orphan" {
 		t.Fatalf("the pending flag must be cleared after the upsert: %+v", h.repo.cleared)
 	}
 	if h.claude.abstractCalls != 0 {
-		t.Fatal("the resume pass must not re-call Claude")
+		t.Fatal("the reconcile pass must not re-call Claude")
+	}
+	rec, ok := h.audits.find("sleepcycle_reconcile")
+	if !ok {
+		t.Fatalf("expected a reconcile summary audit: %+v", h.audits.records)
+	}
+	if ids, _ := rec.detail["reembedded"].([]string); len(ids) != 1 || ids[0] != "mh-orphan" {
+		t.Fatalf("reconcile summary must list the re-embedded id, got %+v", rec.detail["reembedded"])
+	}
+}
+
+// TestReconcileRepairsLegacyGoalScope: a node the graph now scopes to a goal but
+// whose already-embedded row still carries no goal is goal-repaired in place --
+// no re-embed, since the vector is unchanged.
+func TestReconcileRepairsLegacyGoalScope(t *testing.T) {
+	h := newHarness(t, testConfig())
+	h.repo.metaHeuristics = []domain.MetaHeuristic{{ID: "mh-legacy", Definition: "embedded already", GoalID: "g-heal"}}
+	h.embeddings.refs = []store.NodeRef{{NodeID: "mh-legacy", GoalID: ""}}
+
+	if err := h.run(t); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(h.embeddings.upserted) != 0 {
+		t.Fatalf("a goal-repair must not re-embed: %+v", h.embeddings.upserted)
+	}
+	if h.embeddings.goalRepaired["mh-legacy"] != "g-heal" {
+		t.Fatalf("the legacy row must be goal-repaired to the node's goal: %+v", h.embeddings.goalRepaired)
+	}
+	rec, ok := h.audits.find("sleepcycle_reconcile")
+	if !ok {
+		t.Fatalf("expected a reconcile summary audit: %+v", h.audits.records)
+	}
+	if ids, _ := rec.detail["goal_repaired"].([]string); len(ids) != 1 || ids[0] != "mh-legacy" {
+		t.Fatalf("reconcile summary must list the goal-repaired id, got %+v", rec.detail["goal_repaired"])
+	}
+}
+
+// TestReconcileGoalRepairFailureIsNonTerminal: a failed SetGoalID during the
+// goal-repair arm logs and audits but never aborts the run, and does not fall
+// through to a re-embed (the vector is unchanged).
+func TestReconcileGoalRepairFailureIsNonTerminal(t *testing.T) {
+	h := newHarness(t, testConfig())
+	h.repo.metaHeuristics = []domain.MetaHeuristic{{ID: "mh-legacy", Definition: "embedded already", GoalID: "g-heal"}}
+	h.embeddings.refs = []store.NodeRef{{NodeID: "mh-legacy", GoalID: ""}}
+	h.embeddings.setGoalErr = errors.New("pgvector down")
+
+	if err := h.run(t); err != nil {
+		t.Fatalf("a goal-repair failure must be non-terminal: %v", err)
+	}
+	if len(h.embeddings.upserted) != 0 {
+		t.Fatalf("a failed goal-repair must not fall through to a re-embed: %+v", h.embeddings.upserted)
+	}
+	if _, ok := h.audits.find("sleepcycle_reconcile_failure"); !ok {
+		t.Fatalf("expected a reconcile-failure audit: %+v", h.audits.records)
+	}
+}
+
+// TestReconcileListNodeRefsFailureIsNonTerminal: a wedged ListNodeRefs aborts the
+// reconcile diff before any write but never sinks the run.
+func TestReconcileListNodeRefsFailureIsNonTerminal(t *testing.T) {
+	h := newHarness(t, testConfig())
+	h.repo.metaHeuristics = []domain.MetaHeuristic{{ID: "mh-1", Definition: "x", EmbeddingPending: true}}
+	h.embeddings.refsErr = errors.New("pgvector down")
+
+	if err := h.run(t); err != nil {
+		t.Fatalf("a ListNodeRefs failure must be non-terminal: %v", err)
+	}
+	if len(h.embeddings.upserted) != 0 {
+		t.Fatalf("reconcile must abort before any re-embed when ListNodeRefs fails: %+v", h.embeddings.upserted)
+	}
+	if _, ok := h.audits.find("sleepcycle_reconcile_failure"); !ok {
+		t.Fatalf("expected a reconcile-failure audit: %+v", h.audits.records)
 	}
 }
 
 // TestEmbedOrderSurvivesAFailedUpsert: the flag is cleared only after pgvector
-// accepts the vector, so a failed upsert leaves the node retryable.
+// accepts the vector, so a failed upsert leaves the node retryable, and the
+// reconcile fault is non-terminal.
 func TestEmbedOrderSurvivesAFailedUpsert(t *testing.T) {
 	h := newHarness(t, testConfig())
-	h.repo.pending = []domain.MetaHeuristic{{ID: "mh-orphan", Definition: "left behind", EmbeddingPending: true}}
+	h.repo.metaHeuristics = []domain.MetaHeuristic{{ID: "mh-orphan", Definition: "left behind", EmbeddingPending: true}}
 	h.embeddings.err = errors.New("pgvector down")
 
 	if err := h.run(t); err != nil {
-		t.Fatalf("a resume failure must be non-terminal: %v", err)
+		t.Fatalf("a reconcile failure must be non-terminal: %v", err)
 	}
 	if len(h.repo.cleared) != 0 {
 		t.Fatal("the pending flag must not be cleared when the vector write failed")
 	}
-	if _, ok := h.audits.find("sleepcycle_resume_failure"); !ok {
-		t.Fatalf("expected a resume-failure audit: %+v", h.audits.records)
+	if _, ok := h.audits.find("sleepcycle_reconcile_failure"); !ok {
+		t.Fatalf("expected a reconcile-failure audit: %+v", h.audits.records)
 	}
 }
 

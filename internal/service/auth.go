@@ -41,9 +41,7 @@ func BearerAuth(token string, next http.Handler) http.Handler {
 			// RFC 9110 requires a challenge on a 401, and without it a client
 			// cannot tell "needs a token" from "forbidden".
 			w.Header().Set("WWW-Authenticate", "Bearer")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"error":"unauthorized"}`))
+			WriteErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		next.ServeHTTP(w, r)
