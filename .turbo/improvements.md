@@ -309,9 +309,10 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 
 - **Type**: plan
 - **Category**: refactor
-- **Where**: `web/components/{ui.tsx,VerificationQueue.tsx,HeuristicBrowser.tsx,ObjectivesList.tsx,GoalForm.tsx}`
-- **Why**: Five patterns are now copied rather than shared: the segmented control, the text-input class string (five call sites, including the focus-ring tokens), the master/detail list scaffold with its loading/empty/placeholder panels, the fetch-on-mount `cancelled`-guard effect (five instances), and the status badge. The badge is the one with teeth — two components render the same `domain.VerificationStatus` under divergent tone maps, so a `verified` outcome shows neutral on one screen and positive on another. Deferred deliberately from the web UI change as its own refactor, since it reverses an established local-helper convention across files that change did not otherwise touch.
-- **Noted**: 2026-07-30
+- **Where**: `web/components/{ui.tsx,VerificationQueue.tsx,HeuristicBrowser.tsx,ObjectivesList.tsx,GoalForm.tsx,AgentChat.tsx,CausalGraph.tsx,CausalVerifications.tsx}`
+- **Why**: Five patterns are copied rather than shared: the segmented control, the text-input/select class string, the master/detail list scaffold with its loading/empty/placeholder panels, the fetch-on-mount `cancelled`-guard effect, and the status badge. The badge is the one with teeth — components render the same status under divergent tone maps, so one outcome can show neutral on one screen and positive on another. Deferred deliberately as its own refactor, since it reverses an established local-helper convention across files.
+- **Field class string, now at seven call sites** (the causal surfaces added the seventh) with its cost demonstrated: a Tailwind v4 `outline-none` → `outline-hidden` sweep had to touch six by hand. Extract a size-free `FIELD_BASE` constant holding only the verbatim-identical part (`rounded-lg border border-line bg-surface text-fg outline-hidden transition-colors focus:border-signal/60 focus:ring-2 focus:ring-signal/20`), consumed as `cn(FIELD_BASE, …)` with padding/width/placeholder left per call site — mechanical, zero visual change. Avoid an `Input`/`Select` component with a size prop: the seven sites carry five distinct padding combinations across three element kinds, so a size enum deliberately changes spacing at some of them, and `cn` has no tailwind-merge, so a base carrying padding resolves conflicts by stylesheet order rather than class order.
+- **Noted**: 2026-07-30, field-string detail added 2026-08-05
 
 ### Make the sleep-cycle trigger real in local/dev
 
@@ -504,3 +505,19 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 - **Where**: `internal/sleepcycle/policy.go` (`selectPolicy`), with call sites in `worker.go`, `grounding_test.go`, `knowledge_run_test.go`
 - **Why**: Nine positional parameters, two of which carry the same input (`findings`, and `findingAtoms` which is `buildAtoms(findings)`), one consulted for a single field (`obj.Direction`), and a `target` that already holds the goal id and data-source ref — so the callee re-splits what the caller joined. The cost is at the call sites: the production call runs past 120 columns and the test calls are positional soup. The package already has the model in `searchTarget` ("run-invariant addressing"), so a sibling `searchInputs` built once in `Run` and passed as `(ctx, target, inputs)` fixes it; a small `policyChoice{policy, atoms, skipReason}` return would additionally make the documented "a nil policy always comes with a reason" invariant expressible in the type. Raised in two independent review rounds and skipped both times as shape rather than defect — the semantic ambiguity in the middle return value was fixed separately. Same class as the `NewServer` positional-parameter entry above, different package and remedy.
 - **Noted**: 2026-08-04
+
+### Annotate causal-graph columns so an analyst can orient by them
+
+- **Type**: plan
+- **Category**: feature
+- **Where**: `internal/orchestrator/causalgraph.go` (`causalColumnDTO`, `toCausalGraphDTO`), consumed by `web/components/CausalGraph.tsx` (`Node`, edge list) and `web/lib/causal.ts` (`layoutGraph`)
+- **Why**: The graph endpoint exposes only `{name, kind}` per column, so the diagram can say nothing about a column beyond its name — and the node the objective actually measures is indistinguishable from its confounders. On an opaque schema (`A`, `X`, `Z` in the confounder fixture, but equally a warehouse table of coded columns) the analyst has nothing to orient by. Fix: carry the objective's columns (and ideally a short per-column description, which registration's schema introspection already has in hand) on the graph DTO, then mark the outcome node and annotate the rest. Raised while previewing the causal tab and deliberately deferred: the surfaces that would show it are web-only, the data to show is not.
+- **Noted**: 2026-08-04
+
+### Auto-promoted verifications can complete without persisting a record
+
+- **Type**: direct
+- **Category**: reliability
+- **Where**: `internal/verifier/verify.go` (`VerifyOne`'s `ErrInflightCapReached` arm), `internal/store/causalverifications.go` (`inflightSlots`), with the knob pair in `internal/config/config.go` (`ORCHESTRATOR_AUTOPROMOTE_TOP_N` 5 vs `VERIFIER_INFLIGHT_CAP` 4)
+- **Why**: On a fresh goal, auto-promotion dispatched 5 verifications and only 3 rows landed in `causal_verifications`. The two missing ones logged `started` and `complete` seconds *before* inline discovery finished, and left no row, no audit line and no error behind. The shipped defaults explain it exactly: `TOP_N` is 5, `VERIFIER_INFLIGHT_CAP` is 4, and a budgeted dispatch is held one slot below the cap (`inflightSlots`) to reserve a slot for an analyst — so three promotions can hold slots, the first of them running discovery inline for far longer than the others wait, and the remaining two are refused with `ErrInflightCapReached`. That refusal is invisible everywhere an operator would look: `VerifyOne` publishes a `verification_rejected` frame and returns nil, `PublishLive` drops the frame because no client is subscribed to a goal whose run just ended, and nothing is logged or audited. The analyst-visible symptom is a run that promotes N findings while the Causal tab shows fewer, with nothing explaining the gap. The fix is observability rather than a bigger cap — log or audit the refusal — plus a decision on whether promoting more findings than the cap can ever run is worth the wasted dispatches. Observed while smoke-testing the causal web surfaces; the UI matched the API, so this is orchestrator/verifier-side.
+- **Noted**: 2026-08-05

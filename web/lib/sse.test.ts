@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { consumeStream } from "./sse";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { consumeRun, consumeStream } from "./sse";
 import type { ChatFrame, OrchestratorEvent } from "./orchestrator";
 
 // Build a ReadableStream that emits each string as its own Uint8Array chunk, so
@@ -129,5 +129,124 @@ describe("consumeStream · chat frames", () => {
       'data: {"type":"chat_text","text":"Looking at "}\n\n',
     ]);
     expect(frames.some((f) => f.type === "chat_done")).toBe(false);
+  });
+});
+
+describe("consumeRun", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("subscribes to the goal's stream and consumes its frames", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(streamOf(['data: {"type":"loop_complete"}\n\n']), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events: OrchestratorEvent[] = [];
+    await consumeRun("g 1", (ev) => events.push(ev), new AbortController().signal);
+
+    expect(events).toEqual([{ type: "loop_complete" }]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/orchestrator/goals/g%201/stream");
+    expect(init.headers).toEqual({ accept: "text/event-stream" });
+  });
+
+  // The throw is what turns an error response into the caller's reconnect decision.
+  // Resolving instead would read as a stream that ended, and a 404 would look like a
+  // finished run — silently, forever.
+  it("throws when the stream cannot be established", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("nope", { status: 502 })),
+    );
+
+    await expect(
+      consumeRun("g1", () => {}, new AbortController().signal),
+    ).rejects.toThrow("stream status 502");
+  });
+
+  it("throws when a 200 carries no body to read", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200, body: null }),
+    );
+
+    await expect(
+      consumeRun("g1", () => {}, new AbortController().signal),
+    ).rejects.toThrow("stream status 200");
+  });
+
+  // Everything the causal surface does to reconcile a gap hangs off this ordering:
+  // onOpen must fire after the response is known good and before any frame is
+  // delivered, so a read it triggers is taken against an established subscription.
+  it("fires onOpen once, after the status check and before the first frame", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          streamOf([
+            'data: {"type":"triplet","payload":{}}\n\n',
+            'data: {"type":"loop_complete"}\n\n',
+          ]),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const order: string[] = [];
+    await consumeRun(
+      "g1",
+      (ev) => order.push(`frame:${ev.type}`),
+      new AbortController().signal,
+      () => order.push("open"),
+    );
+
+    expect(order).toEqual(["open", "frame:triplet", "frame:loop_complete"]);
+  });
+
+  // Aborting is how a caller stops receiving frames when its view goes away, and
+  // that only works if the signal reaches the body reader — forgetting to pass it on
+  // still aborts the request but leaves already-buffered frames arriving at a
+  // component that has unmounted.
+  it("stops delivering frames once the signal is aborted", async () => {
+    const controller = new AbortController();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          streamOf([
+            'data: {"type":"triplet","payload":{}}\n\n',
+            'data: {"type":"loop_complete"}\n\n',
+          ]),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const seen: OrchestratorEvent[] = [];
+    await consumeRun(
+      "g1",
+      (ev) => {
+        seen.push(ev);
+        controller.abort();
+      },
+      controller.signal,
+    );
+
+    expect(seen).toEqual([{ type: "triplet", payload: {} }]);
+  });
+
+  it("does not fire onOpen for a response it rejects", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("nope", { status: 404 })),
+    );
+    const onOpen = vi.fn();
+
+    await expect(
+      consumeRun("g1", () => {}, new AbortController().signal, onOpen),
+    ).rejects.toThrow();
+    expect(onOpen).not.toHaveBeenCalled();
   });
 });

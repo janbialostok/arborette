@@ -1,14 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   OrchestratorError,
+  correctCausalEdge,
   errorMessage,
+  getCausalGraph,
   getOutcomeExcerpt,
   isExtraction,
+  listCausalVerifications,
   listGoals,
   listOutcomes,
   listVerifications,
   resolveVerification,
   searchHeuristics,
+  verifyFinding,
+  type CausalGraph,
+  type CausalVerification,
   type ExtractionOutcome,
   type GoalListItem,
   type HeuristicMatch,
@@ -364,5 +370,175 @@ describe("resolveVerification", () => {
       message: "corrected_value is required to correct an extraction",
       status: 422,
     });
+  });
+});
+
+describe("correctCausalEdge", () => {
+  it("posts the analyst's edit as JSON", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse({ op: "flip", columns: ["Z", "X"], graph_version: 2, redispatched: 0 }),
+    );
+
+    await expect(
+      correctCausalEdge("g1", { op: "flip", from: "Z", to: "X" }),
+    ).resolves.toEqual({
+      op: "flip",
+      columns: ["Z", "X"],
+      graph_version: 2,
+      redispatched: 0,
+    });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/orchestrator/goals/g1/causal-graph/corrections");
+    expect(init).toMatchObject({
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    });
+    expect(JSON.parse(init.body as string)).toEqual({
+      op: "flip",
+      from: "Z",
+      to: "X",
+    });
+  });
+
+  // Withdrawing a direction is the one correction that cannot be read off from→to,
+  // so the explicit field has to reach the wire.
+  it("carries an explicit direction through to the body", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse({ op: "flip", columns: [], graph_version: 3, redispatched: 0 }),
+    );
+
+    await correctCausalEdge("g1", {
+      op: "flip",
+      from: "X",
+      to: "Z",
+      direction: "undirected",
+    });
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string)).toEqual({
+      op: "flip",
+      from: "X",
+      to: "Z",
+      direction: "undirected",
+    });
+  });
+
+  it("surfaces the in-progress conflict verbatim, with its status", async () => {
+    mockFetch(
+      jsonResponse(
+        { error: "another correction or discovery is in progress for this goal" },
+        409,
+      ),
+    );
+
+    await expect(
+      correctCausalEdge("g1", { op: "delete", from: "X", to: "Z" }),
+    ).rejects.toMatchObject({
+      name: "OrchestratorError",
+      message: "another correction or discovery is in progress for this goal",
+      status: 409,
+    });
+  });
+});
+
+describe("verifyFinding", () => {
+  // Two ids, two segments: swapping or under-encoding either one dispatches a
+  // verification for a finding nobody asked about.
+  it("posts to the finding's own path, escaping both ids", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse({ optimization_function_id: "g 1", intervention_id: "i/1" }, 202),
+    );
+
+    await expect(verifyFinding("g 1", "i/1")).resolves.toEqual({
+      optimization_function_id: "g 1",
+      intervention_id: "i/1",
+    });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/orchestrator/goals/g%201/findings/i%2F1/verify");
+    expect(init).toMatchObject({ method: "POST" });
+  });
+
+  it("surfaces an unavailable verifier verbatim", async () => {
+    mockFetch(jsonResponse({ error: "verifier unavailable" }, 502));
+
+    await expect(verifyFinding("g1", "i1")).rejects.toMatchObject({
+      message: "verifier unavailable",
+      status: 502,
+    });
+  });
+});
+
+describe("getCausalGraph", () => {
+  it("parses the discovered model", async () => {
+    const graph: CausalGraph = {
+      columns: [{ name: "X", kind: "numeric" }],
+      edges: [
+        {
+          col_a: "X",
+          col_b: "Y",
+          direction: "a_to_b",
+          provenance: "statistical",
+          confidence: 1,
+          status: "tested",
+        },
+      ],
+      meta: {
+        version: 2,
+        excluded_columns: [],
+        budget_truncated: false,
+        test_count: 57,
+        discovered_at: "2026-08-04T22:06:38Z",
+      },
+    };
+    const fetchMock = mockFetch(jsonResponse(graph));
+
+    await expect(getCausalGraph("g 1")).resolves.toEqual(graph);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/orchestrator/goals/g%201/causal-graph",
+    );
+  });
+
+  // The 404 is this view's empty state, so its status has to survive the throw for
+  // the caller to tell "none discovered yet" from a fault.
+  it("rejects with a 404 the caller can recognize", async () => {
+    mockFetch(
+      jsonResponse({ error: "no causal graph discovered for this goal yet" }, 404),
+    );
+
+    await expect(getCausalGraph("g1")).rejects.toMatchObject({
+      name: "OrchestratorError",
+      message: "no causal graph discovered for this goal yet",
+      status: 404,
+    });
+  });
+});
+
+describe("listCausalVerifications", () => {
+  // The nullable effects are the whole point of the DTO: a record short of a
+  // terminal outcome must arrive as null, never as a misleading zero.
+  it("parses a record whose effects are not measured yet", async () => {
+    const records: CausalVerification[] = [
+      {
+        id: "v1",
+        intervention_id: "i1",
+        graph_version: 2,
+        status: "pending",
+        naive_effect: null,
+        adjusted_effect: null,
+        adjustment_set: [],
+        refutation_score: null,
+        confidence: null,
+        stale: false,
+        created_at: "2026-08-04T22:06:51Z",
+        updated_at: "2026-08-04T22:06:51Z",
+      },
+    ];
+    const fetchMock = mockFetch(jsonResponse(records));
+
+    await expect(listCausalVerifications("g1")).resolves.toEqual(records);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/orchestrator/goals/g1/causal-verifications",
+    );
   });
 });

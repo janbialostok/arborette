@@ -137,7 +137,7 @@ export function AgentChat({ endpoint }: { endpoint: string }) {
             placeholder={
               streaming ? "Waiting for the reply…" : "Ask about this run…"
             }
-            className="max-h-32 w-full resize-y rounded-lg border border-line bg-surface px-4 py-2.5 text-sm leading-relaxed text-fg outline-none transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20 disabled:opacity-60"
+            className="max-h-32 w-full resize-y rounded-lg border border-line bg-surface px-4 py-2.5 text-sm leading-relaxed text-fg outline-hidden transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20 disabled:opacity-60"
           />
           <Button
             type="submit"

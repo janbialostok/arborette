@@ -39,6 +39,11 @@ type Hub struct {
 type runState struct {
 	buffer      []Event
 	subscribers map[chan Event]struct{}
+	// loop records that a run is feeding this state, which decides who evicts it: a
+	// loop's state is Complete's to reap and must outlive a dropped connection so a
+	// reconnect can replay it, while state a subscriber alone brought into being has
+	// no such owner and belongs to whoever unsubscribes last. Only Publish sets it.
+	loop bool
 }
 
 func (rs *runState) replaceBuffered(ev Event) bool {
@@ -49,6 +54,25 @@ func (rs *runState) replaceBuffered(ev Event) bool {
 		}
 	}
 	return false
+}
+
+// deliver buffers the event for replay and fans it out. A slow subscriber's send is
+// dropped rather than blocking the loop, and a coalescing event replaces its
+// predecessor in place, so a replay keeps the order events happened in rather than
+// jumping the newest value to the end.
+func (rs *runState) deliver(ev Event) {
+	if !ev.Coalesce || !rs.replaceBuffered(ev) {
+		rs.buffer = append(rs.buffer, ev)
+	}
+	if len(rs.buffer) > replayBufferSize {
+		rs.buffer = rs.buffer[len(rs.buffer)-replayBufferSize:]
+	}
+	for ch := range rs.subscribers {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
 }
 
 // NewHub builds an empty hub.
@@ -82,55 +106,47 @@ func (h *Hub) Subscribe(id string) (replay []Event, ch chan Event, cancel func()
 			delete(rs.subscribers, ch)
 			close(ch)
 		}
-		// Evict a run that no live loop is feeding: streaming an arbitrary or
-		// already-finished id lazily creates a runState, and only Complete (at a
-		// real loop's end) otherwise removes it. Without this, a network client
-		// streaming distinct ids would leak map entries unboundedly. A run with a
-		// non-empty buffer belongs to an in-flight or recent loop and is left for
-		// Complete to evict.
-		if len(rs.subscribers) == 0 && len(rs.buffer) == 0 {
+		// Evict a run no loop owns: streaming an arbitrary or already-finished id
+		// lazily creates a runState, and only Complete (at a real loop's end)
+		// otherwise removes it, so without this a client streaming distinct ids
+		// would leak map entries unboundedly.
+		//
+		// The identity check is what keeps this cancel from reaching past its own
+		// state: a run that Complete evicted while this subscriber still held it has
+		// since been replaced under the same key, and deleting by key alone would
+		// take the successor -- and its live subscribers' delivery -- with it.
+		if h.runs[id] == rs && len(rs.subscribers) == 0 && !rs.loop {
 			delete(h.runs, id)
 		}
 	}
 	return replay, ch, cancel
 }
 
-// Publish records the event in the run's replay buffer and fans it out to live
-// subscribers. A slow subscriber's send is dropped rather than blocking the
-// loop. A coalescing event replaces its predecessor in place, so a replay keeps
-// the buffer's original ordering rather than jumping the newest value to the end.
+// Publish records a run's own event and claims the run's state for the loop.
 func (h *Hub) Publish(id string, ev Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	rs := h.run(id)
-	if !ev.Coalesce || !rs.replaceBuffered(ev) {
-		rs.buffer = append(rs.buffer, ev)
-	}
-	if len(rs.buffer) > replayBufferSize {
-		rs.buffer = rs.buffer[len(rs.buffer)-replayBufferSize:]
-	}
-	for ch := range rs.subscribers {
-		select {
-		case ch <- ev:
-		default:
-		}
-	}
+	rs.loop = true
+	rs.deliver(ev)
 }
 
 // PublishLive is Publish for an event that only makes sense while a run is
-// streaming. It drops the event when no run state exists rather than creating
-// it, which plain Publish does -- a late frame would otherwise resurrect state
-// Complete just evicted, and nothing would ever clean it up again. Concurrent
-// runs for one goal share this key, so a still-running run can publish after a
-// sibling completed; that is exactly the case this guards.
+// streaming. It drops the event when no run state exists rather than creating it,
+// which plain Publish does -- a late frame would otherwise resurrect state Complete
+// just evicted, and nothing would clean it up again. The check and the delivery
+// share one critical section for that reason: releasing the lock between them is all
+// a concurrent Complete needs to slip through. Concurrent runs for one goal share
+// this key, so a still-running run can publish after a sibling completed; that is
+// exactly the case this guards.
 func (h *Hub) PublishLive(id string, ev Event) {
 	h.mu.Lock()
-	live := h.runs[id] != nil
-	h.mu.Unlock()
-	if !live {
+	defer h.mu.Unlock()
+	rs := h.runs[id]
+	if rs == nil {
 		return
 	}
-	h.Publish(id, ev)
+	rs.deliver(ev)
 }
 
 // Complete evicts the run: it closes and drops every subscriber channel (ending

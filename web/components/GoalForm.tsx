@@ -78,7 +78,7 @@ export function GoalForm() {
           onChange={(e) => setGoal(e.target.value)}
           rows={4}
           placeholder="e.g. Maximize average order value for repeat customers in the Northeast region."
-          className="w-full resize-y rounded-lg border border-line bg-surface px-4 py-3 text-[15px] leading-relaxed text-fg outline-none transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+          className="w-full resize-y rounded-lg border border-line bg-surface px-4 py-3 text-[15px] leading-relaxed text-fg outline-hidden transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
         />
       </div>
 
@@ -130,7 +130,7 @@ export function GoalForm() {
               value={importPath}
               onChange={(e) => setImportPath(e.target.value)}
               placeholder="contracts/acme-2024.csv"
-              className="w-full rounded-lg border border-line bg-surface px-4 py-3.5 font-mono text-sm text-fg outline-none transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+              className="w-full rounded-lg border border-line bg-surface px-4 py-3.5 font-mono text-sm text-fg outline-hidden transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
             />
             <p className="text-xs text-faint">
               Relative path resolved under the server&apos;s read-only import

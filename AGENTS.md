@@ -131,5 +131,18 @@
   through `make web-dev`, not the :8083 container.
 - The frontend has its own unit suites under `web/lib/` (vitest, no infrastructure
   needed) with no Make target: run them with `npm test` from `web/`. They cover the
-  typed orchestrator client, the SSE frame parser, and the pure logic behind the
-  review, chat, and histogram views.
+  typed orchestrator client, the SSE frame parser and stream-reopen policy, and the
+  pure logic behind each view — every non-trivial rule belongs in `web/lib/` for
+  exactly this reason, since the project writes no component tests.
+
+## Planning Artifacts
+
+- `.turbo/` is **tracked**, not ignored: `specs/`, `plans/`, `shells/`, and the running
+  `improvements.md` backlog are all committed. A commit that implements a shell carries
+  its own plan at `status: done` and deletes the shell it consumed, so the plan file is
+  the durable record of what shipped — if the implementation departs from the plan (a
+  deferral that was actually done, a scope line that no longer holds), correct the plan
+  in the same commit rather than leaving it describing the opposite.
+- `improvements.md` is the backlog for work deliberately skipped. Entries state the
+  problem, the mechanism, and the fix — not the session that found them. Prefer
+  correcting an existing entry over appending a near-duplicate.

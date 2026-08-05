@@ -111,13 +111,15 @@ Four things to know before writing an SSE client, none of them guessable from th
   same `{error}` payload, as a per-candidate failure. Nothing on the wire distinguishes them, and
   `loop_complete` carries no payload — a run's real outcome comes from `GET /goals`, which serves the
   persisted status and failure reason.
-- **Subscribing after a run ends attaches to silence.** An unknown goal is a 404, and the response
-  head is flushed on subscribe so a status code is always available — but a *known* goal whose run
-  already finished attaches to a run that will never emit another event, and nothing closes the
-  connection. Keepalive comment frames arrive every 30s, so the connection stays healthy rather than
-  being reaped; they carry no events. Mid-run reconnects are safe and replay recent history. Prefer a
-  manual reader over `EventSource`, which would reconnect into that silence every time a run
-  completes.
+- **Subscribing after a run ends is how a verdict reaches you.** An unknown goal is a 404, and the
+  response head is flushed on subscribe so a status code is always available. A *known* goal whose run
+  already finished emits nothing further of its own — but the stream is not dead: the router and
+  Engine B publish onto the goal's key from outside any run, and reach only clients already
+  subscribed, so a surface waiting on a verification verdict has to hold the connection open across
+  the run's end. Nothing closes it. Keepalive comment frames arrive every 30s, so the connection stays
+  healthy rather than being reaped; they carry no events. Mid-run reconnects are safe and replay recent
+  history. Prefer a manual reader over `EventSource`, which reconnects on its own schedule and
+  re-subscribes blind, dropping whatever was published in the gap.
 
 ### Phase 2 — Sleep Cycle
 
@@ -409,9 +411,23 @@ the agent-facing equivalent of both.
 
 Little of this walkthrough actually requires curl. The web UI's landing page is the goal-submission
 form, `/goals` lists registered objectives with their run status, and `/heuristics` browses what was
-published. A goal page carries three tabs, mirrored into `?tab=` so any of them is linkable: **Run**
-follows the live stream, **Verify** works the review queue against the source excerpts each value
+published — scoped to a goal, its evidence rows also say whether each supporting finding's effect is
+causal or merely correlated, and can send one for verification. A goal page carries four tabs,
+mirrored into `?tab=` so any of them is linkable: **Run** follows the live stream, **Causal** is
+Engine B's surface, **Verify** works the human review queue against the source excerpts each value
 was read from, and **Preview agent** chats with the accumulated graph.
+
+The two verification tabs answer the same two different questions `/verifications` and
+`/causal-verifications` do: **Verify** asks whether a human confirmed an extracted value, **Causal**
+asks whether the data supports a finding as a causal effect. The Causal tab draws the discovered
+graph with each edge's provenance and confidence, dispatches a finding for verification, and reads
+each verdict back in plain language alongside its naive and adjusted effects, adjustment set, and
+refutation score — a `causally_verified` result always carrying the caveat that it holds only given
+the discovered model. Edge corrections (flip, unorient, delete, add a confounder) are applied from
+the graph view and are never required: an uncorrected graph is verified as discovered, and a
+correction is served as a new version that re-verifies whatever it invalidated. A verdict arrives
+minutes after dispatch and lands on the tab without a reload, including on a goal whose run finished
+long before.
 
 ### Working on the web UI
 

@@ -1,4 +1,33 @@
-import type { OrchestratorEvent } from "./orchestrator";
+// Reading the orchestrator's event streams: the wire format, and the connection the
+// live surfaces open over it. The retry policy deliberately lives elsewhere; this
+// module owns transport only.
+
+import { streamUrl, type OrchestratorEvent } from "./orchestrator";
+
+// consumeRun opens a goal's run stream and consumes it to its end. It resolves when
+// the stream ends and rejects when the connection could not be established or was
+// lost, which is all a caller needs to decide whether to reconnect.
+//
+// onOpen fires once the stream has committed its 200, which is the earliest a
+// caller can know the connection took. It is not quite the moment the server
+// registered the subscription — the head is flushed just before that — so a
+// reconciling read hung off it still races a publish by the width of those two
+// statements, rather than by the width of a whole request as it would if the read
+// were taken before the connection was opened at all.
+export async function consumeRun(
+  id: string,
+  onEvent: (ev: OrchestratorEvent) => void,
+  signal: AbortSignal,
+  onOpen?: () => void,
+): Promise<void> {
+  const res = await fetch(streamUrl(id), {
+    signal,
+    headers: { accept: "text/event-stream" },
+  });
+  if (!res.ok || !res.body) throw new Error(`stream status ${res.status}`);
+  onOpen?.();
+  await consumeStream(res.body, onEvent, signal);
+}
 
 // consumeStream reads an SSE response body, parsing `data: <json>\n\n` frames
 // (the orchestrator emits no event:/id: lines) and invoking onEvent per frame.

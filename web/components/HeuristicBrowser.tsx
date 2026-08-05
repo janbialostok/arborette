@@ -3,14 +3,19 @@
 import { useEffect, useState } from "react";
 import {
   errorMessage,
+  listCausalVerifications,
   listGoals,
   searchHeuristics,
   traceHeuristic,
+  type CausalVerification,
   type GoalListItem,
   type HeuristicMatch,
   type TraceTriplet,
 } from "@/lib/orchestrator";
+import { epistemicSource, inFlight, latestByIntervention } from "@/lib/causal";
 import { renderValue } from "@/lib/format";
+import { EpistemicBadge } from "@/components/EpistemicBadge";
+import { VerifyFindingButton } from "@/components/VerifyFindingButton";
 import {
   Badge,
   Button,
@@ -22,6 +27,28 @@ import {
   type BadgeTone,
 } from "@/components/ui";
 
+// A goal's causal verdicts, joined onto the evidence rows of a search scoped to
+// that goal. Only a scoped search can carry them: a trace triplet names no goal, and
+// a finding belonging to another goal cannot be verified against this one — so
+// cross-goal browsing gets neither the badge nor the button rather than an
+// affordance that answers "finding not found".
+interface GoalScope {
+  goalID: string;
+  // null when the verdicts could not be read: the rows then offer verification
+  // without claiming anything about evidence, rather than showing every finding as
+  // observational on the strength of a failed request.
+  latest: Map<string, CausalVerification> | null;
+}
+
+async function loadScope(goalID: string): Promise<GoalScope> {
+  try {
+    const records = await listCausalVerifications(goalID);
+    return { goalID, latest: latestByIntervention(records) };
+  } catch {
+    return { goalID, latest: null };
+  }
+}
+
 export function HeuristicBrowser() {
   const [q, setQ] = useState("");
   const [results, setResults] = useState<HeuristicMatch[] | null>(null);
@@ -30,6 +57,7 @@ export function HeuristicBrowser() {
   const [selected, setSelected] = useState<HeuristicMatch | null>(null);
   const [goals, setGoals] = useState<GoalListItem[]>([]);
   const [goalId, setGoalId] = useState("");
+  const [scope, setScope] = useState<GoalScope | null>(null);
 
   // Populate the scope selector. The corpus is browsable cross-goal by default;
   // scoping to a goal is what surfaces that goal's own heuristics instead of the
@@ -57,9 +85,17 @@ export function HeuristicBrowser() {
     setSearching(true);
     setSelected(null);
     try {
-      setResults(await searchHeuristics(q.trim(), undefined, goalId || undefined));
+      // The verdicts depend on the goal filter, not on what the search returns, so
+      // the two round trips run together rather than one behind the other.
+      const [matches, next] = await Promise.all([
+        searchHeuristics(q.trim(), undefined, goalId || undefined),
+        goalId ? loadScope(goalId) : Promise.resolve(null),
+      ]);
+      setResults(matches);
+      setScope(next);
     } catch (err) {
       setResults(null);
+      setScope(null);
       setSearchError(errorMessage(err, "Search failed. Please retry."));
     } finally {
       setSearching(false);
@@ -75,9 +111,10 @@ export function HeuristicBrowser() {
         </h1>
         <p className="max-w-xl text-sm leading-relaxed text-muted">
           Search the meta-heuristics distilled by the sleep cycle. Open one to
-          trace the causal evidence it was abstracted from. Scope to a goal to see
-          only that objective&rsquo;s heuristics, since abstracted definitions
-          rank poorly across the whole corpus by domain query.
+          trace the evidence it was abstracted from. Scope to a goal to see only
+          that objective&rsquo;s heuristics — abstracted definitions rank poorly
+          across the whole corpus by domain query — and to check each supporting
+          finding for whether its effect is causal or merely correlated.
         </p>
       </div>
 
@@ -86,7 +123,7 @@ export function HeuristicBrowser() {
           value={goalId}
           onChange={(e) => setGoalId(e.target.value)}
           aria-label="Heuristic scope"
-          className="rounded-lg border border-line bg-surface px-3 py-3 text-sm text-fg outline-none transition-colors focus:border-signal/60 focus:ring-2 focus:ring-signal/20 sm:w-56 sm:shrink-0"
+          className="rounded-lg border border-line bg-surface px-3 py-3 text-sm text-fg outline-hidden transition-colors focus:border-signal/60 focus:ring-2 focus:ring-signal/20 sm:w-56 sm:shrink-0"
         >
           <option value="">All goals</option>
           {goals.map((g) => (
@@ -100,7 +137,7 @@ export function HeuristicBrowser() {
           value={q}
           onChange={(e) => setQ(e.target.value)}
           placeholder="Describe a state or objective, e.g. high-value repeat customers"
-          className="w-full rounded-lg border border-line bg-surface px-4 py-3 text-sm text-fg outline-none transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+          className="w-full rounded-lg border border-line bg-surface px-4 py-3 text-sm text-fg outline-hidden transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
         />
         <Button type="submit" loading={searching}>
           Search
@@ -116,7 +153,11 @@ export function HeuristicBrowser() {
           selectedId={selected?.id ?? null}
           onSelect={setSelected}
         />
-        <TracePanel key={selected?.id ?? "none"} heuristic={selected} />
+        <TracePanel
+          key={selected?.id ?? "none"}
+          heuristic={selected}
+          scope={scope}
+        />
       </div>
     </div>
   );
@@ -184,7 +225,13 @@ function ResultList({
   );
 }
 
-function TracePanel({ heuristic }: { heuristic: HeuristicMatch | null }) {
+function TracePanel({
+  heuristic,
+  scope,
+}: {
+  heuristic: HeuristicMatch | null;
+  scope: GoalScope | null;
+}) {
   const [trace, setTrace] = useState<TraceTriplet[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -246,7 +293,11 @@ function TracePanel({ heuristic }: { heuristic: HeuristicMatch | null }) {
             {trace.length === 1 ? "" : "s"}
           </SectionLabel>
           {trace.map((t, i) => (
-            <EvidenceRow key={`${t.intervention.id}-${i}`} triplet={t} />
+            <EvidenceRow
+              key={`${t.intervention.id}-${i}`}
+              triplet={t}
+              scope={scope}
+            />
           ))}
         </div>
       )}
@@ -254,7 +305,14 @@ function TracePanel({ heuristic }: { heuristic: HeuristicMatch | null }) {
   );
 }
 
-function EvidenceRow({ triplet }: { triplet: TraceTriplet }) {
+function EvidenceRow({
+  triplet,
+  scope,
+}: {
+  triplet: TraceTriplet;
+  scope: GoalScope | null;
+}) {
+  const record = scope?.latest?.get(triplet.intervention.id);
   return (
     <div className="rounded-lg border border-line bg-surface p-4">
       <div className="grid gap-3 md:grid-cols-3">
@@ -271,6 +329,19 @@ function EvidenceRow({ triplet }: { triplet: TraceTriplet }) {
           <PropertyList props={triplet.outcome.value} />
         </Facet>
       </div>
+
+      {scope && (
+        <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-line pt-3">
+          {scope.latest && <EpistemicBadge source={epistemicSource(record)} />}
+          <div className="ml-auto">
+            <VerifyFindingButton
+              goalID={scope.goalID}
+              interventionID={triplet.intervention.id}
+              pending={inFlight(record)}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
