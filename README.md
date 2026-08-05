@@ -8,10 +8,13 @@ tabular path every number in the resulting graph was computed from the data by a
 never asserted by a model.
 
 An objective has a fixed shape: an **aggregation over a value expression, plus a direction** —
-`maximize avg(order_value)`, or `maximize avg(is_fraud = True)` for a rate. Discovery proceeds by
-adding **filter predicates** that carve sub-segments out of the dataset and re-measuring the same
-objective inside each one. A finding is therefore always a pair: a set of filters, and what the
-objective measured under them.
+`maximize avg(order_value)`, or `maximize avg(is_fraud = True)` for a rate. The value expression can
+also be **entity-relative** — a `lag` or a `trailing_aggregate` over an entity's own ordered history
+— when the goal binds an entity key and a time column, so an objective can measure how often a
+transaction's amount beats that account's recent trailing mean. Discovery proceeds by adding **filter
+predicates** that carve sub-segments out of the dataset and re-measuring the same objective inside
+each one. A finding is therefore always a pair: a set of filters, and what the objective measured
+under them.
 
 It is **not** prediction, feature selection, or model training — the output is a ranked set of data
 filters and their measured effect, with no fitted model, no held-out set, and nothing to score
@@ -310,6 +313,14 @@ Two request details matter more than they look:
   absolute-looking `/import/orders.csv` is re-rooted under the mount and fails to resolve, with an
   error that does not explain itself.
 
+For a **windowed (entity-relative) objective**, add two more form fields: `entity_key_column` (the
+partition key, e.g. `account_id`) and `time_column` (an orderable — temporal or numeric — column the
+history sorts by). It is both-or-neither, and each must resolve to a unique real column. Supplying
+them makes the `lag` and `trailing_aggregate` value-expression kinds available, so a goal phrased for
+an entity-relative signal ("amount far above the account's recent average") fits to a window;
+**leave them off and window kinds are rejected at the dry-run** regardless of how the goal is worded
+— nothing in the goal text alone turns windowing on.
+
 Three extensions are accepted: `.csv` and `.parquet` on the tabular path, and `.pdf` on the document
 path. Anything else — `.tsv`, `.xlsx`, `.json` — is rejected, so a spreadsheet export needs
 converting first. A `.pdf` takes a different intake entirely: instead of fitting an objective it
@@ -429,6 +440,37 @@ correction is served as a new version that re-verifies whatever it invalidated. 
 minutes after dispatch and lands on the tab without a reload, including on a goal whose run finished
 long before.
 
+### 6. Enable the agent chat preview (optional)
+
+The **Preview agent** tab — and the `POST /goals/{id}/chat` route behind it — is off by default,
+and a goal's tab answers "agent preview is not configured" until you turn it on. It is the one
+feature that needs setup beyond `make up`, because it uses Anthropic's native MCP connector:
+**Anthropic's infrastructure dials the MCP server inbound**, so the in-network
+`http://mcpserver:8082` address cannot serve it and the connector requires a public **HTTPS** URL.
+Locally that means tunnelling port 8082.
+
+1. **Set an MCP token first.** `MCP_AUTHORIZATION_TOKEN` in `.env` must be non-empty before you
+   expose the listener — the MCP server refuses to start with `MCP_PUBLIC_URL` set and no token,
+   because a tunnel publishes the otherwise fail-open dev listener. `openssl rand -hex 32` mints one.
+2. **Open a tunnel to port 8082**, which prints an `https://…` URL:
+   ```
+   ngrok http 8082
+   # or: cloudflared tunnel --url http://localhost:8082
+   ```
+3. **Point `MCP_PUBLIC_URL` at that URL** in `.env` — the tunnel's root, with no path appended,
+   since the MCP server serves Streamable HTTP at `/`.
+4. **Restart the two services that read it.** The MCP server now serves publicly, and the
+   orchestrator builds the chat client from `MCP_PUBLIC_URL` + `MCP_AUTHORIZATION_TOKEN` — both read
+   the values only at boot:
+   ```
+   docker compose up -d --build mcpserver orchestrator
+   ```
+
+On the free tier the tunnel URL changes each time `ngrok`/`cloudflared` restarts, so a new tunnel
+means re-editing `MCP_PUBLIC_URL` and restarting the orchestrator again. With it unset, everything
+else in the Quickstart still works — only the Preview agent tab is inert (the chat route returns
+503).
+
 ### Working on the web UI
 
 `make web-dev` serves your local `web/` edits on `:3000` against the Orchestrator. The Compose `web`
@@ -477,7 +519,7 @@ The Orchestrator's eighteen routes:
 
 | Method and path | Purpose |
 |---|---|
-| `POST /goals` | Register a goal (multipart: `goal` plus a file upload or `import_path`; optional `confidence_threshold` — above 0, at most 1 — and `epoch_mode=speculative\|blocking` override the review defaults, and a bad value is a 400). Ingests, introspects, fits and dry-runs the Evaluation Matrix, persists, returns 201. Does not start Phase 1. |
+| `POST /goals` | Register a goal (multipart: `goal` plus a file upload or `import_path`; optional `confidence_threshold` — above 0, at most 1 — and `epoch_mode=speculative\|blocking` override the review defaults, and a bad value is a 400; optional `entity_key_column`+`time_column`, both-or-neither, bind a windowed objective). Ingests, introspects, fits and dry-runs the Evaluation Matrix, persists, returns 201. Does not start Phase 1. |
 | `GET /goals` | List registered objectives with each one's latest run status (synthetic `no run` when never triggered). |
 | `POST /goals/{id}/hypothesis-loop` | Trigger Phase 1. |
 | `GET /goals/{id}/stream` | SSE progress for a goal's run. |
@@ -597,11 +639,13 @@ the mapping that reaches it. `WEBUI_PORT` is the one that behaves as it reads.
 
 Open themes, each with the reason it is open:
 
-- **Objective expressiveness.** The query surface has no `GROUP BY`, window, or partition grammar,
-  so every row is independent and any signal defined relative to an entity's own history —
-  transaction velocity, amount versus that account's trailing mean, geo-impossibility between
-  consecutive events — is currently inexpressible. Precomputing such features as plain columns is
-  the working path.
+- **Objective expressiveness.** Entity-relative signals over an entity's own ordered history *are*
+  now expressible: a value expression can use `lag` and `trailing_aggregate` kinds that compile to
+  `OVER (PARTITION BY <entity> ORDER BY <time>)`, so amount-versus-that-account's-trailing-mean and
+  prior-value comparisons work once a goal binds its `entity_key_column` and `time_column`. What
+  stays out of reach is everything beyond those two window kinds — no `GROUP BY`, no arbitrary
+  partition/frame grammar, no cross-row joins — so time-boxed velocity (N events in M minutes) and
+  geo-impossibility between consecutive events still need precomputing as plain columns.
 - **Search quality.** The schema-derived vocabulary that makes the lattice genuinely large is
   opt-in, because enumerating it depends on one model call to flag the identifier, post-outcome, and
   objective-restating columns that support and lift gates cannot catch by construction — and that
