@@ -117,6 +117,8 @@ func (s *Server) handleVerifyFinding(w http.ResponseWriter, r *http.Request) {
 type causalVerificationDTO struct {
 	ID              string    `json:"id"`
 	InterventionID  string    `json:"intervention_id"`
+	ObjectiveLabel  string    `json:"objective_label"`
+	Filters         []string  `json:"filters"`
 	GraphVersion    int       `json:"graph_version"`
 	Status          string    `json:"status"`
 	NaiveEffect     *float64  `json:"naive_effect"`
@@ -147,12 +149,36 @@ func (s *Server) handleListCausalVerifications(w http.ResponseWriter, r *http.Re
 	}
 	out := make([]causalVerificationDTO, 0, len(records))
 	for _, rec := range records {
-		out = append(out, toCausalVerificationDTO(rec))
+		objectiveLabel, filters := s.resolveSegment(r.Context(), rec.InterventionID)
+		out = append(out, toCausalVerificationDTO(rec, objectiveLabel, filters))
 	}
 	service.WriteJSON(w, http.StatusOK, out)
 }
 
-func toCausalVerificationDTO(rec store.CausalVerification) causalVerificationDTO {
+// resolveSegment reads a verified finding's human-readable segment -- its objective
+// label and full cumulative filter set -- off the Intervention node the record keys
+// on, so the effect on the card is self-describing. The segment is purely additive
+// over the effects, so a finding whose intervention no longer resolves, whose filters
+// fail to decode, or that carries the baseline-style shape with no effective filters
+// degrades to an empty segment (never the label alone) rather than failing the list --
+// the same skip-on-error convention rankFindings applies to the identical property.
+func (s *Server) resolveSegment(ctx context.Context, interventionID string) (string, []string) {
+	iv, err := s.repo.GetIntervention(ctx, interventionID)
+	if err != nil {
+		if !errors.Is(err, graph.ErrNotFound) {
+			log.Printf("orchestrator: resolve segment for %q: %v", interventionID, err)
+		}
+		return "", []string{}
+	}
+	filters, err := domain.DecodeConstraints(iv.Properties[domain.PropEffectiveFilters])
+	if err != nil || len(filters) == 0 {
+		return "", []string{}
+	}
+	objectiveLabel, _ := iv.Properties[domain.PropObjectiveLabel].(string)
+	return objectiveLabel, renderConstraints(filters)
+}
+
+func toCausalVerificationDTO(rec store.CausalVerification, objectiveLabel string, filters []string) causalVerificationDTO {
 	set := rec.AdjustmentSet
 	if set == nil {
 		set = []string{}
@@ -160,6 +186,8 @@ func toCausalVerificationDTO(rec store.CausalVerification) causalVerificationDTO
 	return causalVerificationDTO{
 		ID:              rec.ID,
 		InterventionID:  rec.InterventionID,
+		ObjectiveLabel:  objectiveLabel,
+		Filters:         filters,
 		GraphVersion:    rec.GraphVersion,
 		Status:          rec.Status,
 		NaiveEffect:     rec.NaiveEffect,

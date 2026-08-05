@@ -262,6 +262,8 @@ export type CausalVerificationStatus =
 export interface CausalVerification {
   id: string;
   intervention_id: string;
+  objective_label: string;
+  filters: string[];
   graph_version: number;
   status: string;
   naive_effect: number | null;

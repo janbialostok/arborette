@@ -522,6 +522,8 @@ describe("listCausalVerifications", () => {
       {
         id: "v1",
         intervention_id: "i1",
+        objective_label: "",
+        filters: [],
         graph_version: 2,
         status: "pending",
         naive_effect: null,

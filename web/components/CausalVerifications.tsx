@@ -32,7 +32,7 @@ export function CausalVerifications({
         <Panel className="px-6 py-12 text-center text-sm leading-relaxed text-faint">
           Nothing has been verified causally yet. Use <em>Verify causally</em> on a
           finding — on the run feed or in the heuristic browser — to adjust its
-          effect for the confounders this model names.
+          effect for the confounders in the discovered model.
         </Panel>
       ) : (
         <ul className="flex flex-col gap-3">
@@ -84,6 +84,28 @@ function VerificationCard({
         )}
       </div>
 
+      {/* The effects below are numbers about a segment; without the segment the
+          analyst has no way to tell what an adjusted effect is *of*. A degraded
+          record (no resolvable intervention, no filters) renders neither the chips
+          nor the label, so the block is purely additive and never shows empty. */}
+      {record.filters.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          {record.objective_label && (
+            <SectionLabel>{record.objective_label}</SectionLabel>
+          )}
+          <div className="flex flex-wrap gap-1">
+            {record.filters.map((filter, i) => (
+              <span
+                key={i}
+                className="rounded border border-line bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-muted"
+              >
+                {filter}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="grid gap-x-6 gap-y-4 border-t border-line pt-4 sm:grid-cols-2">
         <Effect
           label="Unadjusted effect"
@@ -96,7 +118,7 @@ function VerificationCard({
         <Effect
           label="Adjusted effect"
           value={record.adjusted_effect}
-          caption="after blocking the back-door paths the model names"
+          caption="after blocking the back-door paths in the discovered model"
           emphasis={source === "causal_inferred"}
         />
       </div>
@@ -106,7 +128,8 @@ function VerificationCard({
           <SectionLabel>Adjusted for</SectionLabel>
           {record.adjustment_set.length === 0 ? (
             <span className="text-xs text-faint">
-              no adjustment needed — the model names no confounder of this effect
+              no adjustment needed — the discovered model has no confounder to
+              block for this effect
             </span>
           ) : (
             <div className="flex flex-wrap gap-1">

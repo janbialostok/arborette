@@ -38,6 +38,8 @@ function verification(
 ): CausalVerification {
   return {
     id: `v-${over.intervention_id}-${over.created_at ?? "0"}`,
+    objective_label: "avg(gpa_change)",
+    filters: ["prior_gpa < 3"],
     graph_version: 1,
     status: "causally_verified",
     naive_effect: 2,
