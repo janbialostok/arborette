@@ -46,6 +46,11 @@ your customers already churns most, and how much worse that slice is than the wh
 
 ## How it works
 
+Two diagrams cover the shape of the system before the detail below fills it in:
+[`docs/architecture.md`](docs/architecture.md) for the components and the boundaries between them,
+and [`docs/discovery-flow.md`](docs/discovery-flow.md) for one objective's path from submission to
+published Meta-Heuristics — including how that published corpus reaches the *next* objective.
+
 Discovery runs in two phases, both manually triggered. They are complementary rather than
 sequential refinements of each other: Phase 1 is a greedy, LLM-guided descent that finds strong
 single directions fast; Phase 2 is a budget-bounded search over combinations of what Phase 1 found,
@@ -198,6 +203,9 @@ as a new graph version with the prior one left intact, and every verification wh
 touched a corrected column is marked stale and re-verified against the new version.
 
 ### The services
+
+[`docs/architecture.md`](docs/architecture.md) diagrams what follows, including which service may
+touch which datastore and under which Postgres role.
 
 Seven Go binaries under `cmd/`. Three are always-on services, two run either as a one-shot job or
 in `-serve` mode behind an HTTP launcher, and two are init one-shots:
@@ -684,11 +692,17 @@ edge, rather than adjusting the observational rows — would replace inference w
   front-end iteration does not couple to the Go backend's release cadence.
 - **`local-import/`** — the read-only import mount the Orchestrator ingests on-disk sources from,
   containing the bundled `orders.csv` and `sample-invoice.pdf` samples.
+- **`docs/`** — the architecture and discovery-flow diagrams linked from
+  [How it works](#how-it-works).
 - **`.turbo/`** — specs, plans, shells, and the running improvements log.
 - **`context/`** — the original concept documents, superseded by the specs and kept for provenance.
 
 ## Further reading
 
+- [`docs/architecture.md`](docs/architecture.md) — the components, their boundaries, and which of
+  them may touch which datastore.
+- [`docs/discovery-flow.md`](docs/discovery-flow.md) — one objective end to end, and the reuse path
+  by which published Meta-Heuristics ground a subsequent goal's search.
 - [`AGENTS.md`](AGENTS.md) — build pins, dependency constraints, and the testing gotchas that bite
   when running the integration suite against a live stack.
 - [`.turbo/specs/arborette.md`](.turbo/specs/arborette.md) — the product source of truth:
