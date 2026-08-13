@@ -425,6 +425,7 @@ func TestGoalRegistryGrants(t *testing.T) {
 			Constraints: []domain.Constraint{{Field: "latency_ms", Op: domain.LessThan, Value: 200}},
 		},
 		DataSourceRef: "s3://arborette/data.csv",
+		DatasetID:     seedDataset(t, ctx, orchestrator),
 	}
 	if err := registry.Insert(ctx, goal); err != nil {
 		t.Fatalf("orchestrator insert goal: %v", err)
@@ -508,6 +509,7 @@ func TestGoalRegistryDocumentGoal(t *testing.T) {
 			{Name: "termination_date", Description: "the termination date"},
 		},
 		DataSourceRef: "s3://arborette/contract.pdf",
+		DatasetID:     seedDataset(t, ctx, p),
 	}
 	if err := registry.Insert(ctx, docGoal); err != nil {
 		t.Fatalf("insert document goal: %v", err)
@@ -532,6 +534,7 @@ func TestGoalRegistryDocumentGoal(t *testing.T) {
 		GoalText:               "grow revenue",
 		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
 		DataSourceRef:          "s3://arborette/data.csv",
+		DatasetID:              seedDataset(t, ctx, p),
 	}); err != nil {
 		t.Fatalf("insert tabular goal: %v", err)
 	}
@@ -567,6 +570,7 @@ func TestGoalRegistryWindowBindings(t *testing.T) {
 		GoalText:               "flag anomalous velocity",
 		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "amount", Direction: domain.Maximize, Aggregation: "avg"}}},
 		DataSourceRef:          "s3://arborette/txns.csv",
+		DatasetID:              seedDataset(t, ctx, p),
 		EntityKeyColumn:        "account_id",
 		TimeColumn:             "ts",
 	}); err != nil {
@@ -587,6 +591,7 @@ func TestGoalRegistryWindowBindings(t *testing.T) {
 		GoalText:               "grow revenue",
 		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
 		DataSourceRef:          "s3://arborette/data.csv",
+		DatasetID:              seedDataset(t, ctx, p),
 	}); err != nil {
 		t.Fatalf("insert unbound goal: %v", err)
 	}
@@ -623,6 +628,7 @@ func TestGoalRegistryTrackAndClaim(t *testing.T) {
 		GoalText:               "do gold-tier accounts spend more?",
 		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
 		DataSourceRef:          "s3://arborette/data.csv",
+		DatasetID:              seedDataset(t, ctx, p),
 		Track:                  store.TrackVerify,
 		Claim:                  claim,
 	}); err != nil {
@@ -686,7 +692,8 @@ func TestGoalRegistryTrackAndClaim(t *testing.T) {
 func strPtr(s string) *string { return &s }
 
 // seedGoal inserts a minimal registered goal a run row can reference, returning
-// its id.
+// its id. The goal is bound to a freshly seeded dataset: goal_registry.dataset_id
+// is NOT NULL, so every goal insert needs a parent row.
 func seedGoal(t *testing.T, ctx context.Context, p *store.Pool) string {
 	t.Helper()
 	goalID := testutil.NewID(t)
@@ -695,10 +702,27 @@ func seedGoal(t *testing.T, ctx context.Context, p *store.Pool) string {
 		GoalText:               "grow revenue",
 		EvaluationMatrix:       domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
 		DataSourceRef:          "s3://arborette/data.csv",
+		DatasetID:              seedDataset(t, ctx, p),
 	}); err != nil {
 		t.Fatalf("seed goal: %v", err)
 	}
 	return goalID
+}
+
+// seedDataset inserts a dataset row any goal insert can reference, returning its
+// id. Name and ref are per-test fresh: the name-uniqueness rule (lower(name)
+// index) and residue from earlier runs on the shared db make fixed values unsafe.
+func seedDataset(t *testing.T, ctx context.Context, p *store.Pool) string {
+	t.Helper()
+	var id string
+	err := p.QueryRow(ctx,
+		"INSERT INTO datasets (name, description, status, datasource_ref) VALUES ($1, '', 'active', $2) RETURNING id",
+		"dataset-"+testutil.NewID(t), "datasources/"+testutil.NewID(t)+"/data.csv",
+	).Scan(&id)
+	if err != nil {
+		t.Fatalf("seed dataset: %v", err)
+	}
+	return id
 }
 
 func TestRunsLifecycle(t *testing.T) {
@@ -766,14 +790,14 @@ func TestGoalRegistryList(t *testing.T) {
 	olderID := testutil.NewID(t)
 	if err := registry.Insert(ctx, store.Goal{OptimizationFunctionID: olderID, GoalText: "older",
 		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
-		DataSourceRef:    "ref"}); err != nil {
+		DataSourceRef:    "ref", DatasetID: seedDataset(t, ctx, p)}); err != nil {
 		t.Fatalf("insert older: %v", err)
 	}
 	time.Sleep(2 * time.Millisecond) // keep created_at distinct so DESC ordering is deterministic
 	newerID := testutil.NewID(t)
 	if err := registry.Insert(ctx, store.Goal{OptimizationFunctionID: newerID, GoalText: "newer",
 		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "cost", Direction: domain.Minimize, Aggregation: "sum"}}},
-		DataSourceRef:    "ref"}); err != nil {
+		DataSourceRef:    "ref", DatasetID: seedDataset(t, ctx, p)}); err != nil {
 		t.Fatalf("insert newer: %v", err)
 	}
 

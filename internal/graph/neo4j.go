@@ -379,6 +379,29 @@ func (r *Neo4jRepository) ClearEmbeddingPending(ctx context.Context, id string) 
 	})
 }
 
+// DeleteMetaHeuristic removes a Meta-Heuristic node and its abstraction edges in
+// both directions via DETACH DELETE: another heuristic abstracted from this one
+// keeps its node but loses the meta_abstracted_from edge, so no dangling
+// reference survives into a later query. The node's embedding row is the
+// caller's to remove (the orchestrator deletes it from pgvector alongside).
+// Removing an id that matches nothing is not an error: the desired end state --
+// no node with that id -- already holds.
+func (r *Neo4jRepository) DeleteMetaHeuristic(ctx context.Context, id string) error {
+	return r.writeOp(ctx, "delete meta-heuristic "+id, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (m:"+labelMetaHeuristic+" {id: $id}) DETACH DELETE m "+
+				"RETURN count(*) AS removed",
+			map[string]any{"id": id},
+		)
+		if err != nil {
+			return nil, err
+		}
+		// Consume the result so the write is applied within this tx.
+		_, err = result.Consume(ctx)
+		return nil, err
+	})
+}
+
 // ListMetaHeuristics returns every Meta-Heuristic node, the graph side of the
 // reconcile diff. It does not filter on the embedding-pending flag: reconcile
 // needs the whole set so it can find both nodes whose embedding row is entirely

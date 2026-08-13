@@ -3,10 +3,20 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/arborette/arborette/internal/domain"
+	"github.com/jackc/pgx/v5"
+)
+
+// Delete guard sentinels, returned by GoalRegistry.Delete when the goal's
+// lifecycle state forbids the operation. Callers map them to the HTTP 409 the
+// wire contract prescribes for a busy goal.
+var (
+	ErrGoalRunning         = errors.New("goal has a running hypothesis run")
+	ErrVerificationPending = errors.New("goal has a pending verification")
 )
 
 // EpochMode is how a goal's hypothesis loop treats pending human verifications.
@@ -47,6 +57,7 @@ type Goal struct {
 	EvaluationMatrix       domain.EvaluationMatrix
 	TargetFields           []domain.TargetField
 	DataSourceRef          string
+	DatasetID              string
 	ConfidenceThreshold    *float64
 	EpochMode              EpochMode
 	EntityKeyColumn        string
@@ -76,7 +87,7 @@ func NewGoalRegistry(pool *Pool) *GoalRegistry {
 // COALESCEd to ” so they scan into plain string fields (empty ⇒ unbound), per the
 // store's NULL-scan convention.
 const goalColumns = "optimization_function_id, goal_text, evaluation_matrix, datasource_ref, " +
-	"target_fields, confidence_threshold, epoch_mode, " +
+	"coalesce(dataset_id::text, ''), target_fields, confidence_threshold, epoch_mode, " +
 	"coalesce(entity_key_column, ''), coalesce(time_column, ''), " +
 	"track, claim, coalesce(claim_error, ''), created_at"
 
@@ -114,9 +125,10 @@ func (g *GoalRegistry) Insert(ctx context.Context, goal Goal) error {
 	timeColumn := nullableText(goal.TimeColumn)
 	_, err = g.pool.Exec(ctx,
 		"INSERT INTO goal_registry "+
-			"(optimization_function_id, goal_text, evaluation_matrix, datasource_ref, target_fields, confidence_threshold, epoch_mode, entity_key_column, time_column, track, claim, claim_error) "+
-			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-		goal.OptimizationFunctionID, goal.GoalText, matrix, goal.DataSourceRef, targetFields,
+			"(optimization_function_id, goal_text, evaluation_matrix, datasource_ref, dataset_id, target_fields, confidence_threshold, epoch_mode, entity_key_column, time_column, track, claim, claim_error) "+
+			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+		goal.OptimizationFunctionID, goal.GoalText, matrix, goal.DataSourceRef,
+		nullableUUID(goal.DatasetID), targetFields,
 		goal.ConfidenceThreshold, epochMode, entityKey, timeColumn,
 		track, goal.Claim, nullableText(goal.ClaimError),
 	)
@@ -184,7 +196,8 @@ func (g *GoalRegistry) Get(ctx context.Context, optimizationFunctionID string) (
 	err := g.pool.QueryRow(ctx,
 		"SELECT "+goalColumns+" FROM goal_registry WHERE optimization_function_id = $1",
 		optimizationFunctionID,
-	).Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix, &goal.DataSourceRef, &targetFields,
+	).Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix, &goal.DataSourceRef,
+		&goal.DatasetID, &targetFields,
 		&goal.ConfidenceThreshold, &goal.EpochMode, &goal.EntityKeyColumn, &goal.TimeColumn,
 		&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt)
 	if err != nil {
@@ -213,7 +226,8 @@ func (g *GoalRegistry) List(ctx context.Context) ([]Goal, error) {
 		var goal Goal
 		var matrix, targetFields []byte
 		if err := rows.Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix,
-			&goal.DataSourceRef, &targetFields, &goal.ConfidenceThreshold, &goal.EpochMode,
+			&goal.DataSourceRef, &goal.DatasetID, &targetFields,
+			&goal.ConfidenceThreshold, &goal.EpochMode,
 			&goal.EntityKeyColumn, &goal.TimeColumn,
 			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan goal row: %w", err)
@@ -227,6 +241,122 @@ func (g *GoalRegistry) List(ctx context.Context) ([]Goal, error) {
 		return nil, fmt.Errorf("iterate goal rows: %w", err)
 	}
 	return goals, nil
+}
+
+// ListByDataset returns the goals bound to one dataset, newest first. The scan is
+// identical to List's, so reads through the goal/dataset hierarchy share one
+// projection.
+func (g *GoalRegistry) ListByDataset(ctx context.Context, datasetID string) ([]Goal, error) {
+	rows, err := g.pool.Query(ctx,
+		"SELECT "+goalColumns+" FROM goal_registry WHERE dataset_id = $1 ORDER BY created_at DESC",
+		datasetID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list goals by dataset: %w", err)
+	}
+	defer rows.Close()
+
+	var goals []Goal
+	for rows.Next() {
+		var goal Goal
+		var matrix, targetFields []byte
+		if err := rows.Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix,
+			&goal.DataSourceRef, &goal.DatasetID, &targetFields,
+			&goal.ConfidenceThreshold, &goal.EpochMode,
+			&goal.EntityKeyColumn, &goal.TimeColumn,
+			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan goal row: %w", err)
+		}
+		if err := decodeGoalObjective(&goal, matrix, targetFields); err != nil {
+			return nil, err
+		}
+		goals = append(goals, goal)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate goal rows: %w", err)
+	}
+	return goals, nil
+}
+
+// SetDatasetID re-parents a goal onto a dataset. It is the write behind boot-time
+// reconciliation of a legacy goal that reached the registry without a parent (a row
+// written before the 0015 migration on a partially migrated stack). A goal id that
+// matches no row reports an error: an unreported reassignment would leave the
+// audit record of a goal that the caller believes it fixed.
+func (g *GoalRegistry) SetDatasetID(ctx context.Context, optimizationFunctionID, datasetID string) error {
+	tag, err := g.pool.Exec(ctx,
+		"UPDATE goal_registry SET dataset_id = $1 WHERE optimization_function_id = $2",
+		nullableUUID(datasetID), optimizationFunctionID,
+	)
+	if err != nil {
+		return fmt.Errorf("set dataset for %q: %w", optimizationFunctionID, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("set dataset for %q: no such goal", optimizationFunctionID)
+	}
+	return nil
+}
+
+// Delete removes a goal and its dependent rows in one transaction. Children
+// are deleted before the goal row because runs, verification_queue, and
+// causal_verifications hold NO ACTION references to it: deleting the parent
+// first would trip the FK regardless of order, and deleting children first is
+// what makes the multi-table delete atomic at all. The delete is guarded: a
+// goal with a currently-running hypothesis run or an outstanding pending
+// verification (HITL queue or causal verification) is left untouched and
+// reported as ErrGoalRunning / ErrVerificationPending so the caller can
+// surface a 409 instead of silently discarding in-flight work. An id that
+// matches no goal row reports pgx.ErrNoRows.
+func (g *GoalRegistry) Delete(ctx context.Context, optimizationFunctionID string) error {
+	tx, err := g.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin delete goal %q: %w", optimizationFunctionID, err)
+	}
+	defer tx.Rollback(ctx)
+
+	var running bool
+	if err := tx.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM runs WHERE optimization_function_id = $1 AND status = 'running')",
+		optimizationFunctionID).Scan(&running); err != nil {
+		return fmt.Errorf("check running runs for %q: %w", optimizationFunctionID, err)
+	}
+	if running {
+		return ErrGoalRunning
+	}
+
+	var pending bool
+	if err := tx.QueryRow(ctx,
+		"SELECT "+
+			"EXISTS(SELECT 1 FROM verification_queue WHERE optimization_function_id = $1 AND status = 'pending') "+
+			"OR EXISTS(SELECT 1 FROM causal_verifications WHERE goal_id = $1 AND status = 'pending')",
+		optimizationFunctionID).Scan(&pending); err != nil {
+		return fmt.Errorf("check pending verifications for %q: %w", optimizationFunctionID, err)
+	}
+	if pending {
+		return ErrVerificationPending
+	}
+
+	for _, stmt := range []string{
+		"DELETE FROM runs WHERE optimization_function_id = $1",
+		"DELETE FROM verification_queue WHERE optimization_function_id = $1",
+		"DELETE FROM causal_verifications WHERE goal_id = $1",
+	} {
+		if _, err := tx.Exec(ctx, stmt, optimizationFunctionID); err != nil {
+			return fmt.Errorf("delete goal %q: %w", optimizationFunctionID, err)
+		}
+	}
+	tag, err := tx.Exec(ctx,
+		"DELETE FROM goal_registry WHERE optimization_function_id = $1", optimizationFunctionID)
+	if err != nil {
+		return fmt.Errorf("delete goal %q: %w", optimizationFunctionID, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return pgx.ErrNoRows
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete goal %q: %w", optimizationFunctionID, err)
+	}
+	return nil
 }
 
 // decodeGoalObjective decodes a goal's objective from its two jsonb columns,

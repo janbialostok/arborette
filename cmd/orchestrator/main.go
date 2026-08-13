@@ -64,6 +64,7 @@ func main() {
 	runs := store.NewRuns(pool)
 	queue := store.NewVerificationQueue(pool)
 	audits := store.NewAuditLog(pool)
+	datasets := store.NewDatasetStore(pool)
 	embeddings := store.NewEmbeddingStore(pool, cfg.Embedding.DistanceFloor)
 	heur := heuristics.NewService(provider, embeddings, repo)
 	claude, err := llm.NewClient(cfg.LLM)
@@ -82,6 +83,14 @@ func main() {
 	} else if n > 0 {
 		log.Printf("orchestrator: reconciled %d orphaned run(s) to failed", n)
 	}
+
+	// Goals that reached the registry without a dataset parent (rows written
+	// before the 0015 migration on a partially migrated stack) are bound to the
+	// dataset for their ref and audited as dataset_reconcile. Normally dormant:
+	// the migration backfills and locks NOT NULL, so this is a safety net, not
+	// the primary path. Non-fatal like the run reconciliation.
+	orchestrator.ReconcileDatasets(ctx, goals, datasets, audits,
+		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID})
 
 	// A configured worker URL selects the HTTP launcher (a worker in serve mode);
 	// empty keeps the logging stub, so the AWS Batch seam stays the production path.
@@ -114,7 +123,7 @@ func main() {
 
 	srv := orchestrator.NewServer(
 		repo, goals, runs, queue, causalVerifications, store.NewAdvisoryLock(pool),
-		audits, objects, heur, claude, chat, sandbox,
+		audits, objects, datasets, embeddings, heur, claude, chat, sandbox,
 		orchestrator.NewHub(), launcher, verifierLauncher,
 		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID},
 		orchestrator.RouterConfig{

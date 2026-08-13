@@ -77,6 +77,20 @@ func (c *Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return out.Body, nil
 }
 
+// Delete removes an object under key. Deleting an absent key is not an error
+// (the S3 API is idempotent for DeleteObject), so the dataset-retirement path
+// can delete an object even when a prior cleanup already removed it.
+func (c *Client) Delete(ctx context.Context, key string) error {
+	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("delete object %q: %w", key, err)
+	}
+	return nil
+}
+
 // IsNotFound reports whether err is a missing-object result, from either the
 // modeled NoSuchKey type or MinIO's non-modeled API error form. It keeps SDK-
 // specific error-shape knowledge inside this wrapper so callers classify a

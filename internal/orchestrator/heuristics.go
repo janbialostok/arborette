@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -116,4 +117,40 @@ func toTripletDTO(t graph.CausalTriplet) tripletDTO {
 			Value:              t.Outcome.Value,
 		},
 	}
+}
+
+// handleDeleteHeuristic removes a Meta-Heuristic from the corpus: existence is
+// confirmed first (404 for an unknown id), then the node and its abstraction
+// edges leave the graph and its embedding row leaves pgvector. The embedding
+// delete is best-effort after the node is gone -- a straggler row is inert, and
+// removal order makes the graph the authoritative delete. The audit key
+// heuristic_id names the removed node and optimization_function_id its owning
+// goal (empty for the legacy NULL-goal corpus).
+func (s *Server) handleDeleteHeuristic(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	mh, err := s.repo.GetMetaHeuristic(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, graph.ErrNotFound) {
+			service.WriteErr(w, http.StatusNotFound, "heuristic not found")
+			return
+		}
+		log.Printf("orchestrator: get heuristic %q: %v", id, err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := s.repo.DeleteMetaHeuristic(r.Context(), id); err != nil {
+		log.Printf("orchestrator: delete heuristic %q: %v", id, err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := s.embeddings.Delete(r.Context(), id); err != nil {
+		log.Printf("orchestrator: delete heuristic embedding %q: %v", id, err)
+	}
+	if err := s.recordAudit(r.Context(), "heuristic_remove", "heuristic", map[string]any{
+		"heuristic_id":             id,
+		"optimization_function_id": mh.GoalID,
+	}); err != nil {
+		log.Printf("orchestrator: audit heuristic remove: %v", err)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

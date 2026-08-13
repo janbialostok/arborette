@@ -78,8 +78,11 @@ type graphRepo interface {
 	CorrectOutcome(ctx context.Context, outcomeID string, value map[string]any, provenance *domain.ProvenanceLocator, status domain.VerificationStatus, confidence float64) error
 	GetCausalGraph(ctx context.Context, goalID, datasourceRef string) (domain.CausalGraph, bool, error)
 	GetIntervention(ctx context.Context, id string) (domain.Intervention, error)
+	GetMetaHeuristic(ctx context.Context, id string) (domain.MetaHeuristic, error)
 	ListEligibleFindings(ctx context.Context, goalID string) ([]graph.CausalTriplet, error)
 	CorrectCausalEdge(ctx context.Context, goalID, datasourceRef string, correction domain.EdgeCorrection) (int, []string, error)
+	DeleteMetaHeuristic(ctx context.Context, id string) error
+	DeleteGoalGraph(ctx context.Context, goalID string) error
 }
 
 // causalVerificationStore is the causal-verification surface the router reads and
@@ -108,9 +111,13 @@ type sandboxExecutor interface {
 type goalStore interface {
 	Insert(ctx context.Context, goal store.Goal) error
 	RegisterDataSourceRef(ctx context.Context, ref string) error
+	DataSourceRefExists(ctx context.Context, ref string) (bool, error)
 	Get(ctx context.Context, optimizationFunctionID string) (store.Goal, error)
 	List(ctx context.Context) ([]store.Goal, error)
+	ListByDataset(ctx context.Context, datasetID string) ([]store.Goal, error)
 	SetClaimError(ctx context.Context, optimizationFunctionID, reason string) error
+	SetDatasetID(ctx context.Context, optimizationFunctionID, datasetID string) error
+	Delete(ctx context.Context, optimizationFunctionID string) error
 }
 
 // runStore is the run-lifecycle surface the loop and the objectives list need.
@@ -145,6 +152,32 @@ type objectStore interface {
 	NewKey(parts ...string) string
 	Put(ctx context.Context, key string, r io.Reader, contentType string) error
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
+	Delete(ctx context.Context, key string) error
+}
+
+// datasetStore is the datasets-table seam the inventory, editor, and delete
+// handlers share. It is a narrow slice of store.DatasetStore: exactly the
+// operations the HTTP surface needs, so a fake can stand in without pulling in
+// the whole persistence layer.
+type datasetStore interface {
+	Create(ctx context.Context, dataset store.Dataset) (string, error)
+	Get(ctx context.Context, id string) (store.Dataset, error)
+	GetByRef(ctx context.Context, ref string) (store.Dataset, error)
+	List(ctx context.Context, query string) ([]store.Dataset, error)
+	Update(ctx context.Context, id, name, description string, status store.DatasetStatus) error
+	CountObjectives(ctx context.Context, id string) (int, error)
+	ListObjectives(ctx context.Context, datasetID string) ([]store.Goal, error)
+	Delete(ctx context.Context, id string) error
+	DataSourceRefUsage(ctx context.Context, ref string) (datasets, goals int, err error)
+	DeleteDataSourceRef(ctx context.Context, ref string) error
+}
+
+// embeddingsStore is the pgvector seam the delete paths use to retire a
+// Meta-Heuristic or a goal's whole embedding corpus. Both deletes are idempotent:
+// removing an absent row is not an error.
+type embeddingsStore interface {
+	Delete(ctx context.Context, nodeID string) error
+	DeleteByGoal(ctx context.Context, goalID string) error
 }
 
 type heuristicsService interface {
@@ -178,6 +211,8 @@ type Server struct {
 	graphLock           graphLocker
 	audits              auditStore
 	objects             objectStore
+	datasets            datasetStore
+	embeddings          embeddingsStore
 	heur                heuristicsService
 	claude              claudeClient
 	chat                chatStreamer
@@ -212,6 +247,8 @@ func NewServer(
 	graphLock graphLocker,
 	audits auditStore,
 	objects objectStore,
+	datasets datasetStore,
+	embeddings embeddingsStore,
 	heur heuristicsService,
 	claude claudeClient,
 	chat chatStreamer,
@@ -235,6 +272,8 @@ func NewServer(
 		router:              router,
 		audits:              audits,
 		objects:             objects,
+		datasets:            datasets,
+		embeddings:          embeddings,
 		heur:                heur,
 		claude:              claude,
 		chat:                chat,
@@ -278,6 +317,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /goals/{id}/causal-verifications", s.handleListCausalVerifications)
 	mux.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
 	mux.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)
+	mux.HandleFunc("DELETE /heuristics/{id}", s.handleDeleteHeuristic)
+	mux.HandleFunc("DELETE /goals/{id}", s.handleDeleteGoal)
+	mux.HandleFunc("GET /datasets", s.handleListDatasets)
+	mux.HandleFunc("POST /datasets", s.handleCreateDataset)
+	mux.HandleFunc("GET /datasets/{id}", s.handleGetDataset)
+	mux.HandleFunc("PATCH /datasets/{id}", s.handleUpdateDataset)
+	mux.HandleFunc("DELETE /datasets/{id}", s.handleDeleteDataset)
 	mux.Handle("POST /internal/audit", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleAudit)))
 	mux.Handle("POST /internal/verification-events", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleVerificationEvent)))
 	return mux

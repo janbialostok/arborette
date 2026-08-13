@@ -577,6 +577,32 @@ func (r *Neo4jRepository) DeleteCausalGraphVersion(ctx context.Context, goalID, 
 	})
 }
 
+// DeleteGoalGraph removes every node a goal wrote into the graph. Every
+// goal-owned node carries a goal_id (State/Intervention/Outcome/
+// MetaHeuristic/CausalGraphMeta/DataColumn all write it on create), and a
+// Meta-Heuristic additionally writes origin_goal_id naming the goal its corpus
+// was abstracted from; matching either lets DETACH DELETE clear the node and its
+// edges in one statement without enumerating labels. A heuristic that originated
+// in this goal but was later linked into another goal's corpus follows its
+// origin here -- the corpus it abstracted from is gone, so keeping it would
+// strand a finding whose evidence is deleted. Deleting for a goal with no graph
+// is not an error: the desired end state -- nothing goal-scoped -- already holds.
+func (r *Neo4jRepository) DeleteGoalGraph(ctx context.Context, goalID string) error {
+	return r.writeOp(ctx, "delete goal graph "+goalID, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MATCH (n) WHERE n.goal_id = $goalID OR n.origin_goal_id = $goalID "+
+				"DETACH DELETE n RETURN count(*) AS removed",
+			map[string]any{"goalID": goalID},
+		)
+		if err != nil {
+			return nil, err
+		}
+		// Consume the result so the write is applied within this tx.
+		_, err = result.Consume(ctx)
+		return nil, err
+	})
+}
+
 // GetCausalGraph returns the newest committed graph for a (goal, data-source) pair
 // and whether one exists. A graph is committed only when its CausalGraphMeta node is
 // present, so a torn partial write (columns/edges written, meta not) reads as absent

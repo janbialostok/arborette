@@ -159,29 +159,68 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ref, err := s.ingest(r)
-	if err != nil {
-		s.writeIngestErr(w, err)
-		return
-	}
-
-	// Register the minted ref immediately -- this is the single choke point covering
-	// upload, local-import, and document goals -- and before the intake introspect
-	// and dry-run below, which the Sandbox validates against the registry. Skipping
-	// it would 404 every intake, since those sandbox calls precede goals.Insert. A
-	// row orphaned by a later intake failure is harmless: it names an object the
-	// orchestrator itself staged.
-	if err := s.goals.RegisterDataSourceRef(ctx, ref); err != nil {
-		log.Printf("orchestrator: register data source ref: %v", err)
-		service.WriteErr(w, http.StatusInternalServerError, "internal error")
-		return
+	// A bound goal carries no upload: its data source is the dataset's, so the ref
+	// comes from the dataset row instead of ingest. An unbound goal runs the legacy
+	// ingest, and its ref is wrapped in an implicit dataset -- reused when one already
+	// exists for the ref (a 0015-backfill or earlier implicit row) -- keeping every
+	// goal under a parent (FR-007).
+	explicitDataset := strings.TrimSpace(r.FormValue("dataset_id"))
+	var ref, datasetID string
+	var bound bool
+	if explicitDataset != "" {
+		ds, err := s.datasets.Get(ctx, explicitDataset)
+		if err != nil {
+			s.writeDatasetBindErr(w, err)
+			return
+		}
+		if ds.Status == store.DatasetArchived {
+			service.WriteErr(w, http.StatusConflict, "dataset is archived and cannot accept new objectives")
+			return
+		}
+		ref = ds.DataSourceRef
+		bound = true
+		datasetID = ds.ID
+		// Idempotent; covers a dataset whose ref predates the registry backfill.
+		if err := s.goals.RegisterDataSourceRef(ctx, ref); err != nil {
+			log.Printf("orchestrator: register data source ref: %v", err)
+			service.WriteErr(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	} else {
+		ref, err = s.ingest(r)
+		if err != nil {
+			s.writeIngestErr(w, err)
+			return
+		}
+		// Register the minted ref immediately -- this is the single choke point covering
+		// upload, local-import, and document goals -- and before the intake introspect
+		// and dry-run below, which the Sandbox validates against the registry. Skipping
+		// it would 404 every intake, since those sandbox calls precede goals.Insert. A
+		// row orphaned by a later intake failure is harmless: it names an object the
+		// orchestrator itself staged.
+		if err := s.goals.RegisterDataSourceRef(ctx, ref); err != nil {
+			log.Printf("orchestrator: register data source ref: %v", err)
+			service.WriteErr(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		datasetID, err = s.datasetForRef(ctx, ref)
+		if err != nil {
+			log.Printf("orchestrator: bind implicit dataset for %q: %v", ref, err)
+			service.WriteErr(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 	}
 
 	// Introspect first, as a hard precondition: the schema fits the objective to
 	// real columns, and an unreadable/unsupported/missing source is surfaced now
-	// rather than at run time.
+	// rather than at run time. For a bound dataset an unreadable source is a
+	// refusal of the goal, per the contract, not an intake-class fault.
 	introspect, err := s.sandbox.Introspect(ctx, IntrospectRequest{DataSourceRef: ref})
 	if err != nil {
+		if bound {
+			service.WriteErr(w, http.StatusConflict, "dataset source is unreadable: "+err.Error())
+			return
+		}
 		s.writeIntakeErr(w, err)
 		return
 	}
@@ -190,7 +229,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	// of fields to extract accurately. Branch here so the tabular objective-fitting
 	// path below is never entered for a document goal.
 	if introspect.Schema.Kind == string(datasource.KindDocument) {
-		s.submitDocumentGoal(ctx, w, goal, ref, introspect.Sample, review)
+		s.submitDocumentGoal(ctx, w, goal, ref, introspect.Sample, review, datasetID)
 		return
 	}
 	schema := toSandboxSchema(introspect.Schema)
@@ -247,6 +286,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		GoalText:               goal,
 		EvaluationMatrix:       matrix,
 		DataSourceRef:          ref,
+		DatasetID:              datasetID,
 		ConfidenceThreshold:    review.threshold,
 		EpochMode:              review.epochMode,
 		EntityKeyColumn:        entityKey,
@@ -263,6 +303,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	if err := s.recordAudit(ctx, "goal_submit", "goal", map[string]any{
 		"optimization_function_id": optID,
 		"data_source_ref":          ref,
+		"dataset_id":               datasetID,
 		"track":                    intent.track,
 		"rationale":                intent.rationale,
 	}); err != nil {
@@ -270,7 +311,10 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	s.reportIntent(ctx, optID, intent)
 
-	service.WriteJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+	service.WriteJSON(w, http.StatusCreated, map[string]any{
+		"optimization_function_id": optID,
+		"dataset_id":               datasetID,
+	})
 }
 
 // goalIntent is the classified routing decision as the goal row records it: the
@@ -362,7 +406,7 @@ func (s *Server) reportIntent(ctx context.Context, optID string, intent goalInte
 // the tabular path (optimization_function_id), so the caller cannot tell the two
 // intake flows apart. A Claude fault is a 502, matching the tabular generation
 // failure mapping.
-func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, goal, ref, sample string, review reviewSettings) {
+func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, goal, ref, sample string, review reviewSettings, datasetID string) {
 	fields, err := s.claude.IntrospectDocumentFields(ctx, goal, sample)
 	if err != nil {
 		log.Printf("orchestrator: introspect document fields: %v", err)
@@ -380,6 +424,7 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 		GoalText:               goal,
 		TargetFields:           fields,
 		DataSourceRef:          ref,
+		DatasetID:              datasetID,
 		ConfidenceThreshold:    review.threshold,
 		EpochMode:              review.epochMode,
 	}); err != nil {
@@ -391,11 +436,15 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 	if err := s.recordAudit(ctx, "goal_submit", "goal", map[string]any{
 		"optimization_function_id": optID,
 		"data_source_ref":          ref,
+		"dataset_id":               datasetID,
 	}); err != nil {
 		log.Printf("orchestrator: append audit: %v", err)
 	}
 
-	service.WriteJSON(w, http.StatusCreated, map[string]any{"optimization_function_id": optID})
+	service.WriteJSON(w, http.StatusCreated, map[string]any{
+		"optimization_function_id": optID,
+		"dataset_id":               datasetID,
+	})
 }
 
 // goalListItemDTO is the web-UI projection of a goal plus its latest run status
@@ -421,7 +470,13 @@ type goalListItemDTO struct {
 // synthetic "no run".
 func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	goals, err := s.goals.List(ctx)
+	var goals []store.Goal
+	var err error
+	if datasetID := strings.TrimSpace(r.URL.Query().Get("dataset_id")); datasetID != "" {
+		goals, err = s.goals.ListByDataset(ctx, datasetID)
+	} else {
+		goals, err = s.goals.List(ctx)
+	}
 	if err != nil {
 		log.Printf("orchestrator: list goals: %v", err)
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")

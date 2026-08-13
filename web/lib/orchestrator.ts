@@ -97,6 +97,43 @@ export interface ConfidenceDistribution {
 
 export interface SubmitGoalResponse {
   optimization_function_id: string;
+  dataset_id?: string;
+}
+
+// The dataset lifecycle DTOs. They mirror the dataset endpoints exactly: the
+// summary carries the derived usage in addition to the stored status, and the
+// detail adds the dataset's objectives (children, ascending by created_at).
+export interface DatasetSummary {
+  id: string;
+  name: string;
+  description: string;
+  status: "active" | "archived";
+  usage: "empty" | "in_use";
+  objective_count: number;
+  created_at: string;
+  updated_at: string;
+  data_source_ref: string;
+}
+
+// One objective as the dataset detail and the non-empty delete 409 report it.
+// `status` is the goal's latest run state or the synthetic "no run".
+export interface ObjectiveSummary {
+  optimization_function_id: string;
+  goal_text: string;
+  dataset_id: string;
+  status: string;
+  created_at: string;
+}
+
+export interface DatasetDetail extends DatasetSummary {
+  objectives: ObjectiveSummary[];
+}
+
+// Metadata-only patch: datasource_ref is immutable and never accepted.
+export interface DatasetPatch {
+  name?: string;
+  description?: string;
+  status?: "active" | "archived";
 }
 
 export interface HeuristicMatch {
@@ -370,6 +407,12 @@ async function requestJSON<T>(input: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+// request performs a BFF call whose response has no JSON body (a 204 delete).
+async function request(input: string, init?: RequestInit): Promise<void> {
+  const res = await fetch(input, init);
+  if (!res.ok) throw await errorFrom(res);
+}
+
 export function submitGoal(form: FormData): Promise<SubmitGoalResponse> {
   return requestJSON<SubmitGoalResponse>(`${API_BASE}/goals`, {
     method: "POST",
@@ -391,8 +434,56 @@ export function triggerSleepCycle(id: string): Promise<SubmitGoalResponse> {
   );
 }
 
-export function listGoals(): Promise<GoalListItem[]> {
-  return requestJSON<GoalListItem[]>(`${API_BASE}/goals`);
+export function listGoals(datasetId?: string): Promise<GoalListItem[]> {
+  const query = datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : "";
+  return requestJSON<GoalListItem[]>(`${API_BASE}/goals${query}`);
+}
+
+export function listDatasets(q?: string): Promise<DatasetSummary[]> {
+  const query = q ? `?q=${encodeURIComponent(q)}` : "";
+  return requestJSON<DatasetSummary[]>(`${API_BASE}/datasets${query}`);
+}
+
+export function getDataset(id: string): Promise<DatasetDetail> {
+  return requestJSON<DatasetDetail>(
+    `${API_BASE}/datasets/${encodeURIComponent(id)}`,
+  );
+}
+
+export function createDataset(form: FormData): Promise<DatasetSummary> {
+  return requestJSON<DatasetSummary>(`${API_BASE}/datasets`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+export function updateDataset(
+  id: string,
+  patch: DatasetPatch,
+): Promise<DatasetSummary> {
+  return requestJSON<DatasetSummary>(`${API_BASE}/datasets/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+
+export function deleteDataset(id: string): Promise<void> {
+  return request(`${API_BASE}/datasets/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function deleteGoal(id: string): Promise<void> {
+  return request(`${API_BASE}/goals/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function deleteHeuristic(id: string): Promise<void> {
+  return request(`${API_BASE}/heuristics/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 }
 
 // listVerifications reads a goal's review queue. `status` narrows it to the rows

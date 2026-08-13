@@ -163,6 +163,19 @@ func (e *EmbeddingStore) Delete(ctx context.Context, nodeID string) error {
 	return nil
 }
 
+// DeleteByGoal removes every embedding row scoped to a goal. It is the objective
+// delete's post-transaction cleanup: the goal's Meta-Heuristic nodes are gone
+// from the graph first, so the rows exist only as goal-scoped residue. Deleting
+// for a goal with no rows is not an error (a goal-less legacy heuristic keeps its
+// NULL-goal row, which this never touches).
+func (e *EmbeddingStore) DeleteByGoal(ctx context.Context, goalID string) error {
+	_, err := e.pool.Exec(ctx, "DELETE FROM meta_heuristic_embeddings WHERE goal_id = $1", goalID)
+	if err != nil {
+		return fmt.Errorf("delete embeddings for goal %q: %w", goalID, err)
+	}
+	return nil
+}
+
 // SearchScope selects a SimilaritySearch's visibility. Exactly one mode is set:
 // a goal-scoped search (GoalID non-empty) returns only that goal's rows; a
 // cross-goal search (CrossGoal true) returns every row including the NULL-goal

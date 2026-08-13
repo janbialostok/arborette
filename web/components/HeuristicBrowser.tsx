@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import {
+  deleteHeuristic,
   errorMessage,
   listCausalVerifications,
   listGoals,
@@ -102,6 +103,22 @@ export function HeuristicBrowser() {
     }
   }
 
+  // removeHeuristic retires a selected heuristic (graph node, embedding row) and
+  // drops it from the current results without re-running the search. A refusal
+  // surfaces the orchestrator's named reason verbatim.
+  async function removeHeuristic(id: string) {
+    if (!window.confirm("Remove this heuristic and its embedding?")) return;
+    try {
+      await deleteHeuristic(id);
+      setResults((prev) => (prev ? prev.filter((m) => m.id !== id) : prev));
+      setSelected(null);
+    } catch (err) {
+      setSearchError(
+        errorMessage(err, "Could not remove the heuristic. Please retry."),
+      );
+    }
+  }
+
   return (
     <div className="flex flex-col gap-8 pt-4">
       <div className="flex flex-col gap-3 border-b border-line pb-6">
@@ -157,6 +174,7 @@ export function HeuristicBrowser() {
           key={selected?.id ?? "none"}
           heuristic={selected}
           scope={scope}
+          onRemove={removeHeuristic}
         />
       </div>
     </div>
@@ -228,9 +246,11 @@ function ResultList({
 function TracePanel({
   heuristic,
   scope,
+  onRemove,
 }: {
   heuristic: HeuristicMatch | null;
   scope: GoalScope | null;
+  onRemove: (id: string) => Promise<void>;
 }) {
   const [trace, setTrace] = useState<TraceTriplet[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -271,7 +291,16 @@ function TracePanel({
   return (
     <Panel className="flex flex-col gap-4 p-5">
       <div className="flex flex-col gap-2 border-b border-line pb-4">
-        <SectionLabel>Definition</SectionLabel>
+        <div className="flex items-start justify-between gap-3">
+          <SectionLabel>Definition</SectionLabel>
+          <button
+            type="button"
+            onClick={() => void onRemove(heuristic.id)}
+            className="shrink-0 border border-neg/30 px-2 py-1 text-[11px] uppercase tracking-wider text-neg transition-colors hover:border-neg/60"
+          >
+            Remove
+          </button>
+        </div>
         <p className="text-sm leading-relaxed text-fg">{heuristic.definition}</p>
       </div>
 

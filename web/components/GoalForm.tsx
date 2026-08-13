@@ -1,8 +1,13 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { errorMessage, submitGoal } from "@/lib/orchestrator";
+import {
+  errorMessage,
+  listDatasets,
+  submitGoal,
+  type DatasetSummary,
+} from "@/lib/orchestrator";
 import { Button, Callout, cn, SectionLabel } from "@/components/ui";
 
 type Source = "file" | "path";
@@ -17,9 +22,33 @@ export function GoalForm() {
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // The dataset picker: empty means "new data source" (the legacy upload/path
+  // ingest, which mints an implicit dataset). Selecting a dataset binds the goal
+  // to its already-ingested source and sends no upload.
+  const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
+  const [datasetID, setDatasetID] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    listDatasets()
+      .then((rows) => {
+        // Only active datasets can accept new objectives; archived ones are
+        // gate-409ed by the backend, so the picker omits them up front.
+        if (!cancelled) setDatasets(rows.filter((d) => d.status === "active"));
+      })
+      .catch(() => {
+        // A failed inventory load falls back to upload-only submission; the
+        // upload path needs no dataset list.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const bound = datasetID !== "";
   const canSubmit =
     goal.trim().length > 0 &&
-    (source === "file" ? file != null : importPath.trim().length > 0);
+    (bound || (source === "file" ? file != null : importPath.trim().length > 0));
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -29,10 +58,13 @@ export function GoalForm() {
       setError("Describe the goal before submitting.");
       return;
     }
-    // Enforce exactly-one-source client-side to avoid the both/neither 400s.
+    // Enforce exactly-one-source client-side: a bound goal sends dataset_id and
+    // nothing else; an unbound one sends exactly one of the file/path fields.
     const form = new FormData();
     form.set("goal", goal.trim());
-    if (source === "file") {
+    if (bound) {
+      form.set("dataset_id", datasetID);
+    } else if (source === "file") {
       if (!file) {
         setError("Choose a file to upload, or switch to an on-disk path.");
         return;
@@ -84,22 +116,50 @@ export function GoalForm() {
 
       <div className="flex flex-col gap-3">
         <SectionLabel>Data source</SectionLabel>
-        <div className="flex gap-1 rounded-lg border border-line bg-surface p-1">
-          <SourceTab
-            active={source === "file"}
-            onClick={() => setSource("file")}
-          >
-            File upload
-          </SourceTab>
-          <SourceTab
-            active={source === "path"}
-            onClick={() => setSource("path")}
-          >
-            On-disk path
-          </SourceTab>
-        </div>
+        <select
+          value={datasetID}
+          onChange={(e) => setDatasetID(e.target.value)}
+          aria-label="Data source dataset"
+          className="w-full rounded-lg border border-line bg-surface px-4 py-3 text-sm text-fg outline-hidden transition-colors focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+        >
+          <option value="">
+            New data source — upload a file or import a path
+          </option>
+          {datasets.map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.name}
+            </option>
+          ))}
+        </select>
 
-        {source === "file" ? (
+        {bound ? (
+          <div className="flex flex-col gap-2 rounded-lg border border-signal/25 bg-surface px-4 py-3">
+            <p className="text-sm text-fg">
+              Binding this goal to the selected dataset&apos;s data source.
+            </p>
+            <p className="text-xs leading-relaxed text-muted">
+              No upload needed — the objective fits against the dataset&apos;s
+              already-ingested data. Pick a new data source to upload instead.
+            </p>
+          </div>
+        ) : (
+          <>
+            <div className="flex gap-1 rounded-lg border border-line bg-surface p-1">
+              <SourceTab
+                active={source === "file"}
+                onClick={() => setSource("file")}
+              >
+                File upload
+              </SourceTab>
+              <SourceTab
+                active={source === "path"}
+                onClick={() => setSource("path")}
+              >
+                On-disk path
+              </SourceTab>
+            </div>
+
+            {source === "file" ? (
           <div className="flex flex-col gap-2">
             <input
               ref={fileInputRef}
@@ -135,9 +195,11 @@ export function GoalForm() {
             <p className="text-xs text-faint">
               Relative path resolved under the server&apos;s read-only import
               mount. Absolute paths and <span className="font-mono">..</span>{" "}
-              escapes are rejected.
+                            escapes are rejected.
             </p>
           </div>
+        )}
+          </>
         )}
       </div>
 

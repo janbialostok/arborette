@@ -7,6 +7,7 @@ import { cn } from "@/components/ui";
 const LINKS = [
   { href: "/", label: "Submit goal" },
   { href: "/goals", label: "Objectives" },
+  { href: "/datasets", label: "Datasets" },
   { href: "/heuristics", label: "Heuristics" },
 ];
 

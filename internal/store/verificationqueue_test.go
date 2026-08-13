@@ -259,6 +259,7 @@ func TestGoalRegistryReviewSettings(t *testing.T) {
 			GoalText:               "extract the effective dates",
 			TargetFields:           []domain.TargetField{{Name: "effective_date"}},
 			DataSourceRef:          "s3://arborette/contract.pdf",
+			DatasetID:              seedDataset(t, ctx, p),
 			ConfidenceThreshold:    &threshold,
 			EpochMode:              store.EpochBlocking,
 		}); err != nil {

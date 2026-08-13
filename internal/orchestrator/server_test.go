@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,10 @@ type fakeGoals struct {
 	listErr       error
 	claimErrors   []string
 	claimErrorErr error
+	refExists     bool
+	refExistsErr  error
+	deleteErr     error
+	deletedID     string
 }
 
 func (f *fakeGoals) Insert(_ context.Context, g store.Goal) error {
@@ -53,6 +58,9 @@ func (f *fakeGoals) RegisterDataSourceRef(_ context.Context, ref string) error {
 	f.registeredRef = ref
 	return nil
 }
+func (f *fakeGoals) DataSourceRefExists(_ context.Context, _ string) (bool, error) {
+	return f.refExists, f.refExistsErr
+}
 func (f *fakeGoals) Get(_ context.Context, _ string) (store.Goal, error) {
 	return f.get, f.getErr
 }
@@ -64,6 +72,34 @@ func (f *fakeGoals) SetClaimError(_ context.Context, _, reason string) error {
 		return f.claimErrorErr
 	}
 	f.claimErrors = append(f.claimErrors, reason)
+	return nil
+}
+func (f *fakeGoals) ListByDataset(_ context.Context, datasetID string) ([]store.Goal, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var filtered []store.Goal
+	for _, g := range f.list {
+		if g.DatasetID == datasetID {
+			filtered = append(filtered, g)
+		}
+	}
+	return filtered, nil
+}
+func (f *fakeGoals) SetDatasetID(_ context.Context, _, datasetID string) error {
+	if f.listErr != nil {
+		return f.listErr
+	}
+	return nil
+}
+func (f *fakeGoals) Delete(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deletedID = id
 	return nil
 }
 
@@ -267,18 +303,23 @@ func (f *fakeAudits) records() []store.AuditRecord {
 }
 
 type fakeObjects struct {
-	puts    int
-	putErr  error
-	getData []byte
-	getErr  error
+	mu        sync.Mutex
+	puts      int
+	putErr    error
+	getData   []byte
+	getErr    error
+	deleted   []string
+	deleteErr error
 }
 
-func (fakeObjects) NewKey(parts ...string) string { return strings.Join(parts, "/") }
+func (f *fakeObjects) NewKey(parts ...string) string { return strings.Join(parts, "/") }
 func (f *fakeObjects) Put(_ context.Context, _ string, r io.Reader, _ string) error {
 	io.Copy(io.Discard, r)
 	if f.putErr != nil {
 		return f.putErr
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.puts++
 	return nil
 }
@@ -287,6 +328,225 @@ func (f *fakeObjects) Get(_ context.Context, _ string) (io.ReadCloser, error) {
 		return nil, f.getErr
 	}
 	return io.NopCloser(bytes.NewReader(f.getData)), nil
+}
+func (f *fakeObjects) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deleted = append(f.deleted, key)
+	return nil
+}
+
+// deletedKeys returns the keys retired through Delete, for a refcount-cleanup
+// assertion.
+func (f *fakeObjects) deletedKeys() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deleted...)
+}
+
+// fakeDatasets is an in-memory dataset store for the inventory/editor/delete
+// handlers. objectivesByDataset stands in for the goals a delete must refuse on,
+// refUsage for the refcount-aware retirement, and the per-op error fields let a
+// test force a 409 name conflict, a 404, or a 500.
+type fakeDatasets struct {
+	mu                  sync.Mutex
+	datasets            []store.Dataset
+	nextID              int
+	objectivesByDataset map[string][]store.Goal
+	refUsage            map[string][2]int
+	deletedRefs         []string
+	getErr              error
+	createErr           error
+	updateErr           error
+	deleteErr           error
+	usageErr            error
+}
+
+func (f *fakeDatasets) seed(ds ...store.Dataset) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.datasets = append(f.datasets, ds...)
+}
+
+// currentDatasets is a mutex-guarded read accessor for the seeded and created
+// rows, so a test can inspect what a handler left behind.
+func (f *fakeDatasets) currentDatasets() []store.Dataset {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]store.Dataset(nil), f.datasets...)
+}
+
+func (f *fakeDatasets) Create(_ context.Context, d store.Dataset) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.createErr != nil {
+		return "", f.createErr
+	}
+	for _, existing := range f.datasets {
+		if strings.EqualFold(existing.Name, d.Name) {
+			return "", store.ErrNameConflict
+		}
+	}
+	f.nextID++
+	id := "dataset-" + strconv.Itoa(f.nextID)
+	d.ID = id
+	d.CreatedAt = time.Now()
+	d.UpdatedAt = d.CreatedAt
+	f.datasets = append(f.datasets, d)
+	return id, nil
+}
+
+func (f *fakeDatasets) Get(_ context.Context, id string) (store.Dataset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return store.Dataset{}, f.getErr
+	}
+	for i := range f.datasets {
+		if f.datasets[i].ID == id {
+			d := f.datasets[i]
+			d.ObjectiveCount = len(f.objectivesByDataset[id])
+			return d, nil
+		}
+	}
+	return store.Dataset{}, pgx.ErrNoRows
+}
+
+func (f *fakeDatasets) GetByRef(_ context.Context, ref string) (store.Dataset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.datasets {
+		if f.datasets[i].DataSourceRef == ref {
+			d := f.datasets[i]
+			d.ObjectiveCount = len(f.objectivesByDataset[d.ID])
+			return d, nil
+		}
+	}
+	return store.Dataset{}, pgx.ErrNoRows
+}
+
+func (f *fakeDatasets) List(_ context.Context, query string) ([]store.Dataset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]store.Dataset, 0, len(f.datasets))
+	for _, d := range f.datasets {
+		if query != "" && !strings.Contains(strings.ToLower(d.Name), strings.ToLower(query)) {
+			continue
+		}
+		d.ObjectiveCount = len(f.objectivesByDataset[d.ID])
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+func (f *fakeDatasets) Update(_ context.Context, id, name, description string, status store.DatasetStatus) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	for i := range f.datasets {
+		if f.datasets[i].ID == id {
+			for _, other := range f.datasets {
+				if other.ID != id && strings.EqualFold(other.Name, name) {
+					return store.ErrNameConflict
+				}
+			}
+			f.datasets[i].Name = name
+			f.datasets[i].Description = description
+			f.datasets[i].Status = status
+			f.datasets[i].UpdatedAt = time.Now()
+			return nil
+		}
+	}
+	return pgx.ErrNoRows
+}
+
+func (f *fakeDatasets) CountObjectives(_ context.Context, id string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.objectivesByDataset[id]), nil
+}
+
+func (f *fakeDatasets) ListObjectives(_ context.Context, datasetID string) ([]store.Goal, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]store.Goal(nil), f.objectivesByDataset[datasetID]...), nil
+}
+
+func (f *fakeDatasets) Delete(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	for i := range f.datasets {
+		if f.datasets[i].ID == id {
+			f.datasets = append(f.datasets[:i], f.datasets[i+1:]...)
+			return nil
+		}
+	}
+	return pgx.ErrNoRows
+}
+
+func (f *fakeDatasets) DataSourceRefUsage(_ context.Context, ref string) (int, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.usageErr != nil {
+		return 0, 0, f.usageErr
+	}
+	u := f.refUsage[ref]
+	return u[0], u[1], nil
+}
+
+func (f *fakeDatasets) DeleteDataSourceRef(_ context.Context, ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deletedRefs = append(f.deletedRefs, ref)
+	return nil
+}
+
+// fakeEmbeddings is the pgvector seam the delete handlers retire rows through.
+// Guarded because a completed delete could be asserted after the request
+// goroutine returns.
+type fakeEmbeddings struct {
+	mu              sync.Mutex
+	deleted         []string
+	deletedByGoal   []string
+	deleteErr       error
+	deleteByGoalErr error
+}
+
+func (f *fakeEmbeddings) Delete(ctx context.Context, nodeID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deleted = append(f.deleted, nodeID)
+	return nil
+}
+
+func (f *fakeEmbeddings) DeleteByGoal(ctx context.Context, goalID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deleteByGoalErr != nil {
+		return f.deleteByGoalErr
+	}
+	f.deletedByGoal = append(f.deletedByGoal, goalID)
+	return nil
 }
 
 type fakeHeur struct {
@@ -447,6 +707,16 @@ type fakeRepo struct {
 	correctErr        error
 	correctedVersion  int
 	resolvedColumns   []string
+
+	// The delete surface: metaHeuristicsByID backs the heuristic-remove 404
+	// check, and the delete methods record what was retired so a test can assert
+	// the goal/embedding invocation order.
+	metaHeuristicsByID map[string]domain.MetaHeuristic
+	metaHeuristicErr   error
+	deleteMHErr        error
+	deleteGraphErr     error
+	deletedHeuristics  []string
+	deletedGoalGraphs  []string
 }
 
 func (f *fakeRepo) CreateState(_ context.Context, s domain.State) error {
@@ -525,6 +795,37 @@ func (f *fakeRepo) GetIntervention(_ context.Context, id string) (domain.Interve
 		return domain.Intervention{}, graph.ErrNotFound
 	}
 	return i, nil
+}
+
+func (f *fakeRepo) GetMetaHeuristic(_ context.Context, id string) (domain.MetaHeuristic, error) {
+	if f.metaHeuristicErr != nil {
+		return domain.MetaHeuristic{}, f.metaHeuristicErr
+	}
+	mh, ok := f.metaHeuristicsByID[id]
+	if !ok {
+		return domain.MetaHeuristic{}, graph.ErrNotFound
+	}
+	return mh, nil
+}
+
+func (f *fakeRepo) DeleteMetaHeuristic(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deleteMHErr != nil {
+		return f.deleteMHErr
+	}
+	f.deletedHeuristics = append(f.deletedHeuristics, id)
+	return nil
+}
+
+func (f *fakeRepo) DeleteGoalGraph(_ context.Context, goalID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deleteGraphErr != nil {
+		return f.deleteGraphErr
+	}
+	f.deletedGoalGraphs = append(f.deletedGoalGraphs, goalID)
+	return nil
 }
 
 func (f *fakeRepo) ListEligibleFindings(_ context.Context, _ string) ([]graph.CausalTriplet, error) {
@@ -769,6 +1070,8 @@ type testServer struct {
 	goals               goalStore
 	audits              auditStore
 	objects             objectStore
+	datasets            datasetStore
+	embeddings          embeddingsStore
 	heur                heuristicsService
 	claude              claudeClient
 	sandbox             sandboxExecutor
@@ -814,6 +1117,8 @@ func (ts testServer) build() *Server {
 		orElse(ts.graphLock, &fakeGraphLock{acquired: true}).(graphLocker),
 		orElse(ts.audits, &fakeAudits{}).(auditStore),
 		orElse(ts.objects, &fakeObjects{}).(objectStore),
+		orElse(ts.datasets, &fakeDatasets{}).(datasetStore),
+		orElse(ts.embeddings, &fakeEmbeddings{}).(embeddingsStore),
 		orElse(ts.heur, &fakeHeur{}).(heuristicsService),
 		orElse(ts.claude, &fakeClaude{}).(claudeClient),
 		&fakeChat{},

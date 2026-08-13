@@ -1,0 +1,24 @@
+# Version control / CI
+.git
+.gitignore
+
+# Secrets
+.env
+
+# Agentic tooling + planning artifacts (docs only, never needed at build time)
+.specify
+.turbo
+.opencode
+
+# Go build/test artifacts
+*.out
+*.test
+coverage/
+
+# Web UI (built via its own ./web context; excluded so the Go builds stay lean)
+web/node_modules
+web/.next
+web/next-env.d.ts
+
+# Editor/OS
+.DS_Store
