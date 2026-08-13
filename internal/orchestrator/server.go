@@ -105,13 +105,19 @@ type sandboxExecutor interface {
 	DocumentText(ctx context.Context, req DocumentTextRequest) (DocumentTextResponse, error)
 }
 
-type goalStore interface {
-	Insert(ctx context.Context, goal store.Goal) error
+type datasetStore interface {
+	Insert(ctx context.Context, ds store.Dataset) error
 	RegisterDataSourceRef(ctx context.Context, ref string) error
-	Get(ctx context.Context, optimizationFunctionID string) (store.Goal, error)
-	List(ctx context.Context) ([]store.Goal, error)
+	Get(ctx context.Context, optimizationFunctionID string) (store.Dataset, error)
+	List(ctx context.Context) ([]store.Dataset, error)
 	SetClaimError(ctx context.Context, optimizationFunctionID, reason string) error
+	Delete(ctx context.Context, optimizationFunctionID string) error
 }
+
+// goalStore is a deprecated alias for datasetStore.
+//
+// Deprecated: Use datasetStore instead.
+type goalStore = datasetStore
 
 // runStore is the run-lifecycle surface the loop and the objectives list need.
 // FailOrphaned is deliberately absent: boot-time reconciliation calls it on the
@@ -147,9 +153,9 @@ type objectStore interface {
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
 }
 
-type heuristicsService interface {
+type insightsService interface {
 	Query(ctx context.Context, stateString string, k int, scope store.SearchScope) ([]heuristics.Match, error)
-	Trace(ctx context.Context, metaHeuristicID string) ([]graph.CausalTriplet, error)
+	Trace(ctx context.Context, insightID string) ([]graph.CausalTriplet, error)
 }
 
 // RouterConfig bundles the knobs that govern when verification runs: whether
@@ -178,7 +184,7 @@ type Server struct {
 	graphLock           graphLocker
 	audits              auditStore
 	objects             objectStore
-	heur                heuristicsService
+	heur                insightsService
 	claude              claudeClient
 	chat                chatStreamer
 	sandbox             sandboxExecutor
@@ -212,7 +218,7 @@ func NewServer(
 	graphLock graphLocker,
 	audits auditStore,
 	objects objectStore,
-	heur heuristicsService,
+	heur insightsService,
 	claude claudeClient,
 	chat chatStreamer,
 	sandbox sandboxExecutor,
@@ -260,8 +266,30 @@ func NewServer(
 // is the one guarded route: it is service-to-service, so it can carry a shared
 // secret no analyst has to hold. The analyst-facing routes stay open -- analyst
 // authentication is a separate concern from this internal boundary.
+//
+// Both old (/goals, /heuristics) and new (/datasets, /insights) paths are
+// registered; old paths remain for backward compatibility and redirect clients.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
+	// New dataset routes.
+	mux.HandleFunc("POST /datasets", s.handleSubmitGoal)
+	mux.HandleFunc("GET /datasets", s.handleListGoals)
+	mux.HandleFunc("POST /datasets/{id}/hypothesis-loop", s.handleTriggerLoop)
+	mux.HandleFunc("GET /datasets/{id}/stream", s.handleStream)
+	mux.HandleFunc("POST /datasets/{id}/chat", s.handleChat)
+	mux.HandleFunc("POST /datasets/{id}/sleep-cycle", s.handleTriggerSleepCycle)
+	mux.HandleFunc("GET /datasets/{id}/verifications", s.handleListVerifications)
+	mux.HandleFunc("POST /datasets/{id}/verifications/{outcomeID}", s.handleResolveVerification)
+	mux.HandleFunc("GET /datasets/{id}/outcomes", s.handleListOutcomes)
+	mux.HandleFunc("GET /datasets/{id}/outcomes/{outcomeID}/excerpt", s.handleOutcomeExcerpt)
+	mux.HandleFunc("GET /datasets/{id}/causal-graph", s.handleCausalGraph)
+	mux.HandleFunc("POST /datasets/{id}/causal-graph/corrections", s.handleCausalCorrection)
+	mux.HandleFunc("POST /datasets/{id}/findings/{interventionID}/verify", s.handleVerifyFinding)
+	mux.HandleFunc("GET /datasets/{id}/causal-verifications", s.handleListCausalVerifications)
+	mux.HandleFunc("DELETE /datasets/{id}", s.handleDeleteGoal)
+	mux.HandleFunc("GET /insights/search", s.handleInsightSearch)
+	mux.HandleFunc("GET /insights/{id}/trace", s.handleInsightTrace)
+	// Backward-compatible old paths.
 	mux.HandleFunc("POST /goals", s.handleSubmitGoal)
 	mux.HandleFunc("GET /goals", s.handleListGoals)
 	mux.HandleFunc("POST /goals/{id}/hypothesis-loop", s.handleTriggerLoop)
@@ -276,6 +304,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /goals/{id}/causal-graph/corrections", s.handleCausalCorrection)
 	mux.HandleFunc("POST /goals/{id}/findings/{interventionID}/verify", s.handleVerifyFinding)
 	mux.HandleFunc("GET /goals/{id}/causal-verifications", s.handleListCausalVerifications)
+	mux.HandleFunc("DELETE /goals/{id}", s.handleDeleteGoal)
 	mux.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
 	mux.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)
 	mux.Handle("POST /internal/audit", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleAudit)))
@@ -283,18 +312,18 @@ func (s *Server) Routes() http.Handler {
 	return mux
 }
 
-// lookupGoal fetches a goal, writing a 404 for a missing id and a masked 500
-// otherwise. The bool is false when a response has already been written.
-func (s *Server) lookupGoal(ctx context.Context, w http.ResponseWriter, id string) (store.Goal, bool) {
-	goal, err := s.goals.Get(ctx, id)
+// lookupGoal fetches a dataset, writing a 404 response for a missing id and a
+// masked 500 otherwise. The bool is false when a response has already been written.
+func (s *Server) lookupGoal(ctx context.Context, w http.ResponseWriter, id string) (store.Dataset, bool) {
+	ds, err := s.goals.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			service.WriteErr(w, http.StatusNotFound, "goal not found")
-			return store.Goal{}, false
+			service.WriteErr(w, http.StatusNotFound, "dataset not found")
+			return store.Dataset{}, false
 		}
-		log.Printf("orchestrator: get goal %q: %v", id, err)
+		log.Printf("orchestrator: get dataset %q: %v", id, err)
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")
-		return store.Goal{}, false
+		return store.Dataset{}, false
 	}
-	return goal, true
+	return ds, true
 }

@@ -13,7 +13,7 @@ import (
 // backend can implement it as a no-op outright, since Neptune has no schema
 // constraints.
 func (r *Neo4jRepository) InitSchema(ctx context.Context) error {
-	labels := []string{labelState, labelIntervention, labelOutcome, labelMetaHeuristic, labelDataColumn, labelCausalGraphMeta}
+	labels := []string{labelState, labelIntervention, labelOutcome, labelInsight, labelDataColumn, labelCausalGraphMeta}
 	_, err := r.write(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		for _, label := range labels {
 			constraint := fmt.Sprintf(

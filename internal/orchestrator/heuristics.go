@@ -18,14 +18,19 @@ const (
 )
 
 // The response DTOs below select and snake_case the fields the web UI needs.
-// heuristics.Match wraps domain.MetaHeuristic and graph.CausalTriplet wraps
+// heuristics.Match wraps domain.Insight and graph.CausalTriplet wraps
 // domain.State/Intervention/Outcome — none carry json tags, so marshaling them
 // directly would emit PascalCase keys and leak internal fields.
 
-type heuristicMatchDTO struct {
+type insightMatchDTO struct {
 	ID         string `json:"id"`
 	Definition string `json:"definition"`
 }
+
+// heuristicMatchDTO is a deprecated alias.
+//
+// Deprecated: Use insightMatchDTO instead.
+type heuristicMatchDTO = insightMatchDTO
 
 type stateDTO struct {
 	ID         string         `json:"id"`
@@ -50,9 +55,9 @@ type tripletDTO struct {
 	Outcome      outcomeDTO      `json:"outcome"`
 }
 
-// handleHeuristicSearch backs the web UI's heuristic browser: it runs the shared
+// handleInsightSearch backs the web UI's insight browser: it runs the shared
 // embedding-similarity query and returns the mapped matches.
-func (s *Server) handleHeuristicSearch(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleInsightSearch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	if q == "" {
 		service.WriteErr(w, http.StatusBadRequest, "q is required")
@@ -68,30 +73,29 @@ func (s *Server) handleHeuristicSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// The browser's heuristic surface is deliberately cross-goal by default: it
-	// browses the whole accumulated corpus, including the NULL-goal legacy rows. An
-	// explicit goal_id narrows it to one goal's heuristics.
+	// The browser's insight surface is deliberately cross-dataset by default: it
+	// browses the whole accumulated corpus. An explicit dataset_id narrows it.
 	scope := store.ScopeFromGoalID(r.URL.Query().Get("goal_id"))
 
 	matches, err := s.heur.Query(r.Context(), q, k, scope)
 	if err != nil {
-		log.Printf("orchestrator: heuristic search: %v", err)
+		log.Printf("orchestrator: insight search: %v", err)
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := make([]heuristicMatchDTO, 0, len(matches))
+	out := make([]insightMatchDTO, 0, len(matches))
 	for _, m := range matches {
-		out = append(out, heuristicMatchDTO{ID: m.MetaHeuristic.ID, Definition: m.MetaHeuristic.Definition})
+		out = append(out, insightMatchDTO{ID: m.MetaHeuristic.ID, Definition: m.MetaHeuristic.Definition})
 	}
 	service.WriteJSON(w, http.StatusOK, out)
 }
 
-// handleHeuristicTrace backs the trace view: it walks the causal chain behind a
-// Meta-Heuristic and returns the mapped triplets.
-func (s *Server) handleHeuristicTrace(w http.ResponseWriter, r *http.Request) {
+// handleInsightTrace backs the trace view: it walks the causal chain behind an
+// Insight and returns the mapped triplets.
+func (s *Server) handleInsightTrace(w http.ResponseWriter, r *http.Request) {
 	triplets, err := s.heur.Trace(r.Context(), r.PathValue("id"))
 	if err != nil {
-		log.Printf("orchestrator: heuristic trace: %v", err)
+		log.Printf("orchestrator: insight trace: %v", err)
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -101,6 +105,11 @@ func (s *Server) handleHeuristicTrace(w http.ResponseWriter, r *http.Request) {
 	}
 	service.WriteJSON(w, http.StatusOK, out)
 }
+
+// Deprecated wrappers that delegate to the new handler names for backward compat.
+
+func (s *Server) handleHeuristicSearch(w http.ResponseWriter, r *http.Request) { s.handleInsightSearch(w, r) }
+func (s *Server) handleHeuristicTrace(w http.ResponseWriter, r *http.Request)  { s.handleInsightTrace(w, r) }
 
 func toTripletDTO(t graph.CausalTriplet) tripletDTO {
 	return tripletDTO{

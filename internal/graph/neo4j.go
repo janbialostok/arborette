@@ -15,14 +15,15 @@ import (
 // absent node from an unreachable database.
 var ErrNotFound = errors.New("node not found")
 
-// Node labels. The abstraction node is conceptually "Meta-Heuristic"; the graph
-// uses the hyphen-free MetaHeuristic label so no Cypher needs backtick quoting,
-// keeping every statement inside the Neptune-portable subset.
+// Node labels. The abstraction node is now "Insight" (formerly "Meta-Heuristic");
+// meta_heuristic_id is still the wire value per the graph's existing nodes, but
+// new code should use labelInsight for new nodes.
 const (
 	labelState           = "State"
 	labelIntervention    = "Intervention"
 	labelOutcome         = "Outcome"
-	labelMetaHeuristic   = "MetaHeuristic"
+	labelInsight         = "Insight"
+	labelMetaHeuristic   = labelInsight
 	labelDataColumn      = "DataColumn"
 	labelCausalGraphMeta = "CausalGraphMeta"
 )
@@ -83,7 +84,7 @@ func (r *Neo4jRepository) CreateState(ctx context.Context, s domain.State) error
 	return r.writeOp(ctx, "create state "+s.ID, func(tx neo4j.ManagedTransaction) (any, error) {
 		return tx.Run(ctx,
 			"MERGE (n:"+labelState+" {id: $id}) SET n.goal_id = $goalID, n.properties = $properties",
-			map[string]any{"id": s.ID, "goalID": s.GoalID, "properties": props},
+			map[string]any{"id": s.ID, "goalID": s.DatasetID, "properties": props},
 		)
 	})
 }
@@ -99,7 +100,7 @@ func (r *Neo4jRepository) CreateIntervention(ctx context.Context, i domain.Inter
 				"SET n.goal_id = $goalID, n.type = $type, n.sleep_derived = $sleepDerived, n.properties = $properties",
 			map[string]any{
 				"id":           i.ID,
-				"goalID":       i.GoalID,
+				"goalID":       i.DatasetID,
 				"type":         string(i.Type),
 				"sleepDerived": i.SleepDerived,
 				"properties":   props,
@@ -129,7 +130,7 @@ func (r *Neo4jRepository) CreateOutcome(ctx context.Context, o domain.Outcome) e
 				"SET n.goal_id = $goalID, n.verification_status = $status, n.value = $value, n."+domain.PropSupport+" = $support, n.provenance = $provenance",
 			map[string]any{
 				"id":         o.ID,
-				"goalID":     o.GoalID,
+				"goalID":     o.DatasetID,
 				"status":     string(o.VerificationStatus),
 				"value":      value,
 				"support":    support,
@@ -352,9 +353,9 @@ func (r *Neo4jRepository) CreateMetaHeuristic(ctx context.Context, mh domain.Met
 			map[string]any{
 				"id":           mh.ID,
 				"definition":   mh.Definition,
-				"goalID":       mh.GoalID,
+				"goalID":       mh.DatasetID,
 				"terms":        terms,
-				"originGoalID": mh.OriginGoalID,
+				"originGoalID": mh.OriginDatasetID,
 				"originRef":    mh.OriginDataSourceRef,
 				"ids":          abstractedFrom,
 			},
@@ -630,7 +631,7 @@ func extractionOutcomeFromRecord(rec *neo4j.Record) (ExtractionOutcome, error) {
 	method, _ := intervention.Properties["method"].(string)
 	return ExtractionOutcome{
 		OutcomeID:          outcome.ID,
-		GoalID:             outcome.GoalID,
+		DatasetID:          outcome.DatasetID,
 		Field:              field,
 		Method:             method,
 		Value:              outcome.Value,
@@ -767,7 +768,7 @@ func stateFromNode(id string, node neo4j.Node) (domain.State, error) {
 	if err != nil {
 		return domain.State{}, err
 	}
-	return domain.State{ID: id, GoalID: stringProp(node.Props["goal_id"]), Properties: props}, nil
+	return domain.State{ID: id, DatasetID: stringProp(node.Props["goal_id"]), Properties: props}, nil
 }
 
 func interventionFromNode(id string, node neo4j.Node) (domain.Intervention, error) {
@@ -779,30 +780,47 @@ func interventionFromNode(id string, node neo4j.Node) (domain.Intervention, erro
 	sleepDerived, _ := node.Props["sleep_derived"].(bool)
 	return domain.Intervention{
 		ID:           id,
-		GoalID:       stringProp(node.Props["goal_id"]),
+		DatasetID:    stringProp(node.Props["goal_id"]),
 		Type:         domain.InterventionType(typ),
 		SleepDerived: sleepDerived,
 		Properties:   props,
 	}, nil
 }
 
-// metaHeuristicFromNode decodes one Meta-Heuristic node. Undecodable ontology
-// terms read as none rather than failing the read: the terms are a reuse
-// optimization (their absence routes the heuristic through grounding), so a
-// malformed property must not blank out a search whose neighbourhood touches it.
-func metaHeuristicFromNode(node neo4j.Node) domain.MetaHeuristic {
+// insightFromNode decodes one Insight node. Undecodable ontology terms read as
+// none rather than failing the read: the terms are a reuse optimization (their
+// absence routes the insight through grounding), so a malformed property must not
+// blank out a search whose neighbourhood touches it.
+func insightFromNode(node neo4j.Node) domain.Insight {
 	def, _ := node.Props["definition"].(string)
 	pending, _ := node.Props["embedding_pending"].(bool)
 	stale, _ := node.Props["stale"].(bool)
-	return domain.MetaHeuristic{
+	return domain.Insight{
 		ID:                  stringProp(node.Props["id"]),
 		Definition:          def,
-		GoalID:              stringProp(node.Props["goal_id"]),
+		DatasetID:           stringProp(node.Props["goal_id"]),
 		EmbeddingPending:    pending,
 		Stale:               stale,
 		OntologyTerms:       unmarshalOntologyTerms(node.Props["ontology_terms"]),
-		OriginGoalID:        stringProp(node.Props["origin_goal_id"]),
+		OriginDatasetID:     stringProp(node.Props["origin_goal_id"]),
 		OriginDataSourceRef: stringProp(node.Props["origin_datasource_ref"]),
+	}
+}
+
+// metaHeuristicFromNode is a deprecated wrapper around insightFromNode.
+//
+// Deprecated: Use insightFromNode instead.
+func metaHeuristicFromNode(node neo4j.Node) domain.MetaHeuristic {
+	result := insightFromNode(node)
+	return domain.MetaHeuristic{
+		ID:                  result.ID,
+		Definition:          result.Definition,
+		DatasetID:           result.DatasetID,
+		EmbeddingPending:    result.EmbeddingPending,
+		Stale:               result.Stale,
+		OntologyTerms:       result.OntologyTerms,
+		OriginDatasetID:     result.OriginDatasetID,
+		OriginDataSourceRef: result.OriginDataSourceRef,
 	}
 }
 
@@ -846,7 +864,7 @@ func outcomeFromNode(id string, node neo4j.Node) (domain.Outcome, error) {
 	support, _ := node.Props[domain.PropSupport].(int64)
 	return domain.Outcome{
 		ID:                 id,
-		GoalID:             stringProp(node.Props["goal_id"]),
+		DatasetID:          stringProp(node.Props["goal_id"]),
 		VerificationStatus: domain.VerificationStatus(status),
 		Value:              value,
 		Support:            support,

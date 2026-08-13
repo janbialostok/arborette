@@ -49,7 +49,7 @@ func (w *Worker) writeWinners(ctx context.Context, target searchTarget, obj obje
 		if err != nil {
 			log.Printf("sleepcycle: write back macro-segment: %v", err)
 			w.report(ctx, "sleepcycle_writeback_failure", "failure", map[string]any{
-				"optimization_function_id": target.goalID,
+				"optimization_function_id": target.datasetID,
 				"canonical_filter":         seg.node.canonical,
 				"error":                    err.Error(),
 			})
@@ -79,7 +79,7 @@ func (w *Worker) writeSegment(ctx context.Context, target searchTarget, obj obje
 	interventionID := derivedID(target.namespace, roleIntervention, canonical)
 	outcomeID := derivedID(target.namespace, roleOutcome, canonical)
 
-	state := domain.State{ID: stateID, GoalID: target.goalID, Properties: map[string]any{
+	state := domain.State{ID: stateID, DatasetID: target.datasetID, Properties: map[string]any{
 		domain.PropDataSourceRef:        target.dataSourceRef,
 		domain.PropObjectiveAggregation: obj.Aggregation,
 		domain.PropObjectiveLabel:       obj.Label,
@@ -92,7 +92,7 @@ func (w *Worker) writeSegment(ctx context.Context, target searchTarget, obj obje
 
 	intervention := domain.Intervention{
 		ID:           interventionID,
-		GoalID:       target.goalID,
+		DatasetID:       target.datasetID,
 		Type:         domain.InterventionQuery,
 		SleepDerived: true,
 		Properties: map[string]any{
@@ -116,7 +116,7 @@ func (w *Worker) writeSegment(ctx context.Context, target searchTarget, obj obje
 
 	outcome := domain.Outcome{
 		ID:                 outcomeID,
-		GoalID:             target.goalID,
+		DatasetID:             target.datasetID,
 		VerificationStatus: domain.VerificationVerified,
 		Value:              map[string]any{obj.Label: seg.measurement.Value},
 		Support:            seg.measurement.Support,
@@ -143,7 +143,7 @@ func (w *Worker) writeSegment(ctx context.Context, target searchTarget, obj obje
 	// the segment itself: an empty string is a valid-looking id, and a consumer
 	// counting knowledge reuse would file such a winner under a phantom heuristic.
 	interventionDetail := map[string]any{
-		"optimization_function_id": target.goalID,
+		"optimization_function_id": target.datasetID,
 		"intervention_id":          interventionID,
 		"canonical_filter":         canonical,
 		"support":                  seg.measurement.Support,
@@ -157,7 +157,7 @@ func (w *Worker) writeSegment(ctx context.Context, target searchTarget, obj obje
 	}
 	w.report(ctx, "sleepcycle_intervention", "intervention", interventionDetail)
 	w.report(ctx, "sleepcycle_outcome", "outcome", map[string]any{
-		"optimization_function_id": target.goalID,
+		"optimization_function_id": target.datasetID,
 		"outcome_id":               outcomeID,
 		"value":                    seg.measurement.Value,
 	})

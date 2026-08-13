@@ -5,11 +5,11 @@ import {
   errorMessage,
   listCausalVerifications,
   listGoals,
-  searchHeuristics,
-  traceHeuristic,
+  searchInsights,
+  traceInsight,
   type CausalVerification,
   type GoalListItem,
-  type HeuristicMatch,
+  type InsightMatch,
   type TraceTriplet,
 } from "@/lib/orchestrator";
 import { epistemicSource, inFlight, latestByIntervention } from "@/lib/causal";
@@ -27,11 +27,11 @@ import {
   type BadgeTone,
 } from "@/components/ui";
 
-// A goal's causal verdicts, joined onto the evidence rows of a search scoped to
-// that goal. Only a scoped search can carry them: a trace triplet names no goal, and
-// a finding belonging to another goal cannot be verified against this one — so
-// cross-goal browsing gets neither the badge nor the button rather than an
-// affordance that answers "finding not found".
+// A dataset's causal verdicts, joined onto the evidence rows of a search scoped to
+// that dataset. Only a scoped search can carry them: a trace triplet names no
+// dataset, and a finding belonging to another dataset cannot be verified against
+// this one — so cross-dataset browsing gets neither the badge nor the button rather
+// than an affordance that answers "finding not found".
 interface GoalScope {
   goalID: string;
   // null when the verdicts could not be read: the rows then offer verification
@@ -49,19 +49,20 @@ async function loadScope(goalID: string): Promise<GoalScope> {
   }
 }
 
-export function HeuristicBrowser() {
+export function HeuristicBrowser({ datasetID }: { datasetID?: string } = {}) {
   const [q, setQ] = useState("");
-  const [results, setResults] = useState<HeuristicMatch[] | null>(null);
+  const [results, setResults] = useState<InsightMatch[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<HeuristicMatch | null>(null);
+  const [selected, setSelected] = useState<InsightMatch | null>(null);
   const [goals, setGoals] = useState<GoalListItem[]>([]);
-  const [goalId, setGoalId] = useState("");
+  const [goalId, setGoalId] = useState(datasetID ?? "");
   const [scope, setScope] = useState<GoalScope | null>(null);
 
-  // Populate the scope selector. The corpus is browsable cross-goal by default;
-  // scoping to a goal is what surfaces that goal's own heuristics instead of the
-  // whole (legacy-heavy) corpus. A load failure just leaves the "All goals" option.
+  // Populate the scope selector. The corpus is browsable across all datasets by
+  // default; scoping to a dataset surfaces that dataset's own insights instead of
+  // the whole (legacy-heavy) corpus. A load failure just leaves the "All datasets"
+  // option.
   useEffect(() => {
     let cancelled = false;
     listGoals()
@@ -85,10 +86,10 @@ export function HeuristicBrowser() {
     setSearching(true);
     setSelected(null);
     try {
-      // The verdicts depend on the goal filter, not on what the search returns, so
+      // The verdicts depend on the dataset filter, not on what the search returns, so
       // the two round trips run together rather than one behind the other.
       const [matches, next] = await Promise.all([
-        searchHeuristics(q.trim(), undefined, goalId || undefined),
+        searchInsights(q.trim(), undefined, goalId || undefined),
         goalId ? loadScope(goalId) : Promise.resolve(null),
       ]);
       setResults(matches);
@@ -105,16 +106,16 @@ export function HeuristicBrowser() {
   return (
     <div className="flex flex-col gap-8 pt-4">
       <div className="flex flex-col gap-3 border-b border-line pb-6">
-        <SectionLabel>Heuristic browser</SectionLabel>
+        <SectionLabel>Insight browser</SectionLabel>
         <h1 className="text-2xl font-semibold tracking-tight">
-          Learned optimization heuristics
+          Discovered insights
         </h1>
         <p className="max-w-xl text-sm leading-relaxed text-muted">
-          Search the meta-heuristics distilled by the sleep cycle. Open one to
-          trace the evidence it was abstracted from. Scope to a goal to see only
-          that objective&rsquo;s heuristics — abstracted definitions rank poorly
-          across the whole corpus by domain query — and to check each supporting
-          finding for whether its effect is causal or merely correlated.
+          Search insights the system discovered. Open one to trace the
+          evidence it was abstracted from. Scope to a dataset to see only that
+          question&rsquo;s insights — abstracted definitions rank poorly across
+          the whole corpus by domain query — and to check each supporting finding
+          for whether its effect is causal or merely correlated.
         </p>
       </div>
 
@@ -122,10 +123,10 @@ export function HeuristicBrowser() {
         <select
           value={goalId}
           onChange={(e) => setGoalId(e.target.value)}
-          aria-label="Heuristic scope"
+          aria-label="Dataset scope"
           className="rounded-lg border border-line bg-surface px-3 py-3 text-sm text-fg outline-hidden transition-colors focus:border-signal/60 focus:ring-2 focus:ring-signal/20 sm:w-56 sm:shrink-0"
         >
-          <option value="">All goals</option>
+          <option value="">All datasets</option>
           {goals.map((g) => (
             <option key={g.optimization_function_id} value={g.optimization_function_id}>
               {g.goal_text}
@@ -136,7 +137,7 @@ export function HeuristicBrowser() {
           type="text"
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="Describe a state or objective, e.g. high-value repeat customers"
+          placeholder="Describe a state or question, e.g. high-value repeat customers"
           className="w-full rounded-lg border border-line bg-surface px-4 py-3 text-sm text-fg outline-hidden transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
         />
         <Button type="submit" loading={searching}>
@@ -155,7 +156,7 @@ export function HeuristicBrowser() {
         />
         <TracePanel
           key={selected?.id ?? "none"}
-          heuristic={selected}
+          insight={selected}
           scope={scope}
         />
       </div>
@@ -169,10 +170,10 @@ function ResultList({
   selectedId,
   onSelect,
 }: {
-  results: HeuristicMatch[] | null;
+  results: InsightMatch[] | null;
   searching: boolean;
   selectedId: string | null;
-  onSelect: (m: HeuristicMatch) => void;
+  onSelect: (m: InsightMatch) => void;
 }) {
   if (searching && !results) {
     return (
@@ -184,15 +185,15 @@ function ResultList({
   if (!results) {
     return (
       <Panel className="px-6 py-16 text-center text-sm text-faint">
-        Run a search to list matching meta-heuristics.
+        Run a search to list matching insights.
       </Panel>
     );
   }
   if (results.length === 0) {
     return (
       <Panel className="px-6 py-16 text-center text-sm text-faint">
-        No meta-heuristics matched. Run a sleep cycle after a hypothesis run to
-        distill some.
+        No insights matched. Run insight generation after a hypothesis run to
+        discover some.
       </Panel>
     );
   }
@@ -226,25 +227,25 @@ function ResultList({
 }
 
 function TracePanel({
-  heuristic,
+  insight,
   scope,
 }: {
-  heuristic: HeuristicMatch | null;
+  insight: InsightMatch | null;
   scope: GoalScope | null;
 }) {
   const [trace, setTrace] = useState<TraceTriplet[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Fetch the trace when a heuristic is selected. The parent keys this component
+  // Fetch the trace when an insight is selected. The parent keys this component
   // by id, so it remounts per selection and this effect runs once with the id
   // fixed; the cancelled guard drops a late resolve after unmount.
   useEffect(() => {
-    if (!heuristic) return;
+    if (!insight) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
-    traceHeuristic(heuristic.id)
+    traceInsight(insight.id)
       .then((t) => {
         if (!cancelled) setTrace(t);
       })
@@ -258,12 +259,12 @@ function TracePanel({
     return () => {
       cancelled = true;
     };
-  }, [heuristic]);
+  }, [insight]);
 
-  if (!heuristic) {
+  if (!insight) {
     return (
       <Panel className="hidden px-6 py-16 text-center text-sm text-faint lg:block">
-        Select a heuristic to trace its supporting evidence.
+        Select an insight to trace its supporting evidence.
       </Panel>
     );
   }
@@ -272,7 +273,7 @@ function TracePanel({
     <Panel className="flex flex-col gap-4 p-5">
       <div className="flex flex-col gap-2 border-b border-line pb-4">
         <SectionLabel>Definition</SectionLabel>
-        <p className="text-sm leading-relaxed text-fg">{heuristic.definition}</p>
+        <p className="text-sm leading-relaxed text-fg">{insight.definition}</p>
       </div>
 
       {loading && (
@@ -283,7 +284,7 @@ function TracePanel({
       {error && <Callout tone="error">{error}</Callout>}
       {trace && trace.length === 0 && (
         <p className="py-6 text-sm text-faint">
-          No supporting triplets recorded for this heuristic.
+          No supporting triplets recorded for this insight.
         </p>
       )}
       {trace && trace.length > 0 && (

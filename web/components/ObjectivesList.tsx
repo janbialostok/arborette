@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { errorMessage, listGoals, type GoalListItem } from "@/lib/orchestrator";
+import { errorMessage, listGoals, type GoalListItem as DatasetListItem } from "@/lib/orchestrator";
 import { formatTimestamp } from "@/lib/format";
 import {
   Badge,
@@ -14,7 +14,7 @@ import {
 } from "@/components/ui";
 
 export function ObjectivesList() {
-  const [goals, setGoals] = useState<GoalListItem[] | null>(null);
+  const [datasets, setDatasets] = useState<DatasetListItem[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -22,11 +22,11 @@ export function ObjectivesList() {
     let cancelled = false;
     listGoals()
       .then((rows) => {
-        if (!cancelled) setGoals(rows);
+        if (!cancelled) setDatasets(rows);
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        setError(errorMessage(err, "Could not load objectives. Please retry."));
+        setError(errorMessage(err, "Could not load datasets. Please retry."));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -39,43 +39,43 @@ export function ObjectivesList() {
   return (
     <div className="flex flex-col gap-8 pt-4">
       <div className="flex flex-col gap-3 border-b border-line pb-6">
-        <SectionLabel>Objectives</SectionLabel>
+        <SectionLabel>Datasets</SectionLabel>
         <h1 className="text-2xl font-semibold tracking-tight">
-          Registered optimization objectives
+          Registered datasets
         </h1>
         <p className="max-w-xl text-sm leading-relaxed text-muted">
-          Return to a past or currently-running objective and see its latest run
-          status. Open one to view its live run or settled outcome.
+          Return to a dataset and see its latest run status. Open one to view its
+          live run or settled outcome.
         </p>
       </div>
 
       {error && <Callout tone="error">{error}</Callout>}
 
-      {!error && <List goals={goals} loading={loading} />}
+      {!error && <List datasets={datasets} loading={loading} />}
     </div>
   );
 }
 
 function List({
-  goals,
+  datasets,
   loading,
 }: {
-  goals: GoalListItem[] | null;
+  datasets: DatasetListItem[] | null;
   loading: boolean;
 }) {
-  if (loading && !goals) {
+  if (loading && !datasets) {
     return (
       <Panel className="flex items-center justify-center px-6 py-16 text-sm text-muted">
-        <Spinner className="mr-2" /> Loading objectives…
+        <Spinner className="mr-2" /> Loading datasets…
       </Panel>
     );
   }
-  if (!goals || goals.length === 0) {
+  if (!datasets || datasets.length === 0) {
     return (
       <Panel className="px-6 py-16 text-center text-sm text-faint">
-        No objectives registered yet.{" "}
+        No datasets registered yet.{" "}
         <Link href="/" className="text-signal underline-offset-2 hover:underline">
-          Submit a goal
+          Register a dataset
         </Link>{" "}
         to get started.
       </Panel>
@@ -83,32 +83,32 @@ function List({
   }
   return (
     <ul className="flex flex-col gap-2">
-      {goals.map((g) => (
+      {datasets.map((g) => (
         <li key={g.optimization_function_id}>
-          <ObjectiveRow goal={g} />
+          <DatasetRow dataset={g} />
         </li>
       ))}
     </ul>
   );
 }
 
-function ObjectiveRow({ goal }: { goal: GoalListItem }) {
+function DatasetRow({ dataset }: { dataset: DatasetListItem }) {
   return (
     <Link
-      href={`/goals/${goal.optimization_function_id}`}
+      href={`/datasets/${dataset.optimization_function_id}`}
       className="flex flex-col gap-3 rounded-lg border border-line bg-surface/60 px-4 py-3.5 transition-colors hover:border-line-strong"
     >
       <div className="flex items-start justify-between gap-4">
-        <span className="text-sm leading-relaxed text-fg">{goal.goal_text}</span>
-        <StatusBadge status={goal.status} />
+        <span className="text-sm leading-relaxed text-fg">{dataset.goal_text}</span>
+        <span className="text-xs text-muted">View questions →</span>
       </div>
-      {goal.status === "failed" && goal.failure_reason && (
+      {dataset.status === "failed" && dataset.failure_reason && (
         <span className="text-xs leading-relaxed text-warn">
-          {goal.failure_reason}
+          {dataset.failure_reason}
         </span>
       )}
       <span className="font-mono text-[11px] text-faint">
-        {formatTimestamp(goal.created_at)}
+        {formatTimestamp(dataset.created_at)}
       </span>
     </Link>
   );

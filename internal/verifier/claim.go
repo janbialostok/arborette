@@ -193,7 +193,7 @@ func (w *Worker) reifyClaim(ctx context.Context, goalID, datasourceRef string, o
 	interventionID := domain.DerivedID(ns, domain.RoleClaim, canonical)
 	outcomeID := domain.DerivedID(ns, domain.RoleClaimOutcome, canonical)
 
-	state := domain.State{ID: stateID, GoalID: goalID, Properties: map[string]any{
+	state := domain.State{ID: stateID, DatasetID: goalID, Properties: map[string]any{
 		domain.PropDataSourceRef:        datasourceRef,
 		domain.PropObjectiveAggregation: obj.Aggregation,
 		domain.PropObjectiveLabel:       obj.Label,
@@ -204,7 +204,7 @@ func (w *Worker) reifyClaim(ctx context.Context, goalID, datasourceRef string, o
 		return "", err
 	}
 
-	intervention := domain.Intervention{ID: interventionID, GoalID: goalID, Type: domain.InterventionQuery, Properties: map[string]any{
+	intervention := domain.Intervention{ID: interventionID, DatasetID: goalID, Type: domain.InterventionQuery, Properties: map[string]any{
 		domain.PropObjectiveAggregation: obj.Aggregation,
 		domain.PropObjectiveLabel:       obj.Label,
 		domain.PropNewFilters:           filters,
@@ -219,7 +219,7 @@ func (w *Worker) reifyClaim(ctx context.Context, goalID, datasourceRef string, o
 
 	outcome := domain.Outcome{
 		ID:                 outcomeID,
-		GoalID:             goalID,
+		DatasetID:             goalID,
 		VerificationStatus: domain.VerificationVerified,
 		Value:              map[string]any{obj.Label: measured.segment},
 		Support:            measured.segmentN,

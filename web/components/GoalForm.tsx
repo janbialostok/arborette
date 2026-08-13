@@ -9,6 +9,7 @@ type Source = "file" | "path";
 
 export function GoalForm() {
   const router = useRouter();
+  const [name, setName] = useState("");
   const [goal, setGoal] = useState("");
   const [source, setSource] = useState<Source>("file");
   const [file, setFile] = useState<File | null>(null);
@@ -18,20 +19,27 @@ export function GoalForm() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const canSubmit =
-    goal.trim().length > 0 &&
+    name.trim().length > 0 &&
     (source === "file" ? file != null : importPath.trim().length > 0);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
 
+    if (!name.trim()) {
+      setError("Enter a name for the dataset.");
+      return;
+    }
     if (!goal.trim()) {
-      setError("Describe the goal before submitting.");
+      setError("Describe the question before submitting.");
       return;
     }
     // Enforce exactly-one-source client-side to avoid the both/neither 400s.
     const form = new FormData();
-    form.set("goal", goal.trim());
+    // The backend stores `goal` form field as goal_text (the dataset title).
+    // Send the name as the primary identifier; include the question as well
+    // so Claude can generate the evaluation matrix from both.
+    form.set("goal", `${name.trim()}\n\n${goal.trim()}`);
     if (source === "file") {
       if (!file) {
         setError("Choose a file to upload, or switch to an on-disk path.");
@@ -49,15 +57,11 @@ export function GoalForm() {
     setPending(true);
     try {
       const { optimization_function_id } = await submitGoal(form);
-      // Submitting a goal does not start the hypothesis loop — that's the
-      // separate "Run Phase 1" action on the live view — so the goal is left
-      // un-triggered. Its live view resolves to the neutral "not yet started"
-      // state prompting Phase 1, rather than waiting for a run that isn't going.
-      router.push(`/goals/${optimization_function_id}`);
+      router.push(`/datasets/${optimization_function_id}`);
     } catch (err) {
       // The orchestrator's {error} body is analyst-safe — surface it verbatim.
       setError(
-        errorMessage(err, "Something went wrong submitting the goal. Please retry."),
+        errorMessage(err, "Something went wrong submitting the dataset. Please retry."),
       );
       setPending(false);
     }
@@ -66,8 +70,23 @@ export function GoalForm() {
   return (
     <form onSubmit={onSubmit} className="flex flex-col gap-7">
       <div className="flex flex-col gap-2.5">
+        <label htmlFor="name" className="flex items-center justify-between">
+          <SectionLabel>Dataset name</SectionLabel>
+          <span className="font-mono text-[11px] text-faint">
+            short label
+          </span>
+        </label>
+        <input
+          id="name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="e.g. Transaction Fraud — July 2026"
+          className="w-full rounded-lg border border-line bg-surface px-4 py-3 text-[15px] text-fg outline-hidden transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+        />
+      </div>
+      <div className="flex flex-col gap-2.5">
         <label htmlFor="goal" className="flex items-center justify-between">
-          <SectionLabel>Optimization goal</SectionLabel>
+          <SectionLabel>Question</SectionLabel>
           <span className="font-mono text-[11px] text-faint">
             natural language
           </span>
@@ -77,9 +96,12 @@ export function GoalForm() {
           value={goal}
           onChange={(e) => setGoal(e.target.value)}
           rows={4}
-          placeholder="e.g. Maximize average order value for repeat customers in the Northeast region."
+          placeholder="e.g. Which segments of repeat customers in the Northeast region have the highest average order value?"
           className="w-full resize-y rounded-lg border border-line bg-surface px-4 py-3 text-[15px] leading-relaxed text-fg outline-hidden transition-colors placeholder:text-faint focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
         />
+        <p className="text-xs text-faint">
+          What would you like to learn from this dataset?
+        </p>
       </div>
 
       <div className="flex flex-col gap-3">
@@ -145,7 +167,7 @@ export function GoalForm() {
 
       <div className="flex items-center gap-4">
         <Button type="submit" loading={pending} disabled={!canSubmit}>
-          {pending ? "Registering goal…" : "Register goal"}
+          {pending ? "Registering dataset…" : "Register dataset"}
         </Button>
         {pending && (
           <span className="text-xs text-faint">

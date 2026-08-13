@@ -219,7 +219,7 @@ function ReviewList({
       <Panel className="px-6 py-16 text-center text-sm leading-relaxed text-faint">
         {source === "queue"
           ? "Nothing is waiting for review. Extractions that land below the confidence threshold appear here."
-          : "This run has extracted nothing yet. Only a goal reading from a document produces extractions."}
+          : "This run has extracted nothing yet. Only a dataset reading from a document produces extractions."}
       </Panel>
     );
   }

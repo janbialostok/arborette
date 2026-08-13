@@ -470,7 +470,7 @@ func (s *Server) lookupExtractionOutcome(ctx context.Context, w http.ResponseWri
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return graph.ExtractionOutcome{}, false
 	}
-	if outcome.GoalID != goal.OptimizationFunctionID {
+	if outcome.DatasetID != goal.OptimizationFunctionID {
 		service.WriteErr(w, http.StatusNotFound, "outcome not found")
 		return graph.ExtractionOutcome{}, false
 	}

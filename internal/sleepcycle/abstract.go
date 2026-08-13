@@ -34,7 +34,7 @@ func (w *Worker) abstractAll(ctx context.Context, target searchTarget, obj objec
 		if err := w.abstractOne(ctx, target, obj, goalText, baseline, columns, cand); err != nil {
 			log.Printf("sleepcycle: abstract macro-segment: %v", err)
 			w.report(ctx, "sleepcycle_abstraction_failure", "failure", map[string]any{
-				"optimization_function_id": target.goalID,
+				"optimization_function_id": target.datasetID,
 				"canonical_filter":         cand.canonical,
 				"error":                    err.Error(),
 			})
@@ -72,9 +72,9 @@ func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objec
 		relinkErr := w.repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{
 			ID:                  mhID,
 			Definition:          existing.Definition,
-			GoalID:              target.goalID,
+			DatasetID:              target.datasetID,
 			OntologyTerms:       existing.OntologyTerms,
-			OriginGoalID:        existing.OriginGoalID,
+			OriginDatasetID:        existing.OriginDatasetID,
 			OriginDataSourceRef: existing.OriginDataSourceRef,
 		}, cand.abstractedFrom)
 		if !existing.EmbeddingPending {
@@ -84,7 +84,7 @@ func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objec
 			// would read as a run that published nothing while the whole corpus is
 			// live — so the fault is surfaced on its own and the segment still counts.
 			if relinkErr != nil {
-				w.relinkFailure(ctx, target.goalID, mhID, relinkErr)
+				w.relinkFailure(ctx, target.datasetID, mhID, relinkErr)
 			}
 			return nil
 		}
@@ -94,7 +94,7 @@ func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objec
 		if relinkErr != nil {
 			return fmt.Errorf("re-link meta-heuristic %q: %w", mhID, relinkErr)
 		}
-		return w.embed(ctx, target.goalID, mhID, existing.Definition, cand.abstractedFrom)
+		return w.embed(ctx, target.datasetID, mhID, existing.Definition, cand.abstractedFrom)
 	case !errors.Is(err, graph.ErrNotFound):
 		return fmt.Errorf("look up meta-heuristic %q: %w", mhID, err)
 	}
@@ -117,15 +117,15 @@ func (w *Worker) abstractOne(ctx context.Context, target searchTarget, obj objec
 	mh := domain.MetaHeuristic{
 		ID:                  mhID,
 		Definition:          abstraction.Definition,
-		GoalID:              target.goalID,
+		DatasetID:              target.datasetID,
 		OntologyTerms:       ontologyTermsFromLLM(abstraction.OntologyTerms),
-		OriginGoalID:        target.goalID,
+		OriginDatasetID:        target.datasetID,
 		OriginDataSourceRef: target.dataSourceRef,
 	}
 	if err := w.repo.CreateMetaHeuristic(ctx, mh, cand.abstractedFrom); err != nil {
 		return fmt.Errorf("create meta-heuristic %q: %w", mhID, err)
 	}
-	return w.embed(ctx, target.goalID, mhID, abstraction.Definition, cand.abstractedFrom)
+	return w.embed(ctx, target.datasetID, mhID, abstraction.Definition, cand.abstractedFrom)
 }
 
 // abstractSegment generates a definition and repairs it while it still leaks a
@@ -233,7 +233,7 @@ func (w *Worker) reconcileEmbeddings(ctx context.Context) {
 	}
 	rowGoal := make(map[string]string, len(refs))
 	for _, ref := range refs {
-		rowGoal[ref.NodeID] = ref.GoalID
+		rowGoal[ref.NodeID] = ref.DatasetID
 	}
 
 	var reembedded, repaired []string
@@ -241,13 +241,13 @@ func (w *Worker) reconcileEmbeddings(ctx context.Context) {
 		goalID, hasRow := rowGoal[mh.ID]
 		switch {
 		case !hasRow || mh.EmbeddingPending:
-			if err := w.embed(ctx, mh.GoalID, mh.ID, mh.Definition, nil); err != nil {
+			if err := w.embed(ctx, mh.DatasetID, mh.ID, mh.Definition, nil); err != nil {
 				w.reconcileFailure(ctx, mh.ID, err)
 				continue
 			}
 			reembedded = append(reembedded, mh.ID)
-		case mh.GoalID != "" && goalID == "":
-			if err := w.embeddings.SetGoalID(ctx, mh.ID, mh.GoalID); err != nil {
+		case mh.DatasetID != "" && goalID == "":
+			if err := w.embeddings.SetGoalID(ctx, mh.ID, mh.DatasetID); err != nil {
 				w.reconcileFailure(ctx, mh.ID, err)
 				continue
 			}

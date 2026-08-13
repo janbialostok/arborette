@@ -77,7 +77,7 @@ func (s *Server) handleVerifyFinding(w http.ResponseWriter, r *http.Request) {
 	}
 	// A finding of another goal would verify against this goal's causal graph and
 	// objective, producing a number about neither.
-	if intervention.GoalID != goal.OptimizationFunctionID {
+	if intervention.DatasetID != goal.OptimizationFunctionID {
 		service.WriteErr(w, http.StatusNotFound, "finding not found")
 		return
 	}

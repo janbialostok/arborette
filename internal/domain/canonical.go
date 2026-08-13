@@ -24,7 +24,12 @@ const CanonicalSeparator = "\n"
 const (
 	RoleIntervention  = "intervention"
 	RoleOutcome       = "outcome"
-	RoleMetaHeuristic = "metaheuristic"
+	RoleInsight = "insight"
+
+	// RoleMetaHeuristic is a deprecated alias for RoleInsight.
+	//
+	// Deprecated: Use RoleInsight instead.
+	RoleMetaHeuristic = RoleInsight
 	RoleBaselineState = "baseline-state"
 	RoleClaim         = "claim"
 	RoleClaimOutcome  = "claim-outcome"

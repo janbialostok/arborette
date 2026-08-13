@@ -7,9 +7,9 @@ import { cn } from "@/components/ui";
 // baseline at the center axis, the bar extending right for a positive delta or
 // left for a negative one, width normalized against the largest-magnitude effect
 // currently in the feed. effect_size is a signed magnitude (value − baseline); the
-// stream now carries the objective `direction`, so the bar and number are colored
-// by whether the delta is an improvement (green) or a regression (coral) — for a
-// minimize objective a negative delta is the improvement. The segment's filters
+// stream carries the question's `direction`, so the bar and number are colored by
+// whether the delta is an improvement (green) or a regression (coral) — for a
+// minimize question a negative delta is the improvement. The segment's filters
 // render as predicate chips so the card shows which segment was measured, not just
 // the delta. The delta itself is a measured association — verifying it is what
 // decides whether the segment caused it or merely moved with it — so each card

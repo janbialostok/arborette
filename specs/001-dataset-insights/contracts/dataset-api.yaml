@@ -1,0 +1,228 @@
+openapi: 3.0.0
+info:
+  title: Dataset API
+  version: 1.0.0
+  description: API for managing datasets including time-series datasets
+
+paths:
+  /datasets:
+    post:
+      summary: Create a new dataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetCreate'
+      responses:
+        '201':
+          description: Dataset created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dataset'
+        '400':
+          description: Invalid input
+
+    get:
+      summary: List datasets
+      parameters:
+        - name: isTimeSeries
+          in: query
+          required: false
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: List of datasets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Dataset'
+
+  /datasets/{id}:
+    get:
+      summary: Get a dataset by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Dataset details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dataset'
+        '404':
+          description: Dataset not found
+
+    put:
+      summary: Update a dataset
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetUpdate'
+      responses:
+        '200':
+          description: Dataset updated successfully
+        '400':
+          description: Invalid input
+        '404':
+          description: Dataset not found
+
+    delete:
+      summary: Delete a dataset
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Dataset deleted successfully
+        '404':
+          description: Dataset not found
+
+  /datasets/{id}/versions:
+    get:
+      summary: Get dataset versions
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: List of dataset versions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DatasetVersion'
+
+    post:
+      summary: Create a new dataset version
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetVersionCreate'
+      responses:
+        '201':
+          description: Dataset version created successfully
+        '400':
+          description: Invalid input
+
+components:
+  schemas:
+    Dataset:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        isTimeSeries:
+          type: boolean
+        updateFrequency:
+          type: string
+          enum: [daily, weekly, monthly, quarterly, yearly]
+        lastUpdated:
+          type: string
+          format: date-time
+      required:
+        - id
+        - name
+
+    DatasetCreate:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        isTimeSeries:
+          type: boolean
+          default: false
+        updateFrequency:
+          type: string
+          enum: [daily, weekly, monthly, quarterly, yearly]
+      required:
+        - name
+
+    DatasetUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        updateFrequency:
+          type: string
+          enum: [daily, weekly, monthly, quarterly, yearly]
+
+    DatasetVersion:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        datasetId:
+          type: string
+          format: uuid
+        versionNumber:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        dataSnapshot:
+          type: object
+      required:
+        - id
+        - datasetId
+        - versionNumber
+
+    DatasetVersionCreate:
+      type: object
+      properties:
+        dataSnapshot:
+          type: object
+      required:
+        - dataSnapshot

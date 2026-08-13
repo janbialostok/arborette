@@ -49,7 +49,7 @@ export function VerifyFindingButton({
       </Button>
       {waiting && (
         <span className="text-[11px] leading-relaxed text-faint">
-          Verifying — the verdict appears on the goal&rsquo;s Causal tab.
+          Verifying — the verdict appears on the dataset&rsquo;s Causal tab.
         </span>
       )}
       {error && <Callout tone="error">{error}</Callout>}

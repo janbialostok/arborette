@@ -1,0 +1,144 @@
+openapi: 3.0.0
+info:
+  title: Question API
+  version: 1.0.0
+  description: API for managing questions
+
+paths:
+  /questions:
+    post:
+      summary: Create a new question
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionCreate'
+      responses:
+        '201':
+          description: Question created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Question'
+        '400':
+          description: Invalid input
+
+    get:
+      summary: List questions
+      parameters:
+        - name: datasetId
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: List of questions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Question'
+
+  /questions/{id}:
+    get:
+      summary: Get a question by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Question details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Question'
+        '404':
+          description: Question not found
+
+    put:
+      summary: Update a question
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionUpdate'
+      responses:
+        '200':
+          description: Question updated successfully
+        '400':
+          description: Invalid input
+        '404':
+          description: Question not found
+
+    delete:
+      summary: Delete a question
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Question deleted successfully
+        '404':
+          description: Question not found
+
+components:
+  schemas:
+    Question:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        datasetId:
+          type: string
+          format: uuid
+        content:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - datasetId
+        - content
+
+    QuestionCreate:
+      type: object
+      properties:
+        datasetId:
+          type: string
+          format: uuid
+        content:
+          type: string
+      required:
+        - datasetId
+        - content
+
+    QuestionUpdate:
+      type: object
+      properties:
+        content:
+          type: string

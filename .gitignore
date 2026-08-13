@@ -23,3 +23,14 @@
 
 # Editor/OS
 .DS_Store
+
+# Dataset Insights feature
+/internal/dataset/
+/internal/question/
+/internal/insight/
+/pkg/storage/
+/cmd/dataset-service/
+/cmd/question-service/
+/cmd/insight-service/
+migrate
+iris.csv

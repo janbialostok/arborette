@@ -26,10 +26,10 @@ import { Callout, Panel, Spinner } from "@/components/ui";
 // CausalTab owns the causal surface's reads and its live subscription. It holds
 // its own stream rather than sharing the run's: verification runs against findings
 // that exist only after a run completes, and the hub drops an event published to a
-// goal nobody is subscribed to — so without a subscription of its own, every
+// dataset nobody is subscribed to — so without a subscription of its own, every
 // verdict the analyst asked for would arrive nowhere.
 export function CausalTab({ id }: { id: string }) {
-  // undefined until a read has answered; null is "the goal has no model", which is a
+  // undefined until a read has answered; null is "the dataset has no model", which is a
   // claim only a completed read can make.
   const [graph, setGraph] = useState<Graph | null | undefined>(undefined);
   const [verifications, setVerifications] = useState<CausalVerification[] | null>(
@@ -64,7 +64,7 @@ export function CausalTab({ id }: { id: string }) {
     let cancelled = false;
     getCausalGraph(id)
       .catch((err: unknown) => {
-        // A goal with no discovered graph answers 404. That is this view's empty
+        // A dataset with no discovered graph answers 404. That is this view's empty
         // state, not a failure: the first verification runs discovery inline.
         if (err instanceof OrchestratorError && err.status === 404) return null;
         throw err;
@@ -201,12 +201,12 @@ export function CausalTab({ id }: { id: string }) {
           onConflict={() => refetch(true)}
         />
       ) : (
-        // Only claim the goal has no model once a read has said so — null, not the
+        // Only claim the dataset has no model once a read has said so — null, not the
         // undefined of a read that never answered. An empty state is a statement
-        // about the goal, and a failed read is no evidence for one.
+        // about the dataset, and a failed read is no evidence for one.
         graph === null && (
           <Callout tone="info">
-            No causal graph has been discovered for this goal yet. The first
+            No causal graph has been discovered for this dataset yet. The first
             verification runs discovery inline — verify a finding, and the model it
             reasoned over appears here.
           </Callout>

@@ -1,0 +1,125 @@
+openapi: 3.0.0
+info:
+  title: Visualization API
+  version: 1.0.0
+  description: API for managing visualizations tied to insights
+
+paths:
+  /visualizations:
+    post:
+      summary: Create a new visualization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VisualizationCreate'
+      responses:
+        '201':
+          description: Visualization created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Visualization'
+        '400':
+          description: Invalid input
+
+    get:
+      summary: List visualizations
+      parameters:
+        - name: insightId
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: List of visualizations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Visualization'
+
+  /visualizations/{id}:
+    get:
+      summary: Get a visualization by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Visualization details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Visualization'
+        '404':
+          description: Visualization not found
+
+    delete:
+      summary: Delete a visualization
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Visualization deleted successfully
+        '404':
+          description: Visualization not found
+
+components:
+  schemas:
+    Visualization:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        insightId:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [line_chart, bar_chart, trend_graph, calendar_view, comparison_chart]
+        title:
+          type: string
+        config:
+          type: object
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - insightId
+        - type
+
+    VisualizationCreate:
+      type: object
+      properties:
+        insightId:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [line_chart, bar_chart, trend_graph, calendar_view, comparison_chart]
+        title:
+          type: string
+        config:
+          type: object
+      required:
+        - insightId
+        - type

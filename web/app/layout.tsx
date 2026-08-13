@@ -18,7 +18,7 @@ const jetbrains = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "Arborette",
   description:
-    "Analyst console for the active hypothesis loop — register goals, watch causal triplets stream, browse learned heuristics.",
+    "Analyze your data — register datasets, ask questions, watch causal triplets stream, browse discovered insights.",
 };
 
 export default function RootLayout({

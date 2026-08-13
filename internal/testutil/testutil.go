@@ -60,7 +60,7 @@ func TruncateEmbeddings(t *testing.T, ctx context.Context, cfg config.Config) {
 		t.Fatalf("connect as owner: %v", err)
 	}
 	defer conn.Close(ctx)
-	if _, err := conn.Exec(ctx, "TRUNCATE meta_heuristic_embeddings"); err != nil {
+	if _, err := conn.Exec(ctx, "TRUNCATE insight_embeddings"); err != nil {
 		t.Fatalf("truncate embeddings: %v", err)
 	}
 }

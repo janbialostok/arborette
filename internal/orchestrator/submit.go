@@ -567,6 +567,16 @@ func writeSandboxStatus(w http.ResponseWriter, se *SandboxError, phase string) {
 	}
 }
 
+// handleDeleteGoal deletes a dataset by its ID and returns 204 on success.
+func (s *Server) handleDeleteGoal(w http.ResponseWriter, r *http.Request) {
+	if err := s.goals.Delete(r.Context(), r.PathValue("id")); err != nil {
+		log.Printf("orchestrator: delete goal %q: %v", r.PathValue("id"), err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // writeIngestErr maps an ingestion error to a status: validation and escape
 // errors are 400, a missing on-disk file is 404, anything else is a masked 500.
 func (s *Server) writeIngestErr(w http.ResponseWriter, err error) {
