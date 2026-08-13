@@ -574,7 +574,7 @@ func locateProvenance(pages []string, needle string) *domain.ProvenanceLocator {
 // distribution.
 func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objective.Objective, parentFilters []domain.Constraint, baseline float64, cand llm.CandidateIntervention, effective []domain.Constraint, value float64, support int64) (string, error) {
 	stateID := uuid.NewString()
-	state := domain.State{ID: stateID, DatasetID: goal.OptimizationFunctionID, Properties: map[string]any{
+	state := domain.State{ID: stateID, GoalID: goal.OptimizationFunctionID, Properties: map[string]any{
 		domain.PropDataSourceRef:        goal.DataSourceRef,
 		domain.PropObjectiveAggregation: obj.Aggregation,
 		domain.PropObjectiveLabel:       obj.Label,
@@ -586,7 +586,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 	}
 
 	interventionID := uuid.NewString()
-	intervention := domain.Intervention{ID: interventionID, DatasetID: goal.OptimizationFunctionID, Type: domain.InterventionQuery, Properties: map[string]any{
+	intervention := domain.Intervention{ID: interventionID, GoalID: goal.OptimizationFunctionID, Type: domain.InterventionQuery, Properties: map[string]any{
 		domain.PropObjectiveAggregation: obj.Aggregation,
 		domain.PropObjectiveLabel:       obj.Label,
 		domain.PropNewFilters:           cand.Filters,
@@ -597,7 +597,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 	}
 
 	outcomeID := uuid.NewString()
-	outcome := domain.Outcome{ID: outcomeID, DatasetID: goal.OptimizationFunctionID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{obj.Label: value}, Support: support}
+	outcome := domain.Outcome{ID: outcomeID, GoalID: goal.OptimizationFunctionID, VerificationStatus: domain.VerificationVerified, Value: map[string]any{obj.Label: value}, Support: support}
 	if err := s.repo.CreateOutcome(ctx, outcome); err != nil {
 		return "", err
 	}
@@ -652,7 +652,7 @@ func (s *Server) writeTriplet(ctx context.Context, goal store.Goal, obj objectiv
 // caller can route it for review and count it in the run's distribution.
 func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, field domain.TargetField, method string, parentConfidence float64, value string, confidence float64, locator *domain.ProvenanceLocator) (string, error) {
 	stateID := uuid.NewString()
-	state := domain.State{ID: stateID, DatasetID: goal.OptimizationFunctionID, Properties: map[string]any{
+	state := domain.State{ID: stateID, GoalID: goal.OptimizationFunctionID, Properties: map[string]any{
 		domain.PropDataSourceRef: goal.DataSourceRef,
 		"field":                  field.Name,
 		"confidence":             parentConfidence,
@@ -662,7 +662,7 @@ func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, fi
 	}
 
 	interventionID := uuid.NewString()
-	intervention := domain.Intervention{ID: interventionID, DatasetID: goal.OptimizationFunctionID, Type: domain.InterventionExtract, Properties: map[string]any{
+	intervention := domain.Intervention{ID: interventionID, GoalID: goal.OptimizationFunctionID, Type: domain.InterventionExtract, Properties: map[string]any{
 		"field":  field.Name,
 		"method": method,
 	}}
@@ -675,7 +675,7 @@ func (s *Server) writeExtractionTriplet(ctx context.Context, goal store.Goal, fi
 	// path's label-keyed value; the llm layer returns just the raw string.
 	outcome := domain.Outcome{
 		ID:                 outcomeID,
-		DatasetID:             goal.OptimizationFunctionID,
+		GoalID:             goal.OptimizationFunctionID,
 		VerificationStatus: domain.VerificationUnverified,
 		Value:              map[string]any{field.Name: value},
 		Provenance:         locator,

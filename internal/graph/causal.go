@@ -224,7 +224,7 @@ func (r *Neo4jRepository) WriteCausalVerification(ctx context.Context, intervent
 		if _, err := tx.Run(ctx,
 			"MERGE (o:"+labelOutcome+" {id: $oid}) "+
 				"SET o.goal_id = $goalID, o.verification_status = $status, o.value = $value",
-			map[string]any{"oid": oid, "goalID": outcome.DatasetID, "status": string(outcome.VerificationStatus), "value": value},
+			map[string]any{"oid": oid, "goalID": outcome.GoalID, "status": string(outcome.VerificationStatus), "value": value},
 		); err != nil {
 			return nil, err
 		}
@@ -327,8 +327,9 @@ func (r *Neo4jRepository) UpsertCausalEdges(ctx context.Context, edges []domain.
 	rows := make([]map[string]any, 0, len(edges))
 	for _, e := range edges {
 		rows = append(rows, map[string]any{
-		"aID":           dataColumnID(e.GoalID, e.DatasourceRef, e.ColA),
+			"aID":           dataColumnID(e.GoalID, e.DatasourceRef, e.ColA),
 			"bID":           dataColumnID(e.GoalID, e.DatasourceRef, e.ColB),
+			"version":       e.Version,
 			"goalID":        e.GoalID,
 			"datasourceRef": e.DatasourceRef,
 			"colA":          e.ColA,

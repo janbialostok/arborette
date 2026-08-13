@@ -8,5 +8,5 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> },
 ): Promise<Response> {
   const { id } = await params;
-  return forward(req, `/insights/${encodeURIComponent(id)}/trace`);
+  return forward(req, `/heuristics/${encodeURIComponent(id)}/trace`);
 }

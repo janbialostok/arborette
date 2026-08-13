@@ -61,16 +61,16 @@ type groundedProposal struct {
 func (w *Worker) groundProposals(ctx context.Context, target searchTarget, goalText string, schema sandboxclient.Schema) []groundedProposal {
 	vec, err := w.provider.EmbedQuery(ctx, goalText)
 	if err != nil {
-		w.groundingFailure(ctx, target.datasetID, "", fmt.Errorf("embed goal: %w", err))
+		w.groundingFailure(ctx, target.goalID, "", fmt.Errorf("embed goal: %w", err))
 		return nil
 	}
 	scope := store.SearchScope{CrossGoal: true}
 	if !w.cfg.CrossGoalGrounding {
-		scope = store.ScopeFromGoalID(target.datasetID)
+		scope = store.ScopeFromGoalID(target.goalID)
 	}
 	refs, err := w.embeddings.SimilaritySearchScored(ctx, vec, w.cfg.RetrievalK, scope)
 	if err != nil {
-		w.groundingFailure(ctx, target.datasetID, "", fmt.Errorf("retrieve heuristics: %w", err))
+		w.groundingFailure(ctx, target.goalID, "", fmt.Errorf("retrieve heuristics: %w", err))
 		return nil
 	}
 	if len(refs) == 0 {
@@ -83,7 +83,7 @@ func (w *Worker) groundProposals(ctx context.Context, target searchTarget, goalT
 	}
 	fetched, err := w.repo.GetMetaHeuristics(ctx, ids)
 	if err != nil {
-		w.groundingFailure(ctx, target.datasetID, "", fmt.Errorf("load heuristics: %w", err))
+		w.groundingFailure(ctx, target.goalID, "", fmt.Errorf("load heuristics: %w", err))
 		return nil
 	}
 	byID := make(map[string]domain.MetaHeuristic, len(fetched))
@@ -106,26 +106,26 @@ func (w *Worker) groundProposals(ctx context.Context, target searchTarget, goalT
 			// broken dependency — the distinction an operator reads to tell "the corpus
 			// does not transfer" from "the model is unreachable".
 			if errors.Is(err, llm.ErrNoGroundedFilters) {
-				w.proposalDropped(ctx, target.datasetID, mh.ID, err)
+				w.proposalDropped(ctx, target.goalID, mh.ID, err)
 				continue
 			}
-			w.groundingFailure(ctx, target.datasetID, mh.ID, err)
+			w.groundingFailure(ctx, target.goalID, mh.ID, err)
 			continue
 		}
 		kept, attempted := 0, 0
 		for _, filters := range conjunctions {
 			if attempted >= maxProposalAttempts {
-				w.proposalsTruncated(ctx, target.datasetID, mh.ID, len(conjunctions), kept)
+				w.proposalsTruncated(ctx, target.goalID, mh.ID, len(conjunctions), kept)
 				break
 			}
 			attempted++
 			if kept >= maxProposalsPerHeuristic {
-				w.proposalsTruncated(ctx, target.datasetID, mh.ID, len(conjunctions), kept)
+				w.proposalsTruncated(ctx, target.goalID, mh.ID, len(conjunctions), kept)
 				break
 			}
 			prop, err := w.validateProposal(filters, mh.ID, similarityPrior(ref.Distance), schema)
 			if err != nil {
-				w.proposalDropped(ctx, target.datasetID, mh.ID, err)
+				w.proposalDropped(ctx, target.goalID, mh.ID, err)
 				continue
 			}
 			proposals = append(proposals, prop)
@@ -134,7 +134,7 @@ func (w *Worker) groundProposals(ctx context.Context, target searchTarget, goalT
 	}
 	if len(proposals) > 0 {
 		w.report(ctx, "sleepcycle_grounded_proposals", "job", map[string]any{
-			"optimization_function_id": target.datasetID,
+			"optimization_function_id": target.goalID,
 			"retrieved":                len(refs),
 			"proposals":                len(proposals),
 			"cross_goal":               w.cfg.CrossGoalGrounding,

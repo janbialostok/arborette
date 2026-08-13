@@ -31,7 +31,7 @@ export function CausalVerifications({
       {verifications.length === 0 ? (
         <Panel className="px-6 py-12 text-center text-sm leading-relaxed text-faint">
           Nothing has been verified causally yet. Use <em>Verify causally</em> on a
-          finding — on the run feed or in the insight browser — to adjust its
+          finding — on the run feed or in the heuristic browser — to adjust its
           effect for the confounders in the discovered model.
         </Panel>
       ) : (

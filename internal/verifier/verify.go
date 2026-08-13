@@ -48,7 +48,7 @@ func (w *Worker) VerifyOne(ctx context.Context, goalID, interventionID, datasour
 	// refusal, ends the call with no run and no duplicate transitions.
 	rec := store.CausalVerification{
 		ID:             uuid.NewString(),
-		GoalID:          goalID,
+		GoalID:         goalID,
 		InterventionID: interventionID,
 		GraphVersion:   version,
 		Budgeted:       budgeted,
@@ -188,7 +188,7 @@ func (w *Worker) writeOutcome(ctx context.Context, goalID, interventionID string
 		return w.graph.SupersedePriorCausalOutcomes(ctx, interventionID, version)
 	}
 	outcome := domain.Outcome{
-		DatasetID:             goalID,
+		GoalID:             goalID,
 		VerificationStatus: domain.VerificationVerified,
 		Value:              map[string]any{res.objectiveLabel: *res.adjustedEffect},
 	}

@@ -38,7 +38,7 @@ func ValidateDistanceFloor(floor float64) error {
 }
 
 // ValidateEmbeddingDimension fails fast at startup when the configured embedding
-// dimension disagrees with the insight_embeddings.embedding column, so a
+// dimension disagrees with the meta_heuristic_embeddings.embedding column, so a
 // mismatched EMBEDDING_DIMENSION surfaces as one clear error instead of opaque
 // per-write failures. Changing the dimension is a migration + re-embed, never a
 // runtime toggle; pgvector stores the column dimension in atttypmod.
@@ -46,14 +46,14 @@ func ValidateEmbeddingDimension(ctx context.Context, pool *Pool, expected int) e
 	var columnDim int
 	err := pool.QueryRow(ctx,
 		"SELECT atttypmod FROM pg_attribute "+
-			"WHERE attrelid = 'insight_embeddings'::regclass AND attname = 'embedding'",
+			"WHERE attrelid = 'meta_heuristic_embeddings'::regclass AND attname = 'embedding'",
 	).Scan(&columnDim)
 	if err != nil {
 		return fmt.Errorf("read embedding column dimension: %w", err)
 	}
 	if columnDim != expected {
 		return fmt.Errorf(
-			"embedding dimension mismatch: config=%d but insight_embeddings.embedding is vector(%d); "+
+			"embedding dimension mismatch: config=%d but meta_heuristic_embeddings.embedding is vector(%d); "+
 				"changing the dimension requires a matching migration and full re-embed, not a runtime toggle",
 			expected, columnDim,
 		)
@@ -131,9 +131,9 @@ func parseMajorMinor(version string) (int, int, error) {
 // row while a goal-less re-embed can never re-blank a populated one.
 func (e *EmbeddingStore) Upsert(ctx context.Context, nodeID, goalID string, embedding []float32) error {
 	_, err := e.pool.Exec(ctx,
-		"INSERT INTO insight_embeddings (node_id, goal_id, embedding, updated_at) VALUES ($1, $2, $3, now()) "+
+		"INSERT INTO meta_heuristic_embeddings (node_id, goal_id, embedding, updated_at) VALUES ($1, $2, $3, now()) "+
 			"ON CONFLICT (node_id) DO UPDATE SET embedding = EXCLUDED.embedding, "+
-			"goal_id = COALESCE(EXCLUDED.goal_id, insight_embeddings.goal_id), updated_at = now()",
+			"goal_id = COALESCE(EXCLUDED.goal_id, meta_heuristic_embeddings.goal_id), updated_at = now()",
 		nodeID, nullableUUID(goalID), pgvector.NewVector(embedding),
 	)
 	if err != nil {
@@ -156,7 +156,7 @@ func nullableUUID(id string) any {
 // present is not an error: the desired end state is "no row", and it is reached
 // whether this call or a concurrent one got there.
 func (e *EmbeddingStore) Delete(ctx context.Context, nodeID string) error {
-	_, err := e.pool.Exec(ctx, "DELETE FROM insight_embeddings WHERE node_id = $1", nodeID)
+	_, err := e.pool.Exec(ctx, "DELETE FROM meta_heuristic_embeddings WHERE node_id = $1", nodeID)
 	if err != nil {
 		return fmt.Errorf("delete embedding for %q: %w", nodeID, err)
 	}
@@ -265,13 +265,13 @@ func (e *EmbeddingStore) SimilaritySearchScored(ctx context.Context, query []flo
 	// so the two modes cannot share one OR-ed clause.
 	if scope.CrossGoal {
 		rows, err = tx.Query(ctx,
-			"SELECT node_id, embedding <=> $1 AS distance FROM insight_embeddings "+
+			"SELECT node_id, embedding <=> $1 AS distance FROM meta_heuristic_embeddings "+
 				"WHERE (embedding <=> $1) <= $2 ORDER BY embedding <=> $1 LIMIT $3",
 			vec, e.distanceFloor, k,
 		)
 	} else {
 		rows, err = tx.Query(ctx,
-			"SELECT node_id, embedding <=> $1 AS distance FROM insight_embeddings "+
+			"SELECT node_id, embedding <=> $1 AS distance FROM meta_heuristic_embeddings "+
 				"WHERE (embedding <=> $1) <= $2 AND goal_id = $3 ORDER BY embedding <=> $1 LIMIT $4",
 			vec, e.distanceFloor, scope.GoalID, k,
 		)
@@ -301,8 +301,8 @@ func (e *EmbeddingStore) SimilaritySearchScored(ctx context.Context, query []flo
 // NodeRef is one embedding row's identity and goal scope, the reconcile pass's
 // view of the pgvector side.
 type NodeRef struct {
-	NodeID    string
-	DatasetID string
+	NodeID string
+	GoalID string
 }
 
 // ListNodeRefs returns every embedding row's node_id and goal_id, so the
@@ -312,7 +312,7 @@ type NodeRef struct {
 // heal -- would otherwise abort the whole scan.
 func (e *EmbeddingStore) ListNodeRefs(ctx context.Context) ([]NodeRef, error) {
 	rows, err := e.pool.Query(ctx,
-		"SELECT node_id, COALESCE(goal_id::text, '') FROM insight_embeddings",
+		"SELECT node_id, COALESCE(goal_id::text, '') FROM meta_heuristic_embeddings",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list node refs: %w", err)
@@ -322,7 +322,7 @@ func (e *EmbeddingStore) ListNodeRefs(ctx context.Context) ([]NodeRef, error) {
 	var refs []NodeRef
 	for rows.Next() {
 		var ref NodeRef
-		if err := rows.Scan(&ref.NodeID, &ref.DatasetID); err != nil {
+		if err := rows.Scan(&ref.NodeID, &ref.GoalID); err != nil {
 			return nil, fmt.Errorf("scan node ref: %w", err)
 		}
 		refs = append(refs, ref)
@@ -339,7 +339,7 @@ func (e *EmbeddingStore) ListNodeRefs(ctx context.Context) ([]NodeRef, error) {
 // overwritten.
 func (e *EmbeddingStore) SetGoalID(ctx context.Context, nodeID, goalID string) error {
 	_, err := e.pool.Exec(ctx,
-		"UPDATE insight_embeddings SET goal_id = $2 WHERE node_id = $1 AND goal_id IS NULL",
+		"UPDATE meta_heuristic_embeddings SET goal_id = $2 WHERE node_id = $1 AND goal_id IS NULL",
 		nodeID, nullableUUID(goalID),
 	)
 	if err != nil {

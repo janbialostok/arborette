@@ -5,8 +5,9 @@ import { usePathname } from "next/navigation";
 import { cn } from "@/components/ui";
 
 const LINKS = [
-  { href: "/", label: "New dataset" },
-  { href: "/datasets", label: "Datasets" },
+  { href: "/", label: "Submit goal" },
+  { href: "/goals", label: "Objectives" },
+  { href: "/heuristics", label: "Heuristics" },
 ];
 
 export function AppNav() {

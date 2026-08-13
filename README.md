@@ -1,19 +1,19 @@
 # Arborette
 
-Arborette lets analysts ask **questions** about a **dataset** and returns **insights** — a ranked set
-of data segments and their measured effects. An analyst names a dataset, poses a question about what
-would improve or degrade it, and points the system at a data source; everything after that is
-measurement — the AI proposes where to look, but on the tabular path every number was computed from
-the data by a read-only query, never asserted by a model. The insights that survive scrutiny are
-published as reusable, queryable knowledge that downstream agents consume over MCP.
+Arborette discovers which **segments of a dataset** maximize or minimize a numeric objective, and
+abstracts the findings that survive scrutiny into reusable, queryable **Meta-Heuristics** that
+downstream AI agents consume over MCP. An analyst describes a goal in plain English and points the
+system at a file; everything after that is measurement — Claude proposes where to look, but on the
+tabular path every number in the resulting graph was computed from the data by a read-only query,
+never asserted by a model.
 
-A question has a fixed shape: an **aggregation over a value expression, plus a direction** —
+An objective has a fixed shape: an **aggregation over a value expression, plus a direction** —
 `maximize avg(order_value)`, or `maximize avg(is_fraud = True)` for a rate. The value expression can
 also be **entity-relative** — a `lag` or a `trailing_aggregate` over an entity's own ordered history
-— when the dataset binds an entity key and a time column, so a question can measure how often a
+— when the goal binds an entity key and a time column, so an objective can measure how often a
 transaction's amount beats that account's recent trailing mean. Discovery proceeds by adding **filter
-predicates** that carve sub-segments out of the dataset and re-measuring the same question inside
-each one. An insight is therefore always a pair: a set of filters, and what the question measured
+predicates** that carve sub-segments out of the dataset and re-measuring the same objective inside
+each one. A finding is therefore always a pair: a set of filters, and what the objective measured
 under them.
 
 It is **not** prediction, feature selection, or model training — the output is a ranked set of data
@@ -39,9 +39,9 @@ your customers already churns most, and how much worse that slice is than the wh
   outcome and its confidence are what Claude reported, not what a query computed, so it is written
   `unverified` and stays out of Phase 2 until an analyst confirms or corrects it. Confidence only
   decides what gets queued for review; it never promotes an extraction to evidence.
-- **Document datasets run Phase 1 only.** A PDF data source is supported by the hypothesis loop's
-  per-field extraction path, but the Sleep Cycle rejects a document dataset outright: it has no
-  numeric question to answer and no conjoinable segment to search. That is structural: human
+- **Document goals run Phase 1 only.** A PDF data source is supported by the hypothesis loop's
+  per-field extraction path, but the Sleep Cycle rejects a document goal outright: such a goal has no
+  numeric objective to optimize and no conjoinable segment to search. That is structural: human
   review of the extracted values does not change it.
 
 ## How it works
@@ -58,7 +58,7 @@ which is exactly the space a greedy descent prunes past.
 
 ### Phase 1 — Active Hypothesis Loop
 
-The Orchestrator pins the question from the dataset's Evaluation Matrix, introspects the data source,
+The Orchestrator pins the objective from the goal's Evaluation Matrix, introspects the data source,
 asks Claude for candidate filter predicates, and then measures a root baseline with no filters. Each
 candidate is then measured empirically through the Sandbox Execution service at its **cumulative**
 filter set — its own predicates plus every ancestor's — and written to the graph as a `State →
@@ -87,10 +87,10 @@ and what you must not confuse with the segment's total lift.
 Two things that both look like "filters" are separate flows that happen to share one type.
 **Intervention filters** are compiled to SQL by the Sandbox and are what carves the segment.
 **Matrix hard constraints** are checked in the Orchestrator against the measured objective value,
-and only when the question is a bare column reference — for a compound value expression there is
+and only when the objective is a bare column reference — for a compound value expression there is
 no single column to constrain, so the check is a no-op. Expression-based constraints are deferred.
 
-A failure at the root (pinning the question, introspection, the root proposal, the root baseline)
+A failure at the root (pinning the objective, introspection, the root proposal, the root baseline)
 is terminal and marks the run `failed` with its real reason; a per-candidate failure is recorded and
 its siblings continue. Because the proposal precedes the baseline, a root failure has usually
 already paid for its Claude call. The loop is bounded by a 30-minute timeout, as is the Sleep Cycle
@@ -106,12 +106,12 @@ Four things to know before writing an SSE client, none of them guessable from th
   `causal_verification_dispatched`, `auto_promotion_complete`, `causal_graph_corrected`,
   `claim_construction_failed`), so a client must default-arm its switch rather than exhaust it. A
   `confidence_distribution` frame is a whole snapshot superseding the last rather than a delta, and
-  it is not a liveness signal: resolving a verification republishes one onto the dataset's stream from
+  it is not a liveness signal: resolving a verification republishes one onto the goal's stream from
   outside any run. An
   `addEventListener('triplet', …)` handler would never fire. Note `type` alone is not quite enough:
   a `triplet` from a tabular goal and one from a document goal carry different payloads, and the
   overlap is the dangerous part — both have a `value`, a number on one path and a string on the
-  other. Only the dataset's kind, which the wire never states, tells you which to expect.
+  other. Only the goal's kind, which the wire never states, tells you which to expect.
 - **The stream is keyed by goal, not run.** Two runs triggered on one goal share a buffer and a
   subscriber set, and the first to finish tears the subscription down for both. Let a run finish
   before re-triggering it.
@@ -122,7 +122,7 @@ Four things to know before writing an SSE client, none of them guessable from th
 - **Subscribing after a run ends is how a verdict reaches you.** An unknown goal is a 404, and the
   response head is flushed on subscribe so a status code is always available. A *known* goal whose run
   already finished emits nothing further of its own — but the stream is not dead: the router and
-  Engine B publish onto the dataset's key from outside any run, and reach only clients already
+  Engine B publish onto the goal's key from outside any run, and reach only clients already
   subscribed, so a surface waiting on a verification verdict has to hold the connection open across
   the run's end. Nothing closes it. Keepalive comment frames arrive every 30s, so the connection stays
   healthy rather than being reaped; they carry no events. Mid-run reconnects are safe and replay recent
@@ -137,16 +137,16 @@ publishing as knowledge. In order, one run:
 
 1. Settles the previous run's leftovers: sweeps Meta-Heuristics whose evidence was since rejected,
    and re-embeds any left with a pending embedding by a mid-write crash.
-2. Introspects the data source, pins the question, and measures the **global unfiltered baseline** —
+2. Introspects the data source, pins the objective, and measures the **global unfiltered baseline** —
    the reference every derived finding's effect size is relative to.
-3. Loads the dataset's eligible findings and picks `S*` — the best raw objective value any of them
+3. Loads the goal's eligible findings and picks `S*` — the best raw objective value any of them
    achieved, not the support-shrunk score that ranks publications later. `S*` is the best
    *finding*, not the best single predicate: a depth-2 Phase-1 branch is an equally valid `S*`, and
    it sets a correspondingly higher bar.
 4. Builds the atom vocabulary — every distinct predicate any finding introduced — and searches the
    **conjunction lattice**, by default with a **knowledge-guided PUCT tree search** that descends
    where the measured evidence and its priors point. Prior Meta-Heuristics retrieved from the corpus
-   enter as whole conjunctions to adopt, so a dataset can start from what another goal learned; a
+   enter as whole conjunctions to adopt, so a goal can start from what another goal learned; a
    causal verification multiplies a candidate's value estimate, so a segment resting on a verified
    effect outranks a merely correlated one. Both are additive — with an empty corpus and no verified
    edges the search is plain UCT. `SLEEPCYCLE_POLICY=beam` selects the level-wise **beam** instead.
@@ -156,7 +156,7 @@ publishing as knowledge. In order, one run:
    operator (`x >= 4 ∧ x >= 12` *is* `x >= 12`). Every surviving candidate is measured **empirically**
    through the Sandbox, objective and row count in one query.
 5. Writes each materially-better macro-segment back as a full triplet against the global baseline,
-   flagged as sleep-derived, under an id derived deterministically from the dataset and the
+   flagged as sleep-derived, under an id derived deterministically from the goal and the
    canonicalized filter set so a re-run after a crash rewrites identical nodes instead of
    duplicating them.
 6. Selects publications over the **union of Phase-1 findings and this run's derived winners**:
@@ -173,13 +173,13 @@ gate is never set by evidence it would itself reject, drops publication candidat
 doubles as the shrinkage constant that ranks whatever survives. `SLEEPCYCLE_SEARCH_MIN_LIFT` is
 narrower — the relative improvement over `S*` a macro-segment must clear — and it gates **write-back
 only**, deliberately, because a bar phrased relative to `S*` gets harder to clear the better Phase 1
-performed, and that must not decide whether the dataset publishes anything at all. So a run that writes
+performed, and that must not decide whether the goal publishes anything at all. So a run that writes
 back zero macro-segments can still publish Meta-Heuristics; a run publishes nothing when no
 candidate clears selection, or when every selected one fails to abstract.
 
 ### Engine B — causal verification
 
-Phases 1 and 2 answer *which segments correlate with the question*. Engine B answers *which of those
+Phases 1 and 2 answer *which segments correlate with the objective*. Engine B answers *which of those
 correlations survives adjustment for what else the data explains*, and it is reached three ways.
 
 Intake classifies every registered goal onto a track. A goal that asserts a specific claim registers
@@ -210,7 +210,7 @@ touch which datastore and under which Postgres role.
 Seven Go binaries under `cmd/`. Three are always-on services, two run either as a one-shot job or
 in `-serve` mode behind an HTTP launcher, and two are init one-shots:
 
-- **`orchestrator`** — the REST API, the Phase-1 loop, the SSE stream, the dataset registry, and the
+- **`orchestrator`** — the REST API, the Phase-1 loop, the SSE stream, the goal registry, and the
   only holder of audit-table credentials, which is why the Sleep-Cycle Worker records through its
   internal audit API rather than writing to the table directly.
 - **`sandbox`** — stateless execution of read-only DuckDB queries and document extractions against
@@ -233,7 +233,7 @@ through `internal/sandboxclient`, which carries its own copy of the wire contrac
 reason. Callers must not import `internal/sandbox`.
 
 Storage is split three ways, which is also why cross-store consistency shows up in the roadmap:
-Neo4j holds the triplet graph and the Meta-Heuristic nodes, Postgres holds the dataset registry, the
+Neo4j holds the triplet graph and the Meta-Heuristic nodes, Postgres holds the goal registry, the
 runs table, the append-only audit log, and — via pgvector — the Meta-Heuristic embeddings, and
 MinIO/S3 holds every staged dataset.
 
@@ -303,7 +303,7 @@ Note that `make down` keeps the four named volumes, so goals, triplets, and publ
 survive a restart and accumulate across repeated passes; `docker compose down -v` is the clean
 slate.
 
-### 2. Register a question
+### 2. Register an objective
 
 ```
 curl -sS -X POST http://localhost:8080/goals \
@@ -324,34 +324,34 @@ Two request details matter more than they look:
 For a **windowed (entity-relative) objective**, add two more form fields: `entity_key_column` (the
 partition key, e.g. `account_id`) and `time_column` (an orderable — temporal or numeric — column the
 history sorts by). It is both-or-neither, and each must resolve to a unique real column. Supplying
-them makes the `lag` and `trailing_aggregate` value-expression kinds available, so a dataset phrased for
+them makes the `lag` and `trailing_aggregate` value-expression kinds available, so a goal phrased for
 an entity-relative signal ("amount far above the account's recent average") fits to a window;
-**leave them off and window kinds are rejected at the dry-run** regardless of how the dataset is worded
-— nothing in the dataset text alone turns windowing on.
+**leave them off and window kinds are rejected at the dry-run** regardless of how the goal is worded
+— nothing in the goal text alone turns windowing on.
 
 Three extensions are accepted: `.csv` and `.parquet` on the tabular path, and `.pdf` on the document
 path. Anything else — `.tsv`, `.xlsx`, `.json` — is rejected, so a spreadsheet export needs
-converting first. A `.pdf` takes a different intake entirely: instead of fitting a question it
+converting first. A `.pdf` takes a different intake entirely: instead of fitting an objective it
 asks Claude which fields are extractable from your goal text, so phrase a document goal as the
 values you want pulled out rather than as something to maximize, or it comes back 422 with nothing
 to extract. A one-page sample ships as `sample-invoice.pdf` on the import mount — an invoice
-carrying a number, dates, and totals — so `import_path=sample-invoice.pdf` with a dataset phrased as
+carrying a number, dates, and totals — so `import_path=sample-invoice.pdf` with a goal phrased as
 the fields to pull out exercises the document path end to end.
 
 Registration ingests the file into the object store, introspects its schema, fits the Evaluation
 Matrix to the real columns with Claude, **dry-runs the fitted objective against the Sandbox**, and
-persists the dataset — returning 201 with `{"optimization_function_id": "<uuid>"}`. That id is what
+persists the goal — returning 201 with `{"optimization_function_id": "<uuid>"}`. That id is what
 every later step consumes: `{id}` in the loop and stream routes, and `GOAL=` for `make sleep-cycle`.
 
-Registration also classifies the dataset's **track**. A goal phrased as a hypothesis to test registers
+Registration also classifies the goal's **track**. A goal phrased as a hypothesis to test registers
 as `verify`, with the claim extracted and grounded against the real schema; anything else registers
 as `explore` and runs discovery as before. Classification never fails registration — a classifier
 fault falls open to `explore`. A verify-track claim that will not ground reports its reason in the
 goal's `claim_error`, which is how you tell "the claim could not be built" from "the claim was
 tested and not supported"; `GET /goals` serves both `track` and `claim_error`.
 
-Registration does **not** start Phase 1. It also fails *here* rather than at run time if the dataset
-cannot be fitted to the data — a question that does not compile against the schema comes back as
+Registration does **not** start Phase 1. It also fails *here* rather than at run time if the goal
+cannot be fitted to the data — an objective that does not compile against the schema comes back as
 a 4xx with the reason, after the system has already tried to repair it. One failure at this step is
 worth recognizing on sight: a `502 "evaluation matrix generation failed"` almost always means the
 Anthropic call did not go through, because nothing validates `ANTHROPIC_API_KEY` at startup and the
@@ -428,9 +428,9 @@ Search is semantic over the published Meta-Heuristics' embeddings; it returns
 `[{"id", "definition"}]`, and that `id` is what the trace call takes. The MCP endpoint on `:8082` is
 the agent-facing equivalent of both.
 
-Little of this walkthrough actually requires curl. The web UI's landing page is the dataset-submission
+Little of this walkthrough actually requires curl. The web UI's landing page is the goal-submission
 form, `/goals` lists registered objectives with their run status, and `/heuristics` browses what was
-published — scoped to a dataset, its evidence rows also say whether each supporting finding's effect is
+published — scoped to a goal, its evidence rows also say whether each supporting finding's effect is
 causal or merely correlated, and can send one for verification. A goal page carries four tabs,
 mirrored into `?tab=` so any of them is linkable: **Run** follows the live stream, **Causal** is
 Engine B's surface, **Verify** works the human review queue against the source excerpts each value
@@ -445,13 +445,13 @@ refutation score — a `causally_verified` result always carrying the caveat tha
 the discovered model. Edge corrections (flip, unorient, delete, add a confounder) are applied from
 the graph view and are never required: an uncorrected graph is verified as discovered, and a
 correction is served as a new version that re-verifies whatever it invalidated. A verdict arrives
-minutes after dispatch and lands on the tab without a reload, including on a dataset whose run finished
+minutes after dispatch and lands on the tab without a reload, including on a goal whose run finished
 long before.
 
 ### 6. Enable the agent chat preview (optional)
 
 The **Preview agent** tab — and the `POST /goals/{id}/chat` route behind it — is off by default,
-and a dataset's tab answers "agent preview is not configured" until you turn it on. It is the one
+and a goal's tab answers "agent preview is not configured" until you turn it on. It is the one
 feature that needs setup beyond `make up`, because it uses Anthropic's native MCP connector:
 **Anthropic's infrastructure dials the MCP server inbound**, so the in-network
 `http://mcpserver:8082` address cannot serve it and the connector requires a public **HTTPS** URL.
@@ -527,24 +527,24 @@ The Orchestrator's eighteen routes:
 
 | Method and path | Purpose |
 |---|---|
-| `POST /goals` | Register a dataset (multipart: `goal` plus a file upload or `import_path`; optional `confidence_threshold` — above 0, at most 1 — and `epoch_mode=speculative\|blocking` override the review defaults, and a bad value is a 400; optional `entity_key_column`+`time_column`, both-or-neither, bind a windowed objective). Ingests, introspects, fits and dry-runs the Evaluation Matrix, persists, returns 201. Does not start Phase 1. |
+| `POST /goals` | Register a goal (multipart: `goal` plus a file upload or `import_path`; optional `confidence_threshold` — above 0, at most 1 — and `epoch_mode=speculative\|blocking` override the review defaults, and a bad value is a 400; optional `entity_key_column`+`time_column`, both-or-neither, bind a windowed objective). Ingests, introspects, fits and dry-runs the Evaluation Matrix, persists, returns 201. Does not start Phase 1. |
 | `GET /goals` | List registered objectives with each one's latest run status (synthetic `no run` when never triggered). |
 | `POST /goals/{id}/hypothesis-loop` | Trigger Phase 1. |
-| `GET /goals/{id}/stream` | SSE progress for a dataset's run. |
+| `GET /goals/{id}/stream` | SSE progress for a goal's run. |
 | `POST /goals/{id}/chat` | One turn of the agent preview, streamed back as SSE. The browser holds the transcript and posts it each turn. Returns 503 until the MCP connector is configured — see `MCP_PUBLIC_URL` in `.env.example`. |
 | `POST /goals/{id}/sleep-cycle` | Trigger Phase 2 (202, async, one run per goal — a second while one is in flight is a 409). |
-| `GET /goals/{id}/verifications` | The human-review queue for a dataset (`status=pending\|resolved` narrows it), plus the dataset's effective threshold and epoch mode. |
+| `GET /goals/{id}/verifications` | The human-review queue for a goal (`status=pending\|resolved` narrows it), plus the goal's effective threshold and epoch mode. |
 | `POST /goals/{id}/verifications/{outcomeID}` | Submit a review: `{"action":"confirm"\|"correct"\|"reject","corrected_value":"…"}`. 409 if the outcome was already resolved. |
-| `GET /goals/{id}/outcomes` | Every extracted value for a dataset, not just the queued ones, so any result can be pulled up for review. |
+| `GET /goals/{id}/outcomes` | Every extracted value for a goal, not just the queued ones, so any result can be pulled up for review. |
 | `GET /goals/{id}/outcomes/{outcomeID}/excerpt` | The source text behind an extracted value — the located span, or the whole document when the value cannot be pinpointed in it. |
 | `GET /goals/{id}/causal-graph` | The goal's discovered causal graph — edges with their provenance, direction, and test status. |
-| `POST /goals/{id}/causal-graph/corrections` | Apply one analyst edge correction (`{"op":"flip"\|"delete"\|"add","from":…,"to":…,"direction":…}`), served as a new graph version. Verifications whose adjustment set touched the corrected columns are marked stale and re-dispatched under `ORCHESTRATOR_STALE_REVERIFY_CAP`. 409 while a concurrent correction or discovery holds the dataset's graph lock. |
-| `POST /goals/{id}/findings/{interventionID}/verify` | Dispatch one observational finding for causal verification. 202; the verdict arrives minutes later on the dataset's stream and in `GET /goals/{id}/causal-verifications`. Analyst-initiated, so exempt from the auto-promotion budget. A finding belonging to another goal is a 404. |
+| `POST /goals/{id}/causal-graph/corrections` | Apply one analyst edge correction (`{"op":"flip"\|"delete"\|"add","from":…,"to":…,"direction":…}`), served as a new graph version. Verifications whose adjustment set touched the corrected columns are marked stale and re-dispatched under `ORCHESTRATOR_STALE_REVERIFY_CAP`. 409 while a concurrent correction or discovery holds the goal's graph lock. |
+| `POST /goals/{id}/findings/{interventionID}/verify` | Dispatch one observational finding for causal verification. 202; the verdict arrives minutes later on the goal's stream and in `GET /goals/{id}/causal-verifications`. Analyst-initiated, so exempt from the auto-promotion budget. A finding belonging to another goal is a 404. |
 | `GET /goals/{id}/causal-verifications` | The goal's causal-verification records, newest first: naive and adjusted effect, adjustment set, refutation score, and staleness. Distinct from `/verifications`, which answers "did a human confirm this extracted value" rather than "does the data support this as a causal effect". |
 | `GET /heuristics/search` | Semantic search over published Meta-Heuristics (`q` required; `k` defaults 10, clamped at 100). |
 | `GET /heuristics/{id}/trace` | Trace a Meta-Heuristic back to its supporting triplets. |
 | `POST /internal/audit` | The internal audit-write API other services record through. |
-| `POST /internal/verification-events` | The channel the Verifier republishes run transitions through onto a dataset's SSE stream. Both `/internal` routes check a bearer token, when `INTERNAL_AUTH_TOKEN` is set. |
+| `POST /internal/verification-events` | The channel the Verifier republishes run transitions through onto a goal's SSE stream. Both `/internal` routes check a bearer token, when `INTERNAL_AUTH_TOKEN` is set. |
 
 The Sandbox exposes three routes, all called by other services rather than by an analyst:
 `POST /introspect`, `POST /execute`, and `POST /document/text`.
@@ -560,8 +560,8 @@ Four tools, registered at startup and served over Streamable HTTP on `:8082`:
 | `submit_analyst_goal` | Register an analyst optimization goal against a data source on the import mount, proxied to the Orchestrator. |
 | `verify_finding` | Request causal verification of one observational finding: its effect is recomputed adjusted for the confounders in the discovered causal graph, then stress-tested. Dispatch is asynchronous — poll `trace_causal_chain` for the verified effect. |
 
-An MCP consumer can register a dataset and request verification of a finding, but **cannot trigger
-either discovery phase** — advancing a dataset through Phase 1 or Phase 2 stays a human-driven REST
+An MCP consumer can register a goal and request verification of a finding, but **cannot trigger
+either discovery phase** — advancing a goal through Phase 1 or Phase 2 stays a human-driven REST
 action. Both read tools carry each result's `epistemic_source`, and a causally inferred effect rides
 with its caveat, so an agent can weight verified knowledge above correlation rather than having to
 infer the distinction from the payload shape.
@@ -583,7 +583,7 @@ under [Prerequisites](#prerequisites). Three LLM providers are supported (set vi
 | `DEEP_INFRA_BASE_URL` | DeepInfra API base URL (default `https://api.deepinfra.com/v1/openai`). |
 | `OLLAMA_LLM_ENDPOINT` | Ollama server URL (default `http://localhost:11434`). |
 | `OLLAMA_LLM_MODEL` | Ollama model (default `llama3`). |
-| `MCP_PUBLIC_URL` | Where Anthropic's infrastructure dials the MCP server for the agent chat. It connects inbound, so the in-network `http://mcpserver:8082` cannot serve — locally this is a tunnel to port 8082. Unset, a dataset's Preview agent tab answers "agent preview is not configured". |
+| `MCP_PUBLIC_URL` | Where Anthropic's infrastructure dials the MCP server for the agent chat. It connects inbound, so the in-network `http://mcpserver:8082` cannot serve — locally this is a tunnel to port 8082. Unset, a goal's Preview agent tab answers "agent preview is not configured". |
 | `MCP_AUTHORIZATION_TOKEN` | Bearer token the MCP server checks when set; empty disables auth, leaning on the same trusted-network assumption every other published port makes. Setting `MCP_PUBLIC_URL` without a token makes the MCP server refuse to start. |
 | `INTERNAL_AUTH_TOKEN` | Shared secret for service-to-service writes — today the audit-append API the sleep-cycle job records through. The Orchestrator verifies it and the job presents it, both from this one variable, so the two cannot drift apart; empty disables the guard. A wrong value is quiet rather than loud: the Orchestrator answers 401 and the job logs and swallows the failure, so runs keep reporting success while their audit records stop being written. |
 | `NEO4J_USER` / `_PASSWORD` | Graph credentials. Compose pins the user to `neo4j`, so only the password is really free. |
@@ -650,7 +650,7 @@ Open themes, each with the reason it is open:
 - **Objective expressiveness.** Entity-relative signals over an entity's own ordered history *are*
   now expressible: a value expression can use `lag` and `trailing_aggregate` kinds that compile to
   `OVER (PARTITION BY <entity> ORDER BY <time>)`, so amount-versus-that-account's-trailing-mean and
-  prior-value comparisons work once a dataset binds its `entity_key_column` and `time_column`. What
+  prior-value comparisons work once a goal binds its `entity_key_column` and `time_column`. What
   stays out of reach is everything beyond those two window kinds — no `GROUP BY`, no arbitrary
   partition/frame grammar, no cross-row joins — so time-boxed velocity (N events in M minutes) and
   geo-impossibility between consecutive events still need precomputing as plain columns.
@@ -708,5 +708,5 @@ edge, rather than adjusting the observational rows — would replace inference w
 - [`.turbo/specs/arborette.md`](.turbo/specs/arborette.md) — the product source of truth:
   requirements, architecture, data model, key flows, and the V2 roadmap this README compresses.
 - [`.turbo/specs/objective-intake-and-navigation.md`](.turbo/specs/objective-intake-and-navigation.md)
-  — the question-intake and navigation design; supersedes the parent spec on tabular intake
+  — the objective-intake and navigation design; supersedes the parent spec on tabular intake
   ordering.

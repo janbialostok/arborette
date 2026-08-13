@@ -1,5 +1,5 @@
 import { ObjectivesList } from "@/components/ObjectivesList";
 
-export default function DatasetsPage() {
+export default function ObjectivesPage() {
   return <ObjectivesList />;
 }

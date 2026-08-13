@@ -1,31 +1,5 @@
 # Arborette — Agent Guide
 
-## Terminology (2026-08)
-
-The project underwent a naming refactor in August 2026. Old names have aliases so
-existing code compiles, but **new code must use the current names**.
-
-| Old Name | Current Name |
-|----------|-------------|
-| Goal / Optimization Function | Dataset |
-| Objective | Question |
-| Heuristic / MetaHeuristic | Insight |
-| `meta_heuristic_embeddings` | `insight_embeddings` (table rename, with migration) |
-| `goal_registry` | `dataset_registry` (table rename, with migration) |
-| `get_optimized_heuristics` (MCP tool) | `get_insights` |
-| `optimization_function_id` (column) | retains wire name for backward compat |
-
-**Domain structs**: `domain.Insight` replaces `domain.MetaHeuristic`; an alias
-`MetaHeuristic = Insight` exists for compat. `State.DatasetID`, `Intervention.DatasetID`,
-`Outcome.DatasetID` replace the old `GoalID` fields.
-
-**Question package**: `question.Question` replaces `objective.Objective`; the `internal/objective`
-package is now a thin compat shim that re-exports `question` — new code should import
-`github.com/arborette/arborette/internal/question`.
-
-**Store types**: `store.Dataset` and `store.DatasetRegistry` replace `store.Goal` and
-`store.GoalRegistry`; aliases exist.
-
 ## Build & Dependencies
 
 - The Go toolchain is pinned to **1.24** (`GOTOOLCHAIN`). Pin every new dependency
@@ -72,16 +46,18 @@ package is now a thin compat shim that re-exports `question` — new code should
   (e.g. a status-sweep's affected-row count) — assert per-row effects instead. When
   asserting an `ORDER BY` over `now()`-defaulted timestamps, `time.Sleep` a couple
   ms between inserts so the ordering is deterministic.
-- `make test` **truncates** `insight_embeddings` (`internal/testutil`), so a
-  run against the live stack destroys the pgvector rows of every Insight a
+- `make test` **truncates** `meta_heuristic_embeddings` (`internal/testutil`), so a
+  run against the live stack destroys the pgvector rows of every Meta-Heuristic a
   real Sleep-Cycle run published. The graph side is untouched, so those nodes keep
   `embedding_pending = false` and the resume pass skips them — they stay reachable
-  by `trace_causal_chain` while returning nothing from `get_insights`.
+  by `trace_causal_chain` while returning nothing from `get_optimized_heuristics`.
   Never compare an embeddings-table observation taken before the gate with one
   taken after; re-publish (or re-embed) before drawing conclusions.
 - The graph side is not left alone either: the suite seeds fixture
-  `Insight` nodes into the shared dev Neo4j and never removes them, so
-  residue accumulates run over run. Combined with the truncate above, one `make test` leaves the two
+  `MetaHeuristic` nodes into the shared dev Neo4j and never removes them, so
+  residue accumulates run over run (a real instance reached 169 of 194 nodes,
+  from the `"abstraction"` and `"reducing threshold restores latency"` fixtures
+  among others). Combined with the truncate above, one `make test` leaves the two
   stores diverged in **both** directions — nodes with no embedding, and stale
   embeddings whose fixture node was seeded by an earlier run. When judging drift,
   filter fixture definitions out first; when verifying against the live stack,
@@ -96,7 +72,7 @@ package is now a thin compat shim that re-exports `question` — new code should
   specific id) rather than `detail["k"] != nil`, which passes even when the value
   is the nil the assertion means to catch.
 - `audit_log` is a shared table read by ops queries. Key its `detail` map with the
-  codebase-wide vocabulary — `optimization_function_id` for the dataset id,
+  codebase-wide vocabulary — `optimization_function_id` for the goal id,
   `data_source_ref` for the source — even when a new service's own wire DTO spells
   the same value differently (e.g. the verifier's `POST /verifications` body uses
   `goal_id`/`datasource_ref`). The wire contract and the audit-detail schema are

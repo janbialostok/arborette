@@ -418,7 +418,7 @@ func (w *Worker) runSearch(ctx context.Context, goal searchTarget, obj objective
 	}
 
 	log.Printf("sleepcycle: search for %q ended (%s) after %d measurements",
-		goal.datasetID, outcome.stopReason, len(outcome.measured))
+		goal.goalID, outcome.stopReason, len(outcome.measured))
 	return outcome
 }
 
@@ -433,7 +433,7 @@ func (w *Worker) measure(ctx context.Context, goal searchTarget, obj objective.O
 
 	resp, err := w.sandbox.Execute(ctx, req)
 	if err != nil {
-		w.measurementFailure(ctx, goal.datasetID, node, err.Error())
+		w.measurementFailure(ctx, goal.goalID, node, err.Error())
 		return Measurement{Failed: true}
 	}
 	// The support count decides how to read the rest of the response, so it comes
@@ -441,7 +441,7 @@ func (w *Worker) measure(ctx context.Context, goal searchTarget, obj objective.O
 	// which is a fault.
 	support, counted := sandboxclient.RowCount(resp)
 	if !counted {
-		w.measurementFailure(ctx, goal.datasetID, node, "sandbox returned no row count for a counted measurement")
+		w.measurementFailure(ctx, goal.goalID, node, "sandbox returned no row count for a counted measurement")
 		return Measurement{Failed: true}
 	}
 	// A count of zero means the conjunction matched nothing: a routine search
@@ -453,12 +453,12 @@ func (w *Worker) measure(ctx context.Context, goal searchTarget, obj objective.O
 	// rows, which at a support floor of zero ranks (first, under Minimize) and can
 	// be written back and abstracted as the best known segment.
 	if support == 0 {
-		log.Printf("sleepcycle: segment matched zero rows for %q: %s", goal.datasetID, node.canonical)
+		log.Printf("sleepcycle: segment matched zero rows for %q: %s", goal.goalID, node.canonical)
 		return Measurement{Failed: true}
 	}
 	value, ok := objective.NumericValue(resp.Value, obj.Label)
 	if !ok {
-		w.measurementFailure(ctx, goal.datasetID, node, objective.ErrNonNumericValue.Error())
+		w.measurementFailure(ctx, goal.goalID, node, objective.ErrNonNumericValue.Error())
 		return Measurement{Failed: true}
 	}
 	return Measurement{Value: value, Support: support}

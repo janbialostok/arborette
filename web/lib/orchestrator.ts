@@ -51,7 +51,7 @@ export interface QueryTripletPayload extends TripletIdentity {
   baseline: number;
   value: number;
   effect_size: number;
-  // The question this triplet measured, its optimization direction, and the
+  // The objective this triplet measured, its optimization direction, and the
   // segment's effective/added filters rendered as predicate chips. `direction`
   // decides which sign of effect_size is an improvement; `filters` is the segment
   // the triplet measured, `new_filters` the filter this candidate added.
@@ -99,14 +99,12 @@ export interface SubmitGoalResponse {
   optimization_function_id: string;
 }
 
-export interface InsightMatch {
+export interface HeuristicMatch {
   id: string;
   definition: string;
 }
 
-export type HeuristicMatch = InsightMatch;
-
-// A registered dataset plus its latest run status, as projected by GET /goals.
+// A registered objective plus its latest run status, as projected by GET /goals.
 // `status` is one of the run lifecycle states or a synthetic "no run"; the
 // backend omits `failure_reason` unless the latest run failed with a reason.
 export interface GoalListItem {
@@ -387,21 +385,10 @@ export function triggerHypothesisLoop(id: string): Promise<SubmitGoalResponse> {
 }
 
 export function triggerSleepCycle(id: string): Promise<SubmitGoalResponse> {
-	return requestJSON<SubmitGoalResponse>(
-		`${API_BASE}/goals/${encodeURIComponent(id)}/sleep-cycle`,
-		{ method: "POST" },
-	);
-}
-
-export function triggerInsightGeneration(id: string): Promise<SubmitGoalResponse> {
-	return triggerSleepCycle(id);
-}
-
-export function deleteDataset(id: string): Promise<void> {
-	return requestJSON<unknown>(
-		`${API_BASE}/goals/${encodeURIComponent(id)}`,
-		{ method: "DELETE" },
-	).then(() => {});
+  return requestJSON<SubmitGoalResponse>(
+    `${API_BASE}/goals/${encodeURIComponent(id)}/sleep-cycle`,
+    { method: "POST" },
+  );
 }
 
 export function listGoals(): Promise<GoalListItem[]> {
@@ -502,35 +489,25 @@ export function listCausalVerifications(
   );
 }
 
-export function searchInsights(
-  q: string,
-  k?: number,
-  goalId?: string,
-): Promise<InsightMatch[]> {
-  const params = new URLSearchParams({ q });
-  if (k != null) params.set("k", String(k));
-  if (goalId) params.set("goal_id", goalId);
-  return requestJSON<InsightMatch[]>(
-    `${API_BASE}/insights/search?${params.toString()}`,
-  );
-}
-
-export function traceInsight(id: string): Promise<TraceTriplet[]> {
-  return requestJSON<TraceTriplet[]>(
-    `${API_BASE}/insights/${encodeURIComponent(id)}/trace`,
-  );
-}
-
 export function searchHeuristics(
   q: string,
   k?: number,
   goalId?: string,
 ): Promise<HeuristicMatch[]> {
-  return searchInsights(q, k, goalId) as Promise<HeuristicMatch[]>;
+  const params = new URLSearchParams({ q });
+  if (k != null) params.set("k", String(k));
+  // An empty goalId omits the param, which the orchestrator reads as a
+  // cross-goal (whole-corpus) search; a set goalId narrows to one goal.
+  if (goalId) params.set("goal_id", goalId);
+  return requestJSON<HeuristicMatch[]>(
+    `${API_BASE}/heuristics/search?${params.toString()}`,
+  );
 }
 
 export function traceHeuristic(id: string): Promise<TraceTriplet[]> {
-  return traceInsight(id);
+  return requestJSON<TraceTriplet[]>(
+    `${API_BASE}/heuristics/${encodeURIComponent(id)}/trace`,
+  );
 }
 
 export function streamUrl(id: string): string {

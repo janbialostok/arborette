@@ -23,7 +23,7 @@ import { Button, Callout, cn, Panel, SectionLabel } from "@/components/ui";
 // No event has arrived this long after connecting → decide what the silence
 // means (see runState). A triggered run may just be slow to start (introspect +
 // a ProposeInterventionTree call before the first triplet), so it waits longer;
-  // an un-triggered dataset has no run going, so it resolves to neutral quickly —
+// an un-triggered goal has no run going, so it resolves to neutral quickly —
 // long enough only to catch the replay of a run started elsewhere.
 const IDLE_TRIGGERED_MS = 8000;
 const IDLE_UNTRIGGERED_MS = 2500;
@@ -73,7 +73,7 @@ export function LiveRun({ id }: { id: string }) {
   const seqRef = useRef(0);
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Server-authoritative run status from GET /datasets, fetched once on mount. The
+  // Server-authoritative run status from GET /goals, fetched once on mount. The
   // live stream still wins the moment it delivers an event; this only seeds the
   // initial resolution for a run reopened without a local runState record.
   const persistedStatusRef = useRef<string | null>(null);
@@ -324,7 +324,7 @@ export function LiveRun({ id }: { id: string }) {
     } catch (err) {
       setSleep({
         status: "error",
-        message: errorMessage(err, "Could not launch insight generation. Please retry."),
+        message: errorMessage(err, "Could not launch the sleep cycle. Please retry."),
       });
     }
   }
@@ -390,9 +390,9 @@ export function LiveRun({ id }: { id: string }) {
       {sleep.status === "launched" && (
         <Callout tone="info">
           Sleep cycle launched. It runs asynchronously with no completion
-          signal — new insights appear on a later search in the{" "}
+          signal — new meta-heuristics appear on a later search in the{" "}
           <a href="/heuristics" className="text-signal underline-offset-2 hover:underline">
-            insight browser
+            heuristic browser
           </a>
           .
         </Callout>
@@ -523,7 +523,7 @@ function Feed({
       return (
         <EmptyState
           title="Run complete"
-          body="Phase 1 finished. Its triplets streamed live and were persisted to the graph; generate insights to discover patterns, then browse the results."
+          body="Phase 1 finished. Its triplets streamed live and were persisted to the graph; run the sleep cycle to distill them into meta-heuristics, then browse the results."
         />
       );
     }

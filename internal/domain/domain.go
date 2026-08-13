@@ -1,11 +1,6 @@
 // Package domain holds the shared data-model types every arborette service
 // imports. It is intentionally dependency-free so any package or service can
 // use it without pulling in graph, storage, or embedding concerns.
-//
-// Terminology (2026 refactor): "Dataset" is the top-level entity (formerly
-// "Goal"/"OptimizationFunction"), "Question" specifies what to ask of a
-// dataset (formerly "Objective"), and "Insight" is the abstraction produced
-// during the Sleep Cycle (formerly "MetaHeuristic"/"Heuristic").
 package domain
 
 import (
@@ -83,9 +78,6 @@ const (
 // read yields no filters, so the search finds nothing to conjoin and every run
 // reports a successful degenerate result. Naming them here makes that divergence
 // a compile error instead.
-//
-// Terminology note: objective_label is retained as the wire name (it was never
-// a user-visible concept; it is the label pinned from the evaluation matrix).
 const (
 	PropNewFilters           = "new_filters"
 	PropEffectiveFilters     = "effective_filters"
@@ -94,25 +86,25 @@ const (
 	PropDataSourceRef        = "data_source_ref"
 	PropSupport              = "support"
 	PropClaimDerived         = "claim_derived"
-	PropProposedBy           = "proposed_by_insight_id"
+	PropProposedBy           = "proposed_by_meta_heuristic_id"
 )
 
-// State is a snapshot/telemetry point in time. DatasetID scopes it to the
-// dataset it was measured for.
+// State is a snapshot/telemetry point in time. GoalID scopes it to the
+// optimization function it was measured for.
 type State struct {
 	ID         string
-	DatasetID  string
+	GoalID     string
 	Properties map[string]any
 }
 
 // Intervention is reified action metadata (configuration change, execution
-// metadata, confidence bounds). DatasetID scopes it to its dataset;
+// metadata, confidence bounds). GoalID scopes it to its optimization function;
 // SleepDerived marks a macro-segment the Sleep-Cycle search produced, which is a
 // search output rather than an atomic input and is therefore excluded from a
 // later run's search space so conjunctions are never double-counted.
 type Intervention struct {
 	ID           string
-	DatasetID    string
+	GoalID       string
 	Type         InterventionType
 	SleepDerived bool
 	Properties   map[string]any
@@ -128,11 +120,11 @@ type ProvenanceLocator struct {
 	CharEnd   int
 }
 
-// Outcome is a measured delta from an intervention, expressed as a question
-// answer evaluated against the analyst's dataset.
+// Outcome is a measured delta from an intervention, evaluated against the
+// analyst's Evaluation Matrix.
 type Outcome struct {
 	ID                 string
-	DatasetID          string
+	GoalID             string
 	VerificationStatus VerificationStatus
 	Value              map[string]any
 	// Support is the matched-row count of the measurement that produced this
@@ -154,36 +146,29 @@ type OntologyTerm struct {
 	Ontological string `json:"ontological"`
 }
 
-// Insight is an abstraction produced during the Sleep Cycle. Analogous to the
-// former MetaHeuristic: it captures a learned pattern from a dataset. Its
+// MetaHeuristic is a semantic abstraction produced during the Sleep Cycle. Its
 // embedding lives in pgvector keyed by ID; EmbeddingPending is true from node
-// creation until the pgvector write succeeds. Stale marks an insight whose
-// supporting evidence was since rejected by an analyst. DatasetID is the
-// dataset whose abstraction run wrote it, scoping the node's embedding to that
-// dataset; a legacy node created before dataset scoping carries an empty
-// DatasetID until a later run relinks it.
+// creation until the pgvector write succeeds. Stale marks a heuristic whose
+// supporting evidence was since rejected by an analyst. GoalID is the
+// optimization function whose abstraction run wrote it, scoping the node's
+// embedding to that goal; a legacy node created before goal scoping carries an
+// empty GoalID until a later run relinks it.
 //
-// OntologyTerms, OriginDatasetID, and OriginDataSourceRef are the abstraction's
+// OntologyTerms, OriginGoalID, and OriginDataSourceRef are the abstraction's
 // provenance, recorded so a reuse path can tell same-dataset re-instantiation
 // (the origin ref matches, and the term map resolves every bracketed term) from
 // cross-dataset grounding. All three are empty on a node written before they were
 // persisted, which is exactly the signal to route it through grounding.
-type Insight struct {
+type MetaHeuristic struct {
 	ID                  string
 	Definition          string
-	DatasetID           string
+	GoalID              string
 	EmbeddingPending    bool
 	Stale               bool
 	OntologyTerms       []OntologyTerm
-	OriginDatasetID     string
+	OriginGoalID        string
 	OriginDataSourceRef string
 }
-
-// MetaHeuristic is a deprecated alias for Insight, kept for backward
-// compatibility during the transition. New code must use Insight.
-//
-// Deprecated: Use Insight instead.
-type MetaHeuristic = Insight
 
 // ProducedEdge carries the measured effect size and a self-reported confidence
 // weight (0.0–1.0) on an Intervention→Outcome edge, plus the epistemic provenance

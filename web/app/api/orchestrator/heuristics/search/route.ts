@@ -4,5 +4,5 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export function GET(req: Request): Promise<Response> {
-  return forward(req, "/insights/search");
+  return forward(req, "/heuristics/search");
 }

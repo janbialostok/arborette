@@ -44,7 +44,7 @@ type CausalEvidence struct {
 // map, and the confidence is what review is judging.
 type ExtractionOutcome struct {
 	OutcomeID          string
-	DatasetID          string
+	GoalID             string
 	Field              string
 	Method             string
 	Value              map[string]any

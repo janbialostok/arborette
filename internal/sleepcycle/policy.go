@@ -106,7 +106,7 @@ func (w *Worker) selectPolicy(
 		return nil, findingAtoms, skipNoConjunction
 	}
 	if w.cfg.Policy != policyUCT {
-		vocab := w.vocabulary(ctx, target.datasetID, goalText, schema, findingAtoms)
+		vocab := w.vocabulary(ctx, target.goalID, goalText, schema, findingAtoms)
 		if len(vocab.atoms) < 2 {
 			return nil, vocab.atoms, skipNoConjunction
 		}
@@ -116,12 +116,12 @@ func (w *Worker) selectPolicy(
 	if bestSingle == nil {
 		return nil, findingAtoms, skipNoBestSingle
 	}
-	vocab := w.vocabulary(ctx, target.datasetID, goalText, schema, findingAtoms)
+	vocab := w.vocabulary(ctx, target.goalID, goalText, schema, findingAtoms)
 	proposals := w.groundProposals(ctx, target, goalText, schema)
 	if len(vocab.atoms) < 2 && len(proposals) == 0 {
 		return nil, vocab.atoms, skipNoConjunction
 	}
-	evidence := w.causalEvidence(ctx, target.datasetID, findings, proposals)
+	evidence := w.causalEvidence(ctx, target.goalID, findings, proposals)
 	policy := newUCTPolicy(vocab.atoms, proposals, atomPriors(vocab), evidence, w.cfg, baseline, obj.Direction)
 	return policy, vocab.atoms, ""
 }

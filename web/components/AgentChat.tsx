@@ -230,9 +230,9 @@ function TypingDots() {
 function EmptyHint() {
   return (
     <p className="m-auto max-w-sm text-center text-sm leading-relaxed text-faint">
-      Ask what this run has learned. The agent answers only from the insights it
-      can look up and the evidence behind them — it will say so plainly when
-      nothing relevant has accumulated yet.
+      Ask what this run has learned. The agent answers only from the
+      meta-heuristics it can look up and the evidence behind them — it will say
+      so plainly when nothing relevant has accumulated yet.
     </p>
   );
 }

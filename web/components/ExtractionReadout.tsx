@@ -3,7 +3,7 @@ import type { ExtractionTripletPayload } from "@/lib/orchestrator";
 import { cn } from "@/components/ui";
 
 // LOW_CONFIDENCE tints an extraction the service's default review threshold
-// would queue. It is a fixed reading cue, not the queue's own bar: a dataset may
+// would queue. It is a fixed reading cue, not the queue's own bar: a goal may
 // override that bar, and the live stream carries no threshold to read it from,
 // so the Verify tab — which is given the effective value — stays the authority
 // on what was actually queued.

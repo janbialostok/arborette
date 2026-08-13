@@ -210,7 +210,7 @@ func NewWorker(
 
 // searchTarget is the run-invariant addressing the search and write-back share.
 type searchTarget struct {
-	datasetID     string
+	goalID        string
 	dataSourceRef string
 	namespace     uuid.UUID
 }
@@ -306,7 +306,7 @@ func (w *Worker) Run(ctx context.Context, goalID string) (err error) {
 	obj.EntityKeyColumn = goal.EntityKeyColumn
 	obj.TimeColumn = goal.TimeColumn
 	target := searchTarget{
-		datasetID:     goalID,
+		goalID:        goalID,
 		dataSourceRef: goal.DataSourceRef,
 		namespace:     goalNamespace(goalID),
 	}
