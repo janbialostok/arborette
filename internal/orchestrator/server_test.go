@@ -361,11 +361,13 @@ type fakeDatasets struct {
 	objectivesByDataset map[string][]store.Goal
 	refUsage            map[string][2]int
 	deletedRefs         []string
+	touched             []string
 	getErr              error
 	createErr           error
 	updateErr           error
 	deleteErr           error
 	usageErr            error
+	touchErr            error
 }
 
 func (f *fakeDatasets) seed(ds ...store.Dataset) {
@@ -466,6 +468,33 @@ func (f *fakeDatasets) Update(_ context.Context, id, name, description string, s
 		}
 	}
 	return pgx.ErrNoRows
+}
+
+func (f *fakeDatasets) Touch(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.touchErr != nil {
+		return f.touchErr
+	}
+	for i := range f.datasets {
+		if f.datasets[i].ID == id {
+			now := time.Now()
+			f.datasets[i].LastAccessedAt = &now
+			f.touched = append(f.touched, id)
+			return nil
+		}
+	}
+	return pgx.ErrNoRows
+}
+
+// touchedIDs is a mutex-guarded read accessor for the ids Touch stamped.
+func (f *fakeDatasets) touchedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.touched...)
 }
 
 func (f *fakeDatasets) CountObjectives(_ context.Context, id string) (int, error) {

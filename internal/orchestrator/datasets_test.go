@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/store"
@@ -191,11 +192,106 @@ func TestGetDataset(t *testing.T) {
 		out.Objectives[0].DatasetID != "d1" {
 		t.Fatalf("objectives = %+v, want the child g1 bound to d1", out.Objectives)
 	}
+	// Opening the detail is the access event the inventory ranks by: the GET
+	// stamps the dataset best-effort. The response reflects the pre-touch value
+	// (the stamp lands on the store for the next read), so assert the persisted
+	// effect the inventory ordering derives from.
+	if got := ds.touchedIDs(); len(got) != 1 || got[0] != "d1" {
+		t.Fatalf("touched = %+v, want exactly [d1]", got)
+	}
+	if stored := ds.currentDatasets(); len(stored) != 1 || stored[0].LastAccessedAt == nil {
+		t.Fatalf("touch did not persist on the store: %+v", stored)
+	}
+	// A subsequent open reports the prior stamp on the wire.
+	again := doReq(t, srv, http.MethodGet, "/datasets/d1", "")
+	var reread datasetDetailDTO
+	if err := json.Unmarshal(again.Body.Bytes(), &reread); err != nil {
+		t.Fatalf("decode re-read: %v", err)
+	}
+	if reread.LastAccessedAt == nil {
+		t.Fatal("detail DTO omitted the persisted last_accessed_at")
+	}
 
 	t.Run("unknown id is a 404", func(t *testing.T) {
-		rec := doReq(t, srv, http.MethodGet, "/datasets/missing", "")
+		fresh := &fakeDatasets{}
+		fresh.seed(store.Dataset{ID: "other", Name: "ACS", Status: store.DatasetActive, DataSourceRef: "r2"})
+		freshSrv := datasetTestServer(fresh, nil, nil, nil)
+		rec := doReq(t, freshSrv, http.MethodGet, "/datasets/missing", "")
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+		if got := fresh.touchedIDs(); len(got) != 0 {
+			t.Fatalf("a 404 must not touch: %+v", got)
+		}
+	})
+
+	t.Run("an access-mark failure still serves the detail", func(t *testing.T) {
+		failing := &fakeDatasets{touchErr: pgx.ErrNoRows}
+		failing.seed(store.Dataset{ID: "d2", Name: "ACS", Status: store.DatasetActive, DataSourceRef: "r2"})
+		srv := datasetTestServer(failing, nil, nil, nil)
+		rec := doReq(t, srv, http.MethodGet, "/datasets/d2", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 despite the access-mark failure", rec.Code)
+		}
+	})
+}
+
+// TestDatasetObjectiveOrdering (US5): the detail and the non-empty delete 409
+// both rank an actively-running objective ahead of the settled and never-run
+// ones, while preserving newest-created-first within each group. The fixture
+// seeds ListByDataset's created_at DESC; the partition must move g1 (running) to
+// the head and leave g2 before g3.
+func TestDatasetObjectiveOrdering(t *testing.T) {
+	ds := &fakeDatasets{}
+	ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "r1"})
+	ds.objectivesByDataset = map[string][]store.Goal{"d1": {
+		{OptimizationFunctionID: "g2", GoalText: "newest settled", CreatedAt: time.Unix(3, 0)},
+		{OptimizationFunctionID: "g1", GoalText: "running right now", CreatedAt: time.Unix(2, 0)},
+		{OptimizationFunctionID: "g3", GoalText: "oldest", CreatedAt: time.Unix(1, 0)},
+	}}
+	srv := datasetTestServer(ds, nil, nil, nil)
+	srv.runs = &fakeRuns{latest: map[string]store.Run{
+		"g1": {Status: store.RunRunning},
+		"g2": {Status: store.RunCompleted},
+	}}
+
+	t.Run("detail ranks the running objective first", func(t *testing.T) {
+		rec := doReq(t, srv, http.MethodGet, "/datasets/d1", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+		}
+		var out datasetDetailDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		var got []string
+		for _, o := range out.Objectives {
+			got = append(got, o.OptimizationFunctionID)
+		}
+		if want := []string{"g1", "g2", "g3"}; strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("objective order = %v, want running-first %v", got, want)
+		}
+		if out.Objectives[0].Status != "running" {
+			t.Fatalf("head objective status = %q, want running", out.Objectives[0].Status)
+		}
+	})
+
+	t.Run("the delete 409 surfaces the same partition", func(t *testing.T) {
+		rec := doReq(t, srv, http.MethodDelete, "/datasets/d1", "")
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409", rec.Code)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		objs := body["objectives"].([]any)
+		if len(objs) != 3 {
+			t.Fatalf("blocking objectives = %d, want 3", len(objs))
+		}
+		first := objs[0].(map[string]any)
+		if first["optimization_function_id"] != "g1" {
+			t.Fatalf("409 head = %v, want the running g1", first)
 		}
 	})
 }

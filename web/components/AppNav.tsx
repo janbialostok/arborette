@@ -5,7 +5,6 @@ import { usePathname } from "next/navigation";
 import { cn } from "@/components/ui";
 
 const LINKS = [
-  { href: "/", label: "Submit goal" },
   { href: "/goals", label: "Objectives" },
   { href: "/datasets", label: "Datasets" },
   { href: "/heuristics", label: "Heuristics" },
@@ -23,10 +22,7 @@ export function AppNav() {
       </Link>
       <nav className="flex items-center gap-1">
         {LINKS.map((link) => {
-          const active =
-            link.href === "/"
-              ? pathname === "/"
-              : pathname.startsWith(link.href);
+          const active = pathname.startsWith(link.href);
           return (
             <Link
               key={link.href}

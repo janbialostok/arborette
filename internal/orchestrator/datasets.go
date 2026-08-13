@@ -31,6 +31,10 @@ type datasetDTO struct {
 	DataSourceRef  string    `json:"data_source_ref"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
+	// LastAccessedAt is when the detail view was last opened, NULL (nil) until
+	// the first open. The inventory orders by it, so the web UI surfaces it to
+	// explain the ranking.
+	LastAccessedAt *time.Time `json:"last_accessed_at"`
 }
 
 // datasetDetailDTO extends the summary with the dataset's objectives (its
@@ -69,6 +73,7 @@ func toDatasetDTO(d store.Dataset) datasetDTO {
 		DataSourceRef:  d.DataSourceRef,
 		CreatedAt:      d.CreatedAt,
 		UpdatedAt:      d.UpdatedAt,
+		LastAccessedAt: d.LastAccessedAt,
 	}
 }
 
@@ -99,7 +104,20 @@ func (s *Server) objectivesWithStatus(ctx context.Context, datasetID string, goa
 		}
 		out = append(out, o)
 	}
-	return out, nil
+	// Stable partition: objectives with an active run rank first so the analyst
+	// sees what is happening right now, the rest follow newest-created-first as
+	// ListByDataset already returns them. The partition preserves the order
+	// within each group (running, then the rest) — no sort, just two appends.
+	running := make([]objectiveDTO, 0, len(out))
+	rest := make([]objectiveDTO, 0, len(out))
+	for _, o := range out {
+		if o.Status == "running" {
+			running = append(running, o)
+		} else {
+			rest = append(rest, o)
+		}
+	}
+	return append(running, rest...), nil
 }
 
 // writeDatasetBindErr maps a dataset lookup failure during goal binding: an
@@ -390,6 +408,11 @@ func (s *Server) handleGetDataset(w http.ResponseWriter, r *http.Request) {
 		log.Printf("orchestrator: list objectives for dataset %q: %v", id, err)
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	// Opening the detail view is the access event the inventory ranks by; stamp
+	// it best-effort so an access-mark failure never turns a read into an error.
+	if err := s.datasets.Touch(r.Context(), id); err != nil {
+		log.Printf("orchestrator: touch dataset %q: %v", id, err)
 	}
 	out := datasetDetailDTO{datasetDTO: toDatasetDTO(d)}
 	out.Objectives, err = s.objectivesWithStatus(r.Context(), id, objectives)

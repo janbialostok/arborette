@@ -13,6 +13,7 @@ function ds(overrides: Partial<DatasetSummary> = {}): DatasetSummary {
     created_at: "2026-08-04T22:06:38Z",
     updated_at: "2026-08-04T22:06:38Z",
     data_source_ref: "datasources/u/data.csv",
+    last_accessed_at: null,
     ...overrides,
   };
 }

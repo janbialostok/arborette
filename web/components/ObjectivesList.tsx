@@ -74,10 +74,10 @@ function List({
     return (
       <Panel className="px-6 py-16 text-center text-sm text-faint">
         No objectives registered yet.{" "}
-        <Link href="/" className="text-signal underline-offset-2 hover:underline">
-          Submit a goal
+        <Link href="/datasets" className="text-signal underline-offset-2 hover:underline">
+          Open a dataset
         </Link>{" "}
-        to get started.
+        to register one under it.
       </Panel>
     );
   }

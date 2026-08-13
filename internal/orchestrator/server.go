@@ -168,6 +168,7 @@ type datasetStore interface {
 	CountObjectives(ctx context.Context, id string) (int, error)
 	ListObjectives(ctx context.Context, datasetID string) ([]store.Goal, error)
 	Delete(ctx context.Context, id string) error
+	Touch(ctx context.Context, id string) error
 	DataSourceRefUsage(ctx context.Context, ref string) (datasets, goals int, err error)
 	DeleteDataSourceRef(ctx context.Context, ref string) error
 }

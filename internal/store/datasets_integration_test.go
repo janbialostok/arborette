@@ -110,6 +110,69 @@ func TestDatasetInventory(t *testing.T) {
 	}
 }
 
+// TestDatasetAccessRanking (US2 store side): the last-access stamp the
+// inventory orders by. Opening a dataset is a Touch; never-accessed rows sort
+// after every accessed row regardless of age, so the root URL shows the
+// analyst's most recently opened data first.
+func TestDatasetAccessRanking(t *testing.T) {
+	ctx := context.Background()
+	cfg := setup(t, ctx)
+	p := pool(t, ctx, cfg.Postgres.OrchestratorDSN())
+	ds := store.NewDatasetStore(p)
+
+	touchedID := seedDatasetRow(t, ctx, p, ds, "touched")
+	neverID := seedDatasetRow(t, ctx, p, ds, "never")
+
+	// The column is NULL until the first open; Get reports it as nil.
+	before, err := ds.Get(ctx, touchedID)
+	if err != nil {
+		t.Fatalf("get dataset: %v", err)
+	}
+	if before.LastAccessedAt != nil {
+		t.Fatalf("fresh dataset LastAccessedAt = %v, want nil", before.LastAccessedAt)
+	}
+
+	// Touch stamps the open and is idempotent against a never-opened row; an
+	// unknown id is refused as the world-changing write the handler must not
+	// swallow as a success.
+	if err := ds.Touch(ctx, touchedID); err != nil {
+		t.Fatalf("touch dataset: %v", err)
+	}
+	if err := ds.Touch(ctx, testutil.NewID(t)); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("touch unknown dataset: err=%v, want pgx.ErrNoRows", err)
+	}
+	after, err := ds.Get(ctx, touchedID)
+	if err != nil {
+		t.Fatalf("re-get dataset: %v", err)
+	}
+	if after.LastAccessedAt == nil {
+		t.Fatal("Touch did not stamp last_accessed_at")
+	}
+
+	// List ranks the touched row ahead of the never-accessed one even though the
+	// never-accessed one was created later (NULL falls to the created_at group,
+	// always beneath any real access stamp). This is the SURF feature the root
+	// URL relies on; the row dust the shared database leaves behind never
+	// reverses the relative order of these two fresh rows.
+	all, err := ds.List(ctx, "")
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	seen, sawTouched, sawNever := 0, 0, 0
+	for _, d := range all {
+		if d.ID == touchedID {
+			sawTouched = seen
+		}
+		if d.ID == neverID {
+			sawNever = seen
+		}
+		seen++
+	}
+	if sawTouched >= sawNever {
+		t.Fatalf("touched dataset at index %d ranks at/below never-accessed at index %d: %+v", sawTouched, sawNever, all)
+	}
+}
+
 // TestDatasetLifecycle covers create-conflict, metadata update, and the empty
 // delete with refcount-aware retirement (US2/US6 store side).
 func TestDatasetLifecycle(t *testing.T) {

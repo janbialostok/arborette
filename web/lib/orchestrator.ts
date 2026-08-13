@@ -113,6 +113,9 @@ export interface DatasetSummary {
   created_at: string;
   updated_at: string;
   data_source_ref: string;
+  // When the detail view was last opened, null (omitted from JSON) until the
+  // first open. The inventory orders by it most-recently-first.
+  last_accessed_at: string | null;
 }
 
 // One objective as the dataset detail and the non-empty delete 409 report it.

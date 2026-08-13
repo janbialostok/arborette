@@ -28,13 +28,17 @@ var ErrNameConflict = errors.New("dataset name already in use")
 // the datasets table. ObjectiveCount is derived (a LEFT JOIN over
 // goal_registry.dataset_id), never stored.
 type Dataset struct {
-	ID             string
-	Name           string
-	Description    string
-	Status         DatasetStatus
-	DataSourceRef  string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID            string
+	Name          string
+	Description   string
+	Status        DatasetStatus
+	DataSourceRef string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	// LastAccessedAt is when the dataset's detail view was last opened (the
+	// access event that ranks the inventory). Nil means never accessed; the
+	// column is NULL until the first open.
+	LastAccessedAt *time.Time
 	ObjectiveCount int
 }
 
@@ -51,7 +55,7 @@ func NewDatasetStore(pool *Pool) *DatasetStore {
 // datasetColumns is the read projection every dataset query shares, so the
 // column order and scan order cannot drift apart.
 const datasetColumns = `d.id, d.name, d.description, d.status, d.datasource_ref, ` +
-	`d.created_at, d.updated_at, count(g.optimization_function_id)::int AS objective_count`
+	`d.created_at, d.updated_at, d.last_accessed_at, count(g.optimization_function_id)::int AS objective_count`
 
 // Create registers a new dataset and returns its minted id. The name uniqueness
 // rule is case-insensitive (enforced by the lower(name) function index), so a
@@ -86,7 +90,7 @@ func (s *DatasetStore) Get(ctx context.Context, id string) (Dataset, error) {
 			"WHERE d.id = $1 GROUP BY d.id",
 		id,
 	).Scan(&d.ID, &d.Name, &d.Description, &d.Status, &d.DataSourceRef,
-		&d.CreatedAt, &d.UpdatedAt, &d.ObjectiveCount)
+		&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Dataset{}, pgx.ErrNoRows
@@ -108,7 +112,7 @@ func (s *DatasetStore) GetByRef(ctx context.Context, ref string) (Dataset, error
 			"WHERE d.datasource_ref = $1 GROUP BY d.id LIMIT 1",
 		ref,
 	).Scan(&d.ID, &d.Name, &d.Description, &d.Status, &d.DataSourceRef,
-		&d.CreatedAt, &d.UpdatedAt, &d.ObjectiveCount)
+		&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Dataset{}, pgx.ErrNoRows
@@ -118,23 +122,26 @@ func (s *DatasetStore) GetByRef(ctx context.Context, ref string) (Dataset, error
 	return d, nil
 }
 
-// List returns every dataset, newest first, with its derived objective count.
-// A non-empty q filters by case-insensitive name substring.
+// List returns every dataset with its derived objective count, ordered by last
+// access (most recently opened first), with never-accessed datasets falling back
+// to newest-created-first and a final id tie-break so the order is deterministic
+// across reloads. A non-empty q filters by case-insensitive name substring.
 func (s *DatasetStore) List(ctx context.Context, query string) ([]Dataset, error) {
 	var rows pgx.Rows
 	var err error
+	const orderBy = " ORDER BY d.last_accessed_at DESC NULLS LAST, d.created_at DESC, d.id"
 	if strings.TrimSpace(query) == "" {
 		rows, err = s.pool.Query(ctx,
 			"SELECT "+datasetColumns+" FROM datasets d "+
 				"LEFT JOIN goal_registry g ON g.dataset_id = d.id "+
-				"GROUP BY d.id ORDER BY d.created_at DESC",
+				"GROUP BY d.id"+orderBy,
 		)
 	} else {
 		rows, err = s.pool.Query(ctx,
 			"SELECT "+datasetColumns+" FROM datasets d "+
 				"LEFT JOIN goal_registry g ON g.dataset_id = d.id "+
 				"WHERE position(lower($1) in lower(d.name)) > 0 "+
-				"GROUP BY d.id ORDER BY d.created_at DESC",
+				"GROUP BY d.id"+orderBy,
 			query,
 		)
 	}
@@ -147,7 +154,7 @@ func (s *DatasetStore) List(ctx context.Context, query string) ([]Dataset, error
 	for rows.Next() {
 		var d Dataset
 		if err := rows.Scan(&d.ID, &d.Name, &d.Description, &d.Status, &d.DataSourceRef,
-			&d.CreatedAt, &d.UpdatedAt, &d.ObjectiveCount); err != nil {
+			&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount); err != nil {
 			return nil, fmt.Errorf("scan dataset row: %w", err)
 		}
 		datasets = append(datasets, d)
@@ -156,6 +163,22 @@ func (s *DatasetStore) List(ctx context.Context, query string) ([]Dataset, error
 		return nil, fmt.Errorf("iterate dataset rows: %w", err)
 	}
 	return datasets, nil
+}
+
+// Touch records that the dataset's detail view was opened, stamping the
+// last-access time the inventory orders by. It is the access event the web
+// detail GET fires; the caller treats a failure as best effort because an access
+// mark must never turn a read into an error.
+func (s *DatasetStore) Touch(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE datasets SET last_accessed_at = now() WHERE id = $1", id)
+	if err != nil {
+		return fmt.Errorf("touch dataset %q: %w", id, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return pgx.ErrNoRows
+	}
+	return nil
 }
 
 // Update edits a dataset's metadata only (name, description, status) and touches

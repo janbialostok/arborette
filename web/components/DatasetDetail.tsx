@@ -23,6 +23,7 @@ import {
   Spinner,
   type BadgeTone,
 } from "@/components/ui";
+import { GoalForm } from "@/components/GoalForm";
 
 // DatasetDetail renders one dataset's metadata (editable — US4), its objectives
 // (the children that block deletion until they are gone — US1/US6), and the
@@ -95,6 +96,7 @@ export function DatasetDetail({ id }: { id: string }) {
           onError={setSaveError}
         />
         <div className="flex flex-col gap-6">
+          <RegistrationPanel detail={detail} />
           <ObjectivesPanel objectives={detail.objectives} />
           <DangerZone
             detail={detail}
@@ -254,6 +256,28 @@ function MetadataPanel({
   );
 }
 
+// RegistrationPanel hosts the objective form, bound to this dataset (US4).
+// Registration moved here from the root URL: the primary surface to register a
+// new goal is the dataset its data lands in. An archived dataset cannot accept
+// new objectives — the backend 409s a bound goal — so the form is replaced by
+// the reason, which also points at the un-archive control in Metadata.
+function RegistrationPanel({ detail }: { detail: DatasetDetail }) {
+  return (
+    <Panel className="flex flex-col gap-5 p-5">
+      <SectionLabel>Register an objective</SectionLabel>
+      {detail.status === "active" ? (
+        <GoalForm initialDatasetID={detail.id} />
+      ) : (
+        <p className="py-2 text-sm leading-relaxed text-muted">
+          This dataset is archived and read-only, so it cannot accept new
+          objectives. Switch it back to <span className="text-fg">active</span>{" "}
+          in Metadata first.
+        </p>
+      )}
+    </Panel>
+  );
+}
+
 function ObjectivesPanel({ objectives }: { objectives: ObjectiveSummary[] }) {
   return (
     <Panel className="flex flex-col gap-3 p-5">
@@ -262,8 +286,8 @@ function ObjectivesPanel({ objectives }: { objectives: ObjectiveSummary[] }) {
       </SectionLabel>
       {objectives.length === 0 ? (
         <p className="py-6 text-center text-sm text-faint">
-          No objectives registered against this dataset yet. Submit one with it
-          selected as the data source.
+          No objectives registered against this dataset yet. Register one above
+          to optimize against its data.
         </p>
       ) : (
         <ul className="flex flex-col gap-2">

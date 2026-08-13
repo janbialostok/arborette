@@ -12,7 +12,15 @@ import { Button, Callout, cn, SectionLabel } from "@/components/ui";
 
 type Source = "file" | "path";
 
-export function GoalForm() {
+export function GoalForm({
+  initialDatasetID,
+}: {
+  // Bound mode: the form is dropped into a dataset's detail view, pre-bound to
+  // that dataset. The picker and the upload/path ingest disappear — the goal
+  // submits against the already-ingested source with dataset_id and nothing else.
+  // Absent, the form is the standalone landing affordance with a free picker.
+  initialDatasetID?: string;
+}) {
   const router = useRouter();
   const [goal, setGoal] = useState("");
   const [source, setSource] = useState<Source>("file");
@@ -26,7 +34,7 @@ export function GoalForm() {
   // ingest, which mints an implicit dataset). Selecting a dataset binds the goal
   // to its already-ingested source and sends no upload.
   const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
-  const [datasetID, setDatasetID] = useState("");
+  const [datasetID, setDatasetID] = useState(initialDatasetID ?? "");
 
   useEffect(() => {
     let cancelled = false;
@@ -116,21 +124,33 @@ export function GoalForm() {
 
       <div className="flex flex-col gap-3">
         <SectionLabel>Data source</SectionLabel>
-        <select
-          value={datasetID}
-          onChange={(e) => setDatasetID(e.target.value)}
-          aria-label="Data source dataset"
-          className="w-full rounded-lg border border-line bg-surface px-4 py-3 text-sm text-fg outline-hidden transition-colors focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
-        >
-          <option value="">
-            New data source — upload a file or import a path
-          </option>
-          {datasets.map((d) => (
-            <option key={d.id} value={d.id}>
-              {d.name}
+        {initialDatasetID ? (
+          <div className="flex items-center justify-between rounded-lg border border-line bg-surface px-4 py-3.5">
+            <span className="text-sm text-fg">
+              {datasets.find((d) => d.id === initialDatasetID)?.name ??
+                "this dataset"}
+            </span>
+            <span className="font-mono text-[11px] uppercase tracking-wider text-faint">
+              bound
+            </span>
+          </div>
+        ) : (
+          <select
+            value={datasetID}
+            onChange={(e) => setDatasetID(e.target.value)}
+            aria-label="Data source dataset"
+            className="w-full rounded-lg border border-line bg-surface px-4 py-3 text-sm text-fg outline-hidden transition-colors focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+          >
+            <option value="">
+              New data source — upload a file or import a path
             </option>
-          ))}
-        </select>
+            {datasets.map((d) => (
+              <option key={d.id} value={d.id}>
+                {d.name}
+              </option>
+            ))}
+          </select>
+        )}
 
         {bound ? (
           <div className="flex flex-col gap-2 rounded-lg border border-signal/25 bg-surface px-4 py-3">
@@ -138,8 +158,9 @@ export function GoalForm() {
               Binding this goal to the selected dataset&apos;s data source.
             </p>
             <p className="text-xs leading-relaxed text-muted">
-              No upload needed — the objective fits against the dataset&apos;s
-              already-ingested data. Pick a new data source to upload instead.
+              {initialDatasetID
+                ? "No upload needed — the objective fits against this dataset's already-ingested data."
+                : "No upload needed — the objective fits against the dataset's already-ingested data. Pick a new data source to upload instead."}
             </p>
           </div>
         ) : (
