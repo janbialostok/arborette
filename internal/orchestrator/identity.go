@@ -1,6 +1,9 @@
 package orchestrator
 
-import "context"
+import (
+	"context"
+	"net/http"
+)
 
 // Analyst is the acting identity an audit record is stamped with.
 type Analyst struct {
@@ -43,4 +46,22 @@ func (s SessionIdentity) Current(ctx context.Context) (Analyst, error) {
 		return a, nil
 	}
 	return s.Fallback.Current(ctx)
+}
+
+// actingUser resolves the signed-in account driving the request, falling back
+// to the configured identity for non-guard paths (the /internal/audit seam, boot
+// reconciliation, and unit-test servers that never pass the guard). Every
+// analyst-facing handler runs behind the session guard, which stashes a real
+// account in AnalystsFromContext; the fallback is the stub identity those other
+// paths audit under. Ownership stamping and access reads both use its result:
+// an empty id stamps NULL (the ownerless-yet-unattributed state) and reads
+// nothing, the safe uniform answer for a system path with no account at all.
+func (s *Server) actingUser(r *http.Request) string {
+	if a, ok := AnalystsFromContext(r.Context()); ok {
+		return a.ID
+	}
+	if a, err := s.identity.Current(r.Context()); err == nil {
+		return a.ID
+	}
+	return ""
 }

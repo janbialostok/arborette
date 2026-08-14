@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/graph"
 	"github.com/arborette/arborette/internal/service"
 	"github.com/arborette/arborette/internal/store"
@@ -51,6 +52,49 @@ type tripletDTO struct {
 	Outcome      outcomeDTO      `json:"outcome"`
 }
 
+// lookupHeuristicWithAccess fetches a heuristic node and gates it on the acting
+// user's access to its owning goal, answering the uniform 404 "heuristic not
+// found" for a node that never matches: it does not exist, or its owning goal's
+// dataset is not accessible (owner or share) to the user. A legacy NULL-goal
+// node (no owning goal recorded) is readable by the caretaker admin alone,
+// mirroring the search scope's legacy-corpus rule. An empty acting user (a
+// system path with no account) reads nothing.
+func (s *Server) lookupHeuristicWithAccess(w http.ResponseWriter, r *http.Request, id string) (domain.MetaHeuristic, bool) {
+	ctx := r.Context()
+	mh, err := s.repo.GetMetaHeuristic(ctx, id)
+	if err != nil {
+		if errors.Is(err, graph.ErrNotFound) {
+			service.WriteErr(w, http.StatusNotFound, "heuristic not found")
+			return domain.MetaHeuristic{}, false
+		}
+		log.Printf("orchestrator: get heuristic %q: %v", id, err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return domain.MetaHeuristic{}, false
+	}
+
+	userID := s.actingUser(r)
+	if mh.GoalID == "" {
+		// Legacy corpus: the caretaker admin alone. Every visible search result
+		// carries a goal id assigned at write time, so a NULL-goal node here is
+		// either pre-dataset residue or a node with no owning goal recorded.
+		if s.users == nil {
+			service.WriteErr(w, http.StatusNotFound, "heuristic not found")
+			return domain.MetaHeuristic{}, false
+		}
+		caretaker, cerr := s.users.EarliestActiveAdmin(ctx)
+		if cerr != nil || caretaker.ID != userID {
+			service.WriteErr(w, http.StatusNotFound, "heuristic not found")
+			return domain.MetaHeuristic{}, false
+		}
+		return mh, true
+	}
+	if _, err := s.goals.GetAccessible(ctx, mh.GoalID, userID); err != nil {
+		service.WriteErr(w, http.StatusNotFound, "heuristic not found")
+		return domain.MetaHeuristic{}, false
+	}
+	return mh, true
+}
+
 // handleHeuristicSearch backs the web UI's heuristic browser: it runs the shared
 // embedding-similarity query and returns the mapped matches.
 func (s *Server) handleHeuristicSearch(w http.ResponseWriter, r *http.Request) {
@@ -71,8 +115,20 @@ func (s *Server) handleHeuristicSearch(w http.ResponseWriter, r *http.Request) {
 
 	// The browser's heuristic surface is deliberately cross-goal by default: it
 	// browses the whole accumulated corpus, including the NULL-goal legacy rows. An
-	// explicit goal_id narrows it to one goal's heuristics.
+	// explicit goal_id narrows it to one goal's heuristics. The acting user rides
+	// on the scope so the store filters rows by dataset access (owner or share);
+	// the legacy NULL-goal corpus is readable only by the caretaker admin. A
+	// system path with no account at all leaves the corpus unscoped (empty UserID),
+	// matching the pre-ownership browsing behavior for non-human surfaces.
 	scope := store.ScopeFromGoalID(r.URL.Query().Get("goal_id"))
+	if userID := s.actingUser(r); userID != "" {
+		scope.UserID = userID
+		if scope.CrossGoal && s.users != nil {
+			if caretaker, err := s.users.EarliestActiveAdmin(r.Context()); err == nil {
+				scope.CaretakerID = caretaker.ID
+			}
+		}
+	}
 
 	matches, err := s.heur.Query(r.Context(), q, k, scope)
 	if err != nil {
@@ -90,6 +146,9 @@ func (s *Server) handleHeuristicSearch(w http.ResponseWriter, r *http.Request) {
 // handleHeuristicTrace backs the trace view: it walks the causal chain behind a
 // Meta-Heuristic and returns the mapped triplets.
 func (s *Server) handleHeuristicTrace(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.lookupHeuristicWithAccess(w, r, r.PathValue("id")); !ok {
+		return
+	}
 	triplets, err := s.heur.Trace(r.Context(), r.PathValue("id"))
 	if err != nil {
 		log.Printf("orchestrator: heuristic trace: %v", err)
@@ -128,14 +187,8 @@ func toTripletDTO(t graph.CausalTriplet) tripletDTO {
 // goal (empty for the legacy NULL-goal corpus).
 func (s *Server) handleDeleteHeuristic(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	mh, err := s.repo.GetMetaHeuristic(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, graph.ErrNotFound) {
-			service.WriteErr(w, http.StatusNotFound, "heuristic not found")
-			return
-		}
-		log.Printf("orchestrator: get heuristic %q: %v", id, err)
-		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+	mh, ok := s.lookupHeuristicWithAccess(w, r, id)
+	if !ok {
 		return
 	}
 	if err := s.repo.DeleteMetaHeuristic(r.Context(), id); err != nil {

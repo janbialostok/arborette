@@ -59,7 +59,7 @@ type correctionRequest struct {
 // even after automation has spent its budget.
 func (s *Server) handleCausalCorrection(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}

@@ -12,12 +12,15 @@ import {
   listDatasets,
   listGoals,
   listOutcomes,
+  listShares,
   listVerifications,
   login,
   registerAuthRedirect,
   registerUser,
   resolveVerification,
+  revokeShare,
   searchHeuristics,
+  shareDataset,
   verifyFinding,
   type CausalGraph,
   type CausalVerification,
@@ -702,5 +705,56 @@ describe("listCausalVerifications", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/api/orchestrator/goals/g1/causal-verifications",
     );
+  });
+});
+
+// The sharing surface (US4): list reads the grants, shareDataset PUTs by
+// username, revokeShare DELETEs. The URL encoding and the verbatim refusal
+// bodies are the contract — a panel relies on them for its copy.
+describe("share client", () => {
+  it("listShares GETs the grant list", async () => {
+    const grants = [{ user_id: "u1", username: "maya", created_at: "2026-08-14T12:00:00Z" }];
+    const fetchMock = mockFetch(jsonResponse(grants));
+
+    await expect(listShares("d1")).resolves.toEqual(grants);
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/orchestrator/datasets/d1/shares",
+      undefined,
+    ]);
+  });
+
+  it("shareDataset PUTs the username and resolves the grant", async () => {
+    const grant = { user_id: "u1", username: "maya", created_at: "2026-08-14T12:00:00Z" };
+    const fetchMock = mockFetch(jsonResponse(grant));
+
+    await expect(shareDataset("d1", "Maya")).resolves.toEqual(grant);
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/orchestrator/datasets/d1/shares/Maya",
+      { method: "PUT" },
+    ]);
+  });
+
+  it("shareDataset surfaces the orchestrator's refusal verbatim (409 duplicate)", async () => {
+    mockFetch(
+      new Response(JSON.stringify({ error: "dataset already shared with this user" }), {
+        status: 409,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await expect(shareDataset("d1", "maya")).rejects.toMatchObject({
+      name: "OrchestratorError",
+      message: "dataset already shared with this user",
+      status: 409,
+    });
+  });
+
+  it("revokeShare DELETEs and treats 204 as success", async () => {
+    const fetchMock = mockFetch(new Response(null, { status: 204 }));
+
+    await expect(revokeShare("d1", "maya")).resolves.toBeUndefined();
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/orchestrator/datasets/d1/shares/maya",
+      { method: "DELETE" },
+    ]);
   });
 });

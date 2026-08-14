@@ -118,6 +118,12 @@ type goalStore interface {
 	SetClaimError(ctx context.Context, optimizationFunctionID, reason string) error
 	SetDatasetID(ctx context.Context, optimizationFunctionID, datasetID string) error
 	Delete(ctx context.Context, optimizationFunctionID string) error
+	// The access-scoped reads are the ownership gate: the goal inherits its
+	// dataset's access set, so every goal-keyed surface answers 404 uniformly
+	// for "missing" and "exists but not yours".
+	GetAccessible(ctx context.Context, optimizationFunctionID, userID string) (store.Goal, error)
+	ListAccessible(ctx context.Context, userID string) ([]store.Goal, error)
+	ListByDatasetAccessible(ctx context.Context, datasetID, userID string) ([]store.Goal, error)
 }
 
 // runStore is the run-lifecycle surface the loop and the objectives list need.
@@ -159,6 +165,10 @@ type userStore interface {
 	List(ctx context.Context) ([]store.User, error)
 	CountActiveAdmins(ctx context.Context) (int, error)
 	Update(ctx context.Context, id string, updates store.UserUpdate) (store.User, error)
+	// EarliestActiveAdmin resolves the caretaker owner that pre-ownership and
+	// system-created datasets are attributed to, and the only account allowed
+	// to read the legacy NULL-goal heuristic corpus.
+	EarliestActiveAdmin(ctx context.Context) (store.User, error)
 }
 
 // sessionStore is the signed-in-cookie ledger surface: create on sign-in, look
@@ -192,6 +202,16 @@ type datasetStore interface {
 	Touch(ctx context.Context, id string) error
 	DataSourceRefUsage(ctx context.Context, ref string) (datasets, goals int, err error)
 	DeleteDataSourceRef(ctx context.Context, ref string) error
+	// The access-scoped surface is the ownership gate every dataset route goes
+	// through: lists are filtered by the acting user's access, single-object
+	// reads and existence checks answer 404/uniformly, and the share CRUD is
+	// the working-access grant an owner manages.
+	GetAccessible(ctx context.Context, id, userID string) (store.Dataset, error)
+	ListAccessible(ctx context.Context, query, userID string) ([]store.Dataset, error)
+	CanAccess(ctx context.Context, id, userID string) (bool, error)
+	Share(ctx context.Context, datasetID, userID, sharedBy string) error
+	RevokeShare(ctx context.Context, datasetID, userID string) error
+	ListShares(ctx context.Context, datasetID string) ([]store.ShareGrant, error)
 }
 
 // embeddingsStore is the pgvector seam the delete paths use to retire a
@@ -377,6 +397,9 @@ func (s *Server) Routes() http.Handler {
 	analyst.HandleFunc("GET /datasets/{id}", s.handleGetDataset)
 	analyst.HandleFunc("PATCH /datasets/{id}", s.handleUpdateDataset)
 	analyst.HandleFunc("DELETE /datasets/{id}", s.handleDeleteDataset)
+	analyst.HandleFunc("GET /datasets/{id}/shares", s.handleListShares)
+	analyst.HandleFunc("PUT /datasets/{id}/shares/{username}", s.handleShareDataset)
+	analyst.HandleFunc("DELETE /datasets/{id}/shares/{username}", s.handleRevokeShare)
 	analyst.HandleFunc("POST /register", s.handleRegister)
 	analyst.HandleFunc("POST /login", s.handleLogin)
 	analyst.HandleFunc("POST /logout", s.handleLogout)
@@ -405,10 +428,16 @@ func (s *Server) sessionMiddleware() *sessionGuard {
 
 // lookupGoal fetches a goal, writing a 404 for a missing id and a masked 500
 // otherwise. The bool is false when a response has already been written.
-func (s *Server) lookupGoal(ctx context.Context, w http.ResponseWriter, id string) (store.Goal, bool) {
-	goal, err := s.goals.Get(ctx, id)
+func (s *Server) lookupGoal(ctx context.Context, w http.ResponseWriter, id, userID string) (store.Goal, bool) {
+	// The store read runs on a detached context: a cancelled request (a client
+	// hangup) must still resolve the goal so the handler's own cancellation logic
+	// decides the quiet abort, exactly as the streaming replay and chat-disconnect
+	// paths depend on. The real pool fails a call on a cancelled context, so
+	// threading r.Context() through blind would turn a walk-away into a server
+	// error.
+	goal, err := s.goals.GetAccessible(context.WithoutCancel(ctx), id, userID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			service.WriteErr(w, http.StatusNotFound, "goal not found")
 			return store.Goal{}, false
 		}

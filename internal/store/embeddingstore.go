@@ -182,9 +182,25 @@ func (e *EmbeddingStore) DeleteByGoal(ctx context.Context, goalID string) error 
 // legacy corpus. Setting both or neither is a caller error, not a silent default
 // -- the browsing surface picks cross-goal deliberately, and grounding picks a
 // goal deliberately, so neither should fall through to the other.
+//
+// Two optional access fields ride on the mode:
+//
+//   - UserID narrows a cross-goal search to rows whose goal's dataset the
+//     acting user can access (owner or share grant). Legacy NULL-goal rows are
+//     returned only when the user is CaretakerID -- the only account that may
+//     read the pre-dataset corpus. An empty UserID leaves the corpus unscoped
+//     (the system/boot path: MCP reads, sleep-cycle).
+//   - DatasetID selects rows whose goal belongs to a dataset, plus the legacy
+//     NULL-goal corpus. It is the sleep-cycle grounding mode: the worker scopes
+//     its knowledge-reuse read to the run's own dataset plus system-owned rows
+//     so it never retrieves across an ownership boundary. It is exclusive with
+//     the goal/cross-goal mode pair.
 type SearchScope struct {
-	GoalID    string
-	CrossGoal bool
+	GoalID      string
+	CrossGoal   bool
+	UserID      string
+	CaretakerID string
+	DatasetID   string
 }
 
 // ScopeFromGoalID is the boundary translation an external caller uses: a
@@ -203,6 +219,11 @@ func ScopeFromGoalID(goalID string) SearchScope {
 
 func (s SearchScope) validate() error {
 	switch {
+	case s.DatasetID != "":
+		if s.GoalID != "" || s.CrossGoal {
+			return fmt.Errorf("search scope has a dataset plus a goal/cross-goal mode; dataset mode is exclusive")
+		}
+		return nil
 	case s.CrossGoal && s.GoalID != "":
 		return fmt.Errorf("search scope has both a goal and cross-goal set; exactly one mode is allowed")
 	case !s.CrossGoal && s.GoalID == "":
@@ -276,13 +297,57 @@ func (e *EmbeddingStore) SimilaritySearchScored(ctx context.Context, query []flo
 	// predicate while cross-goal mode omits it entirely: binding a Go "" against a
 	// uuid parameter fails at bind time regardless of a runtime OR short-circuit,
 	// so the two modes cannot share one OR-ed clause.
-	if scope.CrossGoal {
+	switch {
+	case scope.DatasetID != "":
+		// Sleep-cycle grounding mode: the run's own dataset plus the legacy
+		// NULL-goal system corpus. The LEFT JOIN is how the NULL-goal rows are
+		// reached at all: they have no goal_registry row, so the dataset filter
+		// falls back to the explicit OR on goal_id IS NULL.
+		rows, err = tx.Query(ctx,
+			"SELECT mh.node_id, mh.embedding <=> $1 AS distance FROM meta_heuristic_embeddings mh "+
+				"LEFT JOIN goal_registry g ON g.optimization_function_id = mh.goal_id "+
+				"WHERE (mh.embedding <=> $1) <= $2 "+
+				"AND (mh.goal_id IS NULL OR g.dataset_id = $3) "+
+				"ORDER BY mh.embedding <=> $1 LIMIT $4",
+			vec, e.distanceFloor, scope.DatasetID, k,
+		)
+	case scope.CrossGoal && scope.UserID != "":
+		// User-scoped browse: a row is reachable when its goal's dataset is
+		// accessible to the user (owner or share), and the legacy NULL-goal
+		// corpus belongs to the admin caretaker alone.
+		rows, err = tx.Query(ctx,
+			"SELECT mh.node_id, mh.embedding <=> $1 AS distance FROM meta_heuristic_embeddings mh "+
+				"WHERE (mh.embedding <=> $1) <= $2 AND ("+
+				"(mh.goal_id IS NOT NULL AND EXISTS ("+
+				"SELECT 1 FROM goal_registry g JOIN datasets d ON d.id = g.dataset_id "+
+				"WHERE g.optimization_function_id = mh.goal_id "+
+				"AND (d.owner_id = $3::uuid OR EXISTS ("+
+				"SELECT 1 FROM dataset_shares sh WHERE sh.dataset_id = d.id AND sh.user_id = $3::uuid)))) "+
+				"OR (mh.goal_id IS NULL AND $3::uuid = $4::uuid)) "+
+				"ORDER BY mh.embedding <=> $1 LIMIT $5",
+			vec, e.distanceFloor, scope.UserID, nullableUUID(scope.CaretakerID), k,
+		)
+	case scope.CrossGoal:
 		rows, err = tx.Query(ctx,
 			"SELECT node_id, embedding <=> $1 AS distance FROM meta_heuristic_embeddings "+
 				"WHERE (embedding <=> $1) <= $2 ORDER BY embedding <=> $1 LIMIT $3",
 			vec, e.distanceFloor, k,
 		)
-	} else {
+	case scope.UserID != "":
+		// Goal-scoped with an access gate: even a caller that already verified
+		// the goal's dataset access at the handler re-checks it here, so a
+		// direct store caller cannot enumerate a stranger's goal rows.
+		rows, err = tx.Query(ctx,
+			"SELECT mh.node_id, mh.embedding <=> $1 AS distance FROM meta_heuristic_embeddings mh "+
+				"WHERE (mh.embedding <=> $1) <= $2 AND mh.goal_id = $3 AND EXISTS ("+
+				"SELECT 1 FROM goal_registry g JOIN datasets d ON d.id = g.dataset_id "+
+				"WHERE g.optimization_function_id = mh.goal_id "+
+				"AND (d.owner_id = $4::uuid OR EXISTS ("+
+				"SELECT 1 FROM dataset_shares sh WHERE sh.dataset_id = d.id AND sh.user_id = $4::uuid))) "+
+				"ORDER BY mh.embedding <=> $1 LIMIT $5",
+			vec, e.distanceFloor, scope.GoalID, scope.UserID, k,
+		)
+	default:
 		rows, err = tx.Query(ctx,
 			"SELECT node_id, embedding <=> $1 AS distance FROM meta_heuristic_embeddings "+
 				"WHERE (embedding <=> $1) <= $2 AND goal_id = $3 ORDER BY embedding <=> $1 LIMIT $4",

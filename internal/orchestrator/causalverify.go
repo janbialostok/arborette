@@ -60,7 +60,7 @@ func claimArgs(goalID, datasourceRef string) map[string]string {
 // goal's SSE channel and the audit trail like every other Verifier transition.
 func (s *Server) handleVerifyFinding(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}
@@ -137,7 +137,7 @@ type causalVerificationDTO struct {
 // while these key on a finding's intervention and answer "does the data support this
 // as a causal effect".
 func (s *Server) handleListCausalVerifications(w http.ResponseWriter, r *http.Request) {
-	goal, ok := s.lookupGoal(r.Context(), w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(r.Context(), w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}

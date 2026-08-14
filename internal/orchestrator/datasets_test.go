@@ -73,7 +73,7 @@ func TestCreateDataset(t *testing.T) {
 
 	t.Run("duplicate name is a 409", func(t *testing.T) {
 		ds := &fakeDatasets{}
-		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: "datasources/x/data.csv"})
+		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: "datasources/x/data.csv", OwnerID: testAnalystID})
 		body, ct := multipartBody(t, map[string]string{"name": "nccd"}, "file", "data.csv", "a\n")
 		req := httptest.NewRequest(http.MethodPost, "/datasets", body)
 		req.Header.Set("Content-Type", ct)
@@ -130,9 +130,9 @@ func TestListDatasets(t *testing.T) {
 	ds := &fakeDatasets{}
 	ds.seed(
 		store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: "datasources/x/nccd.csv",
-			Status: store.DatasetActive, ObjectiveCount: 3},
+			Status: store.DatasetActive, ObjectiveCount: 3, OwnerID: testAnalystID},
 		store.Dataset{ID: "d2", Name: "ACS", DataSourceRef: "datasources/x/acs.csv",
-			Status: store.DatasetArchived},
+			Status: store.DatasetArchived, OwnerID: testAnalystID},
 	)
 	ds.objectivesByDataset = map[string][]store.Goal{"d1": {{OptimizationFunctionID: "g1"}}}
 	srv := datasetTestServer(ds, nil, nil, nil)
@@ -171,7 +171,7 @@ func TestListDatasets(t *testing.T) {
 
 func TestGetDataset(t *testing.T) {
 	ds := &fakeDatasets{}
-	ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "datasources/x/nccd.csv"})
+	ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "datasources/x/nccd.csv", OwnerID: testAnalystID})
 	ds.objectivesByDataset = map[string][]store.Goal{"d1": {
 		{OptimizationFunctionID: "g1", GoalText: "reduce latency"},
 	}}
@@ -214,7 +214,7 @@ func TestGetDataset(t *testing.T) {
 
 	t.Run("unknown id is a 404", func(t *testing.T) {
 		fresh := &fakeDatasets{}
-		fresh.seed(store.Dataset{ID: "other", Name: "ACS", Status: store.DatasetActive, DataSourceRef: "r2"})
+		fresh.seed(store.Dataset{ID: "other", Name: "ACS", Status: store.DatasetActive, DataSourceRef: "r2", OwnerID: testAnalystID})
 		freshSrv := datasetTestServer(fresh, nil, nil, nil)
 		rec := doReq(t, freshSrv, http.MethodGet, "/datasets/missing", "")
 		if rec.Code != http.StatusNotFound {
@@ -227,7 +227,7 @@ func TestGetDataset(t *testing.T) {
 
 	t.Run("an access-mark failure still serves the detail", func(t *testing.T) {
 		failing := &fakeDatasets{touchErr: pgx.ErrNoRows}
-		failing.seed(store.Dataset{ID: "d2", Name: "ACS", Status: store.DatasetActive, DataSourceRef: "r2"})
+		failing.seed(store.Dataset{ID: "d2", Name: "ACS", Status: store.DatasetActive, DataSourceRef: "r2", OwnerID: testAnalystID})
 		srv := datasetTestServer(failing, nil, nil, nil)
 		rec := doReq(t, srv, http.MethodGet, "/datasets/d2", "")
 		if rec.Code != http.StatusOK {
@@ -243,7 +243,7 @@ func TestGetDataset(t *testing.T) {
 // the head and leave g2 before g3.
 func TestDatasetObjectiveOrdering(t *testing.T) {
 	ds := &fakeDatasets{}
-	ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "r1"})
+	ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "r1", OwnerID: testAnalystID})
 	ds.objectivesByDataset = map[string][]store.Goal{"d1": {
 		{OptimizationFunctionID: "g2", GoalText: "newest settled", CreatedAt: time.Unix(3, 0)},
 		{OptimizationFunctionID: "g1", GoalText: "running right now", CreatedAt: time.Unix(2, 0)},
@@ -298,7 +298,7 @@ func TestDatasetObjectiveOrdering(t *testing.T) {
 
 func TestUpdateDataset(t *testing.T) {
 	ds := &fakeDatasets{}
-	ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Description: "kpi", DataSourceRef: "datasources/x/nccd.csv"})
+	ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Description: "kpi", DataSourceRef: "datasources/x/nccd.csv", OwnerID: testAnalystID})
 	srv := datasetTestServer(ds, nil, nil, nil)
 
 	t.Run("edits metadata only", func(t *testing.T) {
@@ -317,8 +317,8 @@ func TestUpdateDataset(t *testing.T) {
 
 	t.Run("rename onto existing name is a 409", func(t *testing.T) {
 		ds2 := &fakeDatasets{}
-		ds2.seed(store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: "r1"},
-			store.Dataset{ID: "d2", Name: "ACS", DataSourceRef: "r2"})
+		ds2.seed(store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: "r1", OwnerID: testAnalystID},
+			store.Dataset{ID: "d2", Name: "ACS", DataSourceRef: "r2", OwnerID: testAnalystID})
 		srv := datasetTestServer(ds2, nil, nil, nil)
 		rec := doReq(t, srv, http.MethodPatch, "/datasets/d1", `{"name":"acs"}`)
 		if rec.Code != http.StatusConflict {
@@ -356,7 +356,7 @@ func TestDeleteDataset(t *testing.T) {
 
 	t.Run("non-empty dataset is 409 with the offending objectives", func(t *testing.T) {
 		ds := &fakeDatasets{}
-		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: ref})
+		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: ref, OwnerID: testAnalystID})
 		ds.objectivesByDataset = map[string][]store.Goal{"d1": {
 			{OptimizationFunctionID: "g1", GoalText: "reduce latency"},
 		}}
@@ -385,7 +385,7 @@ func TestDeleteDataset(t *testing.T) {
 
 	t.Run("empty dataset is 204 and retires an unreferenced ref", func(t *testing.T) {
 		ds := &fakeDatasets{}
-		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: ref})
+		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: ref, OwnerID: testAnalystID})
 		ds.refUsage = map[string][2]int{ref: {0, 0}}
 		objects := &fakeObjects{}
 		audits := &fakeAudits{}
@@ -411,7 +411,7 @@ func TestDeleteDataset(t *testing.T) {
 
 	t.Run("a still-referenced ref is kept", func(t *testing.T) {
 		ds := &fakeDatasets{}
-		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: ref})
+		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", DataSourceRef: ref, OwnerID: testAnalystID})
 		ds.refUsage = map[string][2]int{ref: {1, 0}}
 		objects := &fakeObjects{}
 		srv := testServer{datasets: ds, goals: &fakeGoals{}, objects: objects, repo: nil, embeddings: &fakeEmbeddings{}, audits: &fakeAudits{}}.build()
@@ -440,7 +440,7 @@ func TestDeleteGoal(t *testing.T) {
 	t.Run("success retires graph and embeddings and audits with the vocabulary", func(t *testing.T) {
 		repo := &fakeRepo{}
 		ds := &fakeDatasets{}
-		ds.seed(store.Dataset{ID: "dset-1", Name: "NCCD", DataSourceRef: "sources/x.csv"})
+		ds.seed(store.Dataset{ID: "dset-1", Name: "NCCD", DataSourceRef: "sources/x.csv", OwnerID: testAnalystID})
 		emb := &fakeEmbeddings{}
 		audits := &fakeAudits{}
 		goals := &fakeGoals{get: store.Goal{OptimizationFunctionID: "g1", DataSourceRef: "sources/x.csv"}}
@@ -514,7 +514,13 @@ func TestDeleteHeuristic(t *testing.T) {
 		}
 		emb := &fakeEmbeddings{}
 		audits := &fakeAudits{}
-		srv := testServer{repo: repo, embeddings: emb, audits: audits, goals: &fakeGoals{}, datasets: &fakeDatasets{}}.build()
+		srv := testServer{
+			repo:      repo,
+			embeddings: emb,
+			audits:    audits,
+			goals:     &fakeGoals{get: store.Goal{OptimizationFunctionID: "g1"}},
+			datasets:  &fakeDatasets{},
+		}.build()
 		rec := doReq(t, srv, http.MethodDelete, "/heuristics/mh-1", "")
 		if rec.Code != http.StatusNoContent {
 			t.Fatalf("status = %d, body %q, want 204", rec.Code, rec.Body.String())

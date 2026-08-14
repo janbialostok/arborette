@@ -24,7 +24,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// Subscribing lazily creates run state, and the keepalive below holds an
 	// otherwise-silent stream open indefinitely, so an unknown id would pin a
 	// goroutine and a buffer that nothing reaps.
-	goal, ok := s.lookupGoal(r.Context(), w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(r.Context(), w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}

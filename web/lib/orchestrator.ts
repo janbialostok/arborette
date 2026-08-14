@@ -113,6 +113,12 @@ export interface DatasetSummary {
   created_at: string;
   updated_at: string;
   data_source_ref: string;
+  // The account that created the dataset, or null for legacy/pre-ownership rows.
+  owner_id: string | null;
+  // The acting user's relationship to this dataset: "owner", "shared", or
+  // "none". "none" rows are never listed; the inventory only carries what the
+  // signed-in user can reach.
+  access: "owner" | "shared" | "none";
   // When the detail view was last opened, null (omitted from JSON) until the
   // first open. The inventory orders by it most-recently-first.
   last_accessed_at: string | null;
@@ -538,6 +544,47 @@ export function deleteDataset(id: string): Promise<void> {
   return request(`${API_BASE}/datasets/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+// One collaborator's working access to a dataset, as the sharing panel lists it.
+// `shared_by` is intentionally absent: who granted the access is an audit
+// concern, not something the recipient list needs to carry.
+export interface ShareGrant {
+  user_id: string;
+  username: string;
+  created_at: string;
+}
+
+// listShares reads the dataset's collaborator grants. Owner-only: the
+// orchestrator answers 403 to a collaborator, so the grant list never leaks to
+// the very accounts it names.
+export function listShares(id: string): Promise<ShareGrant[]> {
+  return requestJSON<ShareGrant[]>(
+    `${API_BASE}/datasets/${encodeURIComponent(id)}/shares`,
+  );
+}
+
+// shareDataset grants one account working access by (case-insensitive) username.
+// The refusal reasons surface verbatim: 404 for an unknown username, 400 for a
+// self-share, 409 for a duplicate grant, 403 for a non-owner.
+export function shareDataset(
+  id: string,
+  username: string,
+): Promise<ShareGrant> {
+  return requestJSON<ShareGrant>(
+    `${API_BASE}/datasets/${encodeURIComponent(id)}/shares/${encodeURIComponent(username)}`,
+    { method: "PUT" },
+  );
+}
+
+// revokeShare removes a collaborator's working access. Owner-only and idempotent
+// on the server (an already-absent grant answers 204); the recipient's next
+// data action is refused.
+export function revokeShare(id: string, username: string): Promise<void> {
+  return request(
+    `${API_BASE}/datasets/${encodeURIComponent(id)}/shares/${encodeURIComponent(username)}`,
+    { method: "DELETE" },
+  );
 }
 
 export function deleteGoal(id: string): Promise<void> {

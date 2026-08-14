@@ -66,6 +66,10 @@ type Goal struct {
 	Claim                  []byte
 	ClaimError             string
 	CreatedAt              time.Time
+	// CreatedBy is the account that registered the goal. Empty for a goal
+	// written before ownership existed (a legacy row) that has not yet been
+	// attributed to the admin caretaker.
+	CreatedBy string
 }
 
 // IsDocument reports whether this is a document goal (its objective is a set of
@@ -89,7 +93,7 @@ func NewGoalRegistry(pool *Pool) *GoalRegistry {
 const goalColumns = "optimization_function_id, goal_text, evaluation_matrix, datasource_ref, " +
 	"coalesce(dataset_id::text, ''), target_fields, confidence_threshold, epoch_mode, " +
 	"coalesce(entity_key_column, ''), coalesce(time_column, ''), " +
-	"track, claim, coalesce(claim_error, ''), created_at"
+	"track, claim, coalesce(claim_error, ''), created_at, coalesce(created_by::text, '')"
 
 // Insert persists a registered goal. A document goal writes a NULL
 // evaluation_matrix and populated target_fields; a tabular goal does the reverse.
@@ -125,12 +129,13 @@ func (g *GoalRegistry) Insert(ctx context.Context, goal Goal) error {
 	timeColumn := nullableText(goal.TimeColumn)
 	_, err = g.pool.Exec(ctx,
 		"INSERT INTO goal_registry "+
-			"(optimization_function_id, goal_text, evaluation_matrix, datasource_ref, dataset_id, target_fields, confidence_threshold, epoch_mode, entity_key_column, time_column, track, claim, claim_error) "+
-			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+			"(optimization_function_id, goal_text, evaluation_matrix, datasource_ref, dataset_id, target_fields, confidence_threshold, epoch_mode, entity_key_column, time_column, track, claim, claim_error, created_by) "+
+			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
 		goal.OptimizationFunctionID, goal.GoalText, matrix, goal.DataSourceRef,
 		nullableUUID(goal.DatasetID), targetFields,
 		goal.ConfidenceThreshold, epochMode, entityKey, timeColumn,
 		track, goal.Claim, nullableText(goal.ClaimError),
+		nullableUUID(goal.CreatedBy),
 	)
 	if err != nil {
 		return fmt.Errorf("insert goal: %w", err)
@@ -199,7 +204,7 @@ func (g *GoalRegistry) Get(ctx context.Context, optimizationFunctionID string) (
 	).Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix, &goal.DataSourceRef,
 		&goal.DatasetID, &targetFields,
 		&goal.ConfidenceThreshold, &goal.EpochMode, &goal.EntityKeyColumn, &goal.TimeColumn,
-		&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt)
+		&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt, &goal.CreatedBy)
 	if err != nil {
 		return Goal{}, fmt.Errorf("get goal %q: %w", optimizationFunctionID, err)
 	}
@@ -229,7 +234,7 @@ func (g *GoalRegistry) List(ctx context.Context) ([]Goal, error) {
 			&goal.DataSourceRef, &goal.DatasetID, &targetFields,
 			&goal.ConfidenceThreshold, &goal.EpochMode,
 			&goal.EntityKeyColumn, &goal.TimeColumn,
-			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt); err != nil {
+			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt, &goal.CreatedBy); err != nil {
 			return nil, fmt.Errorf("scan goal row: %w", err)
 		}
 		if err := decodeGoalObjective(&goal, matrix, targetFields); err != nil {
@@ -264,7 +269,7 @@ func (g *GoalRegistry) ListByDataset(ctx context.Context, datasetID string) ([]G
 			&goal.DataSourceRef, &goal.DatasetID, &targetFields,
 			&goal.ConfidenceThreshold, &goal.EpochMode,
 			&goal.EntityKeyColumn, &goal.TimeColumn,
-			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt); err != nil {
+			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt, &goal.CreatedBy); err != nil {
 			return nil, fmt.Errorf("scan goal row: %w", err)
 		}
 		if err := decodeGoalObjective(&goal, matrix, targetFields); err != nil {
@@ -276,6 +281,116 @@ func (g *GoalRegistry) ListByDataset(ctx context.Context, datasetID string) ([]G
 		return nil, fmt.Errorf("iterate goal rows: %w", err)
 	}
 	return goals, nil
+}
+
+// goalAccessPredicate is the shared child-access test: a goal is reachable
+// exactly when its owning dataset is (owner or share grant). The parameter is
+// $1 for the acting user's id. A goal with a NULL dataset_id (pre-0015 legacy,
+// not yet reconciled) matches nobody -- visibility is inherited through the
+// dataset, so an unparented goal is inaccessible until reconciled.
+const goalAccessPredicate = `EXISTS (
+	SELECT 1 FROM datasets d
+	WHERE d.id = g.dataset_id
+	  AND (d.owner_id = $1::uuid OR EXISTS (
+		SELECT 1 FROM dataset_shares sh WHERE sh.dataset_id = d.id AND sh.user_id = $1::uuid)))`
+
+// ListAccessible returns the goals the acting user may work with -- those
+// bound to a dataset they own or hold a share grant for -- newest first. The
+// projection, ordering, and null-guarded decode are identical to List.
+func (g *GoalRegistry) ListAccessible(ctx context.Context, userID string) ([]Goal, error) {
+	rows, err := g.pool.Query(ctx,
+		"SELECT "+goalColumns+" FROM goal_registry g WHERE "+goalAccessPredicate+
+			" ORDER BY g.created_at DESC",
+		userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list accessible goals: %w", err)
+	}
+	defer rows.Close()
+
+	var goals []Goal
+	for rows.Next() {
+		var goal Goal
+		var matrix, targetFields []byte
+		if err := rows.Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix,
+			&goal.DataSourceRef, &goal.DatasetID, &targetFields,
+			&goal.ConfidenceThreshold, &goal.EpochMode,
+			&goal.EntityKeyColumn, &goal.TimeColumn,
+			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt, &goal.CreatedBy); err != nil {
+			return nil, fmt.Errorf("scan accessible goal row: %w", err)
+		}
+		if err := decodeGoalObjective(&goal, matrix, targetFields); err != nil {
+			return nil, err
+		}
+		goals = append(goals, goal)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate accessible goal rows: %w", err)
+	}
+	return goals, nil
+}
+
+// ListByDatasetAccessible returns the goals bound to one dataset that the
+// acting user may work with. Because every goal inherits its dataset's access
+// set, this is the dataset's goal list for any user who can see the dataset at
+// all -- the predicate is still applied so a caller holding only a dataset id
+// (never having checked dataset access) cannot enumerate a stranger's goals.
+func (g *GoalRegistry) ListByDatasetAccessible(ctx context.Context, datasetID, userID string) ([]Goal, error) {
+	rows, err := g.pool.Query(ctx,
+		"SELECT "+goalColumns+" FROM goal_registry g WHERE g.dataset_id = $2 AND "+goalAccessPredicate+
+			" ORDER BY g.created_at DESC",
+		userID, datasetID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list accessible goals by dataset: %w", err)
+	}
+	defer rows.Close()
+
+	var goals []Goal
+	for rows.Next() {
+		var goal Goal
+		var matrix, targetFields []byte
+		if err := rows.Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix,
+			&goal.DataSourceRef, &goal.DatasetID, &targetFields,
+			&goal.ConfidenceThreshold, &goal.EpochMode,
+			&goal.EntityKeyColumn, &goal.TimeColumn,
+			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt, &goal.CreatedBy); err != nil {
+			return nil, fmt.Errorf("scan accessible-by-dataset goal row: %w", err)
+		}
+		if err := decodeGoalObjective(&goal, matrix, targetFields); err != nil {
+			return nil, err
+		}
+		goals = append(goals, goal)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate accessible-by-dataset goal rows: %w", err)
+	}
+	return goals, nil
+}
+
+// GetAccessible fetches a goal only if the acting user may work with its
+// dataset. The caller relies on pgx.ErrNoRows to answer 404 for both "missing"
+// and "exists but not yours" uniformly.
+func (g *GoalRegistry) GetAccessible(ctx context.Context, optimizationFunctionID, userID string) (Goal, error) {
+	var goal Goal
+	var matrix, targetFields []byte
+	err := g.pool.QueryRow(ctx,
+		"SELECT "+goalColumns+" FROM goal_registry g WHERE g.optimization_function_id = $2 AND "+goalAccessPredicate,
+		userID, optimizationFunctionID,
+	).Scan(&goal.OptimizationFunctionID, &goal.GoalText, &matrix, &goal.DataSourceRef,
+		&goal.DatasetID, &targetFields,
+		&goal.ConfidenceThreshold, &goal.EpochMode, &goal.EntityKeyColumn, &goal.TimeColumn,
+		&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt, &goal.CreatedBy)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Goal{}, pgx.ErrNoRows
+		}
+		return Goal{}, fmt.Errorf("get accessible goal %q: %w", optimizationFunctionID, err)
+	}
+	if err := decodeGoalObjective(&goal, matrix, targetFields); err != nil {
+		return Goal{}, err
+	}
+	return goal, nil
 }
 
 // SetDatasetID re-parents a goal onto a dataset. It is the write behind boot-time

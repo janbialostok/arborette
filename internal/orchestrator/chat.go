@@ -75,7 +75,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// The goal resolves first, matching the other POST /goals/{id}/... handlers,
 	// so a wrong id always answers 404 rather than whatever the body happens to
 	// be wrong about.
-	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}

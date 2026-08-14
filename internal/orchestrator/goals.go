@@ -20,7 +20,7 @@ import (
 // (optimization_function_id / data_source_ref / dataset_id).
 func (s *Server) handleDeleteGoal(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	goal, ok := s.lookupGoal(r.Context(), w, id)
+	goal, ok := s.lookupGoal(r.Context(), w, id, s.actingUser(r))
 	if !ok {
 		return
 	}

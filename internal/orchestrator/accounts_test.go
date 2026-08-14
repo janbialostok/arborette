@@ -133,6 +133,31 @@ func (f *fakeUserStore) CountActiveAdmins(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// EarliestActiveAdmin mirrors the store's caretaker oracle over the in-memory
+// roster: the oldest active admin by created_at, then id.
+func (f *fakeUserStore) EarliestActiveAdmin(ctx context.Context) (store.User, error) {
+	if err := ctx.Err(); err != nil {
+		return store.User{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var earliest *store.User
+	for id, u := range f.users {
+		if u.Role != store.RoleAdmin || !u.Active {
+			continue
+		}
+		if earliest == nil || u.CreatedAt.Before(earliest.CreatedAt) ||
+			(u.CreatedAt.Equal(earliest.CreatedAt) && id < earliest.ID) {
+			copy := u
+			earliest = &copy
+		}
+	}
+	if earliest == nil {
+		return store.User{}, pgx.ErrNoRows
+	}
+	return *earliest, nil
+}
+
 func (f *fakeUserStore) Update(ctx context.Context, id string, updates store.UserUpdate) (store.User, error) {
 	if err := ctx.Err(); err != nil {
 		return store.User{}, err

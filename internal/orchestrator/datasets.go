@@ -35,6 +35,14 @@ type datasetDTO struct {
 	// the first open. The inventory orders by it, so the web UI surfaces it to
 	// explain the ranking.
 	LastAccessedAt *time.Time `json:"last_accessed_at"`
+	// OwnerID is the owning account id; it is what the web UI keys "owner" vs
+	// "shared" markers and owner-only controls off of.
+	OwnerID string `json:"owner_id"`
+	// Access is the acting user's relationship to this dataset: "owner" when
+	// they own it, "shared" when it was granted to them. The web UI renders the
+	// neutral "shared with you" marker from it and hides owner-only controls
+	// from non-owners.
+	Access string `json:"access"`
 }
 
 // datasetDetailDTO extends the summary with the dataset's objectives (its
@@ -58,7 +66,19 @@ type objectiveDTO struct {
 	CreatedAt              time.Time `json:"created_at"`
 }
 
-func toDatasetDTO(d store.Dataset) datasetDTO {
+// accessFor classifies the acting user's relationship to a dataset the access
+// predicate has already admitted. Rows admitted through ListAccessible are
+// always owner-or-shared; "owner" when the row's owner is the acting user,
+// "shared" otherwise. The distinction is what the inventory's "shared with
+// you" marker and the owner-only control hiding render off of.
+func accessFor(d store.Dataset, actingUser string) string {
+	if d.OwnerID != "" && d.OwnerID == actingUser {
+		return "owner"
+	}
+	return "shared"
+}
+
+func toDatasetDTO(d store.Dataset, actingUser string) datasetDTO {
 	usage := "empty"
 	if d.ObjectiveCount > 0 {
 		usage = "in_use"
@@ -74,6 +94,8 @@ func toDatasetDTO(d store.Dataset) datasetDTO {
 		CreatedAt:      d.CreatedAt,
 		UpdatedAt:      d.UpdatedAt,
 		LastAccessedAt: d.LastAccessedAt,
+		OwnerID:        d.OwnerID,
+		Access:         accessFor(d, actingUser),
 	}
 }
 
@@ -120,12 +142,14 @@ func (s *Server) objectivesWithStatus(ctx context.Context, datasetID string, goa
 	return append(running, rest...), nil
 }
 
-// writeDatasetBindErr maps a dataset lookup failure during goal binding: an
-// unknown dataset is refused as the conflict the contract names (the goal cannot
-// be parented), anything else is a server fault.
+// writeDatasetBindErr maps a dataset lookup failure during goal binding: a
+// dataset the acting user cannot reach -- unknown or exists-but-not-theirs -- is
+// refused as the uniform 404 "dataset not found", so binding never leaks a
+// dataset's existence any more than viewing it does. Anything else is a server
+// fault.
 func (s *Server) writeDatasetBindErr(w http.ResponseWriter, err error) {
 	if errors.Is(err, pgx.ErrNoRows) {
-		service.WriteErr(w, http.StatusConflict, "dataset not found")
+		service.WriteErr(w, http.StatusNotFound, "dataset not found")
 		return
 	}
 	log.Printf("orchestrator: bind goal to dataset: %v", err)
@@ -134,16 +158,19 @@ func (s *Server) writeDatasetBindErr(w http.ResponseWriter, err error) {
 
 // datasetForRef resolves the implicit dataset that wraps a legacy-ingested ref,
 // reusing an existing row (a 0015 backfill or an earlier implicit registration)
-// instead of minting a duplicate around the same ref.
-func (s *Server) datasetForRef(ctx context.Context, ref string) (string, error) {
-	return resolveDatasetForRef(ctx, s.datasets, ref)
+// instead of minting a duplicate around the same ref. A freshly minted implicit
+// dataset is owned by the acting user -- the submission that created it is its
+// creator (US3.3) -- so an unbound goal's ref never leaks a dataset to others.
+func (s *Server) datasetForRef(ctx context.Context, ref, owner string) (string, error) {
+	return resolveDatasetForRef(ctx, s.datasets, ref, owner)
 }
 
 // resolveDatasetForRef is the shared implicit-dataset resolution: find the
-// dataset bound to the ref, or create it with the deterministic auto-name. A
-// create race on that name falls back to reading the winner's row, so two
-// concurrent legacy registrations of the same ref converge on one parent.
-func resolveDatasetForRef(ctx context.Context, targets datasetStore, ref string) (string, error) {
+// dataset bound to the ref, or create it with the deterministic auto-name,
+// owned by owner (the caretaker on a system/boot path). A create race on that
+// name falls back to reading the winner's row, so two concurrent legacy
+// registrations of the same ref converge on one parent.
+func resolveDatasetForRef(ctx context.Context, targets datasetStore, ref, owner string) (string, error) {
 	existing, err := targets.GetByRef(ctx, ref)
 	if err == nil {
 		return existing.ID, nil
@@ -156,6 +183,7 @@ func resolveDatasetForRef(ctx context.Context, targets datasetStore, ref string)
 		Description:   "",
 		Status:        store.DatasetActive,
 		DataSourceRef: ref,
+		OwnerID:       owner,
 	})
 	if err == nil {
 		return id, nil
@@ -177,19 +205,31 @@ func resolveDatasetForRef(ctx context.Context, targets datasetStore, ref string)
 // before the 0015 migration on a partially migrated stack) is bound to the
 // dataset for its ref -- reused or created implicitly -- and the reassignment is
 // audited as dataset_reconcile so legacy reconciliation is visible for review.
-// Failures are logged, never fatal: one unreachable ref must not stop serving.
-func ReconcileDatasets(ctx context.Context, goals goalStore, targets datasetStore, audits auditStore, identity Identity) {
+// A dataset this sweep mints is owned by the admin caretaker (system-created
+// objects follow the same ownership rules as user-created data, FR-003), never
+// left ownerless. Failures are logged, never fatal: one unreachable ref must not
+// stop serving.
+func ReconcileDatasets(ctx context.Context, goals goalStore, targets datasetStore, users userStore, audits auditStore, identity Identity) {
 	all, err := goals.List(ctx)
 	if err != nil {
 		log.Printf("orchestrator: reconcile datasets: list goals: %v", err)
 		return
+	}
+	// The caretaker is the owner every boot-minted dataset is attributed to. A
+	// stack with no admin yet (a fresh deployment) has nothing to attribute to,
+	// so the mint is deferred to the caretaker self-heal rather than guessed.
+	caretakerOwner := ""
+	if users != nil {
+		if caretaker, cerr := users.EarliestActiveAdmin(ctx); cerr == nil {
+			caretakerOwner = caretaker.ID
+		}
 	}
 	reconciled := 0
 	for _, g := range all {
 		if g.DatasetID != "" {
 			continue
 		}
-		datasetID, derr := resolveDatasetForRef(ctx, targets, g.DataSourceRef)
+		datasetID, derr := resolveDatasetForRef(ctx, targets, g.DataSourceRef, caretakerOwner)
 		if derr != nil {
 			log.Printf("orchestrator: reconcile datasets: bind goal %q: %v", g.OptimizationFunctionID, derr)
 			continue
@@ -242,9 +282,14 @@ func implicitDatasetName(ref string) string {
 }
 
 // handleListDatasets serves the inventory the header Datasets link lands on,
-// optionally narrowed by a case-insensitive name substring (?q).
+// optionally narrowed by a case-insensitive name substring (?q). Only the
+// acting user's own and shared-with datasets are returned: rows with no owner
+// (unattributed pre-ownership data, visible to nobody) are never listed, even
+// to the caretaker -- attribution is an explicit admin act, not an implicit
+// read grant. Each row classifies the acting user's access ("owner"/"shared").
 func (s *Server) handleListDatasets(w http.ResponseWriter, r *http.Request) {
-	datasets, err := s.datasets.List(r.Context(), r.URL.Query().Get("q"))
+	userID := s.actingUser(r)
+	datasets, err := s.datasets.ListAccessible(r.Context(), r.URL.Query().Get("q"), userID)
 	if err != nil {
 		log.Printf("orchestrator: list datasets: %v", err)
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")
@@ -252,7 +297,7 @@ func (s *Server) handleListDatasets(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]datasetDTO, 0, len(datasets))
 	for _, d := range datasets {
-		out = append(out, toDatasetDTO(d))
+		out = append(out, toDatasetDTO(d, userID))
 	}
 	service.WriteJSON(w, http.StatusOK, out)
 }
@@ -289,10 +334,15 @@ func (s *Server) handleCreateDataset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The acting signed-in account becomes the dataset's owner immediately --
+	// the ownership stamping at the heart of this feature. A system/boot path
+	// with no account stamps NULL, the ownerless-yet-unattributed state the
+	// caretaker self-heal attributes later.
 	id, err := s.datasets.Create(ctx, store.Dataset{
 		Name:          name,
 		Description:   description,
 		DataSourceRef: ref,
+		OwnerID:       s.actingUser(r),
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrNameConflict) {
@@ -314,10 +364,11 @@ func (s *Server) handleCreateDataset(w http.ResponseWriter, r *http.Request) {
 		"dataset_id":      id,
 		"dataset_name":    name,
 		"data_source_ref": ref,
+		"owner_id":        s.actingUser(r),
 	}); err != nil {
 		log.Printf("orchestrator: audit dataset create: %v", err)
 	}
-	service.WriteJSON(w, http.StatusCreated, toDatasetDTO(d))
+	service.WriteJSON(w, http.StatusCreated, toDatasetDTO(d, s.actingUser(r)))
 }
 
 type updateDatasetRequest struct {
@@ -392,7 +443,7 @@ func (s *Server) handleUpdateDataset(w http.ResponseWriter, r *http.Request) {
 		service.WriteErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	service.WriteJSON(w, http.StatusOK, toDatasetDTO(updated))
+	service.WriteJSON(w, http.StatusOK, toDatasetDTO(updated, s.actingUser(r)))
 }
 
 // handleGetDataset serves one dataset's detail row with its objectives, the
@@ -414,7 +465,7 @@ func (s *Server) handleGetDataset(w http.ResponseWriter, r *http.Request) {
 	if err := s.datasets.Touch(r.Context(), id); err != nil {
 		log.Printf("orchestrator: touch dataset %q: %v", id, err)
 	}
-	out := datasetDetailDTO{datasetDTO: toDatasetDTO(d)}
+	out := datasetDetailDTO{datasetDTO: toDatasetDTO(d, s.actingUser(r))}
 	out.Objectives, err = s.objectivesWithStatus(r.Context(), id, objectives)
 	if err != nil {
 		log.Printf("orchestrator: synthesize objective status for dataset %q: %v", id, err)
@@ -498,9 +549,12 @@ func (s *Server) retireDataSourceRef(r *http.Request, ref string) {
 }
 
 // lookupDataset fetches a dataset, writing a 404/500 and returning ok=false
-// when nothing can be served.
+// when nothing can be served. It is the uniform single-object gate every
+// dataset-keyed route passes through: a dataset the acting user cannot access
+// (missing, unowned, or unshared) reads exactly as "not found", so a direct
+// link to a stranger's dataset never reveals it exists.
 func (s *Server) lookupDataset(w http.ResponseWriter, r *http.Request, id string) (store.Dataset, bool) {
-	d, err := s.datasets.Get(r.Context(), id)
+	d, err := s.datasets.GetAccessible(r.Context(), id, s.actingUser(r))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			service.WriteErr(w, http.StatusNotFound, "dataset not found")
@@ -511,4 +565,165 @@ func (s *Server) lookupDataset(w http.ResponseWriter, r *http.Request, id string
 		return store.Dataset{}, false
 	}
 	return d, true
+}
+
+// lookupOwnedDataset fetches a dataset only when the acting user is its owner,
+// the gate every dataset-administering route (sharing management, and later
+// metadata edit/delete) goes through. A dataset the acting user can read but not
+// administer is refused with 403; an unknown id stays the uniform 404. A
+// dataset with no owner (an unattributed legacy row) is owned by nobody, so it
+// too answers 403 to everyone until the caretaker self-heal attributes it.
+func (s *Server) lookupOwnedDataset(w http.ResponseWriter, r *http.Request, id string) (store.Dataset, bool) {
+	actingUser := s.actingUser(r)
+	d, err := s.datasets.Get(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			service.WriteErr(w, http.StatusNotFound, "dataset not found")
+			return store.Dataset{}, false
+		}
+		log.Printf("orchestrator: get dataset %q: %v", id, err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return store.Dataset{}, false
+	}
+	if d.OwnerID == "" || d.OwnerID != actingUser {
+		service.WriteErr(w, http.StatusForbidden, "only the dataset owner can administer sharing")
+		return store.Dataset{}, false
+	}
+	return d, true
+}
+
+// shareGrantDTO is the wire shape of one collaborator's working access, as
+// returned by GET /datasets/{id}/shares and PUT /datasets/{id}/shares/{username}.
+// SharedBy is omitted from the wire: it names the account that granted the
+// access, which is an audit concern, not something the collaborator list needs.
+type shareGrantDTO struct {
+	UserID    string    `json:"user_id"`
+	Username  string    `json:"username"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func toShareGrantDTO(g store.ShareGrant) shareGrantDTO {
+	return shareGrantDTO{UserID: g.UserID, Username: g.Username, CreatedAt: g.CreatedAt}
+}
+
+// handleListShares serves the collaborator list for the owner's sharing panel.
+// Sharing management is owner-only (FR-011): a collaborator is refused with 403,
+// so the grant list never leaks to the very accounts it names.
+func (s *Server) handleListShares(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id := r.PathValue("id")
+	if _, ok := s.lookupOwnedDataset(w, r, id); !ok {
+		return
+	}
+	grants, err := s.datasets.ListShares(ctx, id)
+	if err != nil {
+		log.Printf("orchestrator: list shares for dataset %q: %v", id, err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	out := make([]shareGrantDTO, 0, len(grants))
+	for _, g := range grants {
+		out = append(out, toShareGrantDTO(g))
+	}
+	service.WriteJSON(w, http.StatusOK, out)
+}
+
+// handleShareDataset grants one account working access to a dataset owned by the
+// acting user. The recipient is named by username (case-insensitive, matching
+// the sign-in lookup); the owner cannot be shared with (400), a duplicate grant
+// is refused (409), an unknown username is 404, and a non-owner acting user is
+// refused with 403 before any of that is resolved. The grant takes effect
+// immediately: it is one row write, and the next access-scoped query admits the
+// recipient.
+func (s *Server) handleShareDataset(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id := r.PathValue("id")
+	username := strings.TrimSpace(r.PathValue("username"))
+	ds, ok := s.lookupOwnedDataset(w, r, id)
+	if !ok {
+		return
+	}
+	if username == "" {
+		service.WriteErr(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	target, err := s.users.GetByUsername(ctx, username)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			service.WriteErr(w, http.StatusNotFound, "user not found")
+			return
+		}
+		log.Printf("orchestrator: look up share recipient %q: %v", username, err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if target.ID == ds.OwnerID {
+		service.WriteErr(w, http.StatusBadRequest, "you already own this dataset")
+		return
+	}
+	existing, err := s.datasets.ListShares(ctx, id)
+	if err != nil {
+		log.Printf("orchestrator: list shares for dataset %q: %v", id, err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	for _, g := range existing {
+		if g.UserID == target.ID {
+			service.WriteErr(w, http.StatusConflict, "dataset already shared with this user")
+			return
+		}
+	}
+	actor := s.actingUser(r)
+	if err := s.datasets.Share(ctx, id, target.ID, actor); err != nil {
+		log.Printf("orchestrator: share dataset %q with %q: %v", id, target.ID, err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := s.recordAudit(ctx, "dataset_share", "dataset", map[string]any{
+		"dataset_id":  id,
+		"user_id":     target.ID,
+		"shared_with": target.Username,
+	}); err != nil {
+		log.Printf("orchestrator: audit dataset share: %v", err)
+	}
+	service.WriteJSON(w, http.StatusOK, toShareGrantDTO(store.ShareGrant{
+		UserID:    target.ID,
+		Username:  target.Username,
+		CreatedAt: time.Now().UTC(),
+	}))
+}
+
+// handleRevokeShare removes one collaborator's working access. Owner-only like
+// every sharing-management route; revoking an already-absent grant is an
+// idempotent 204 (the store's DELETE is a no-op), and an unknown username is
+// resolved first so the response names the offender's status honestly.
+func (s *Server) handleRevokeShare(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id := r.PathValue("id")
+	username := strings.TrimSpace(r.PathValue("username"))
+	if _, ok := s.lookupOwnedDataset(w, r, id); !ok {
+		return
+	}
+	target, err := s.users.GetByUsername(ctx, username)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			service.WriteErr(w, http.StatusNotFound, "user not found")
+			return
+		}
+		log.Printf("orchestrator: look up revoke recipient %q: %v", username, err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := s.datasets.RevokeShare(ctx, id, target.ID); err != nil {
+		log.Printf("orchestrator: revoke share for dataset %q user %q: %v", id, target.ID, err)
+		service.WriteErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := s.recordAudit(ctx, "dataset_unshare", "dataset", map[string]any{
+		"dataset_id": id,
+		"user_id":    target.ID,
+	}); err != nil {
+		log.Printf("orchestrator: audit dataset unshare: %v", err)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

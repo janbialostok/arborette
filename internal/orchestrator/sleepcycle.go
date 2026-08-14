@@ -12,7 +12,7 @@ import (
 // not a direct code call into the worker), audits the trigger, and returns 202.
 func (s *Server) handleTriggerSleepCycle(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}

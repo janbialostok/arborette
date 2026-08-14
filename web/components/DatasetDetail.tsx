@@ -1,18 +1,23 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   deleteDataset,
   errorMessage,
   getDataset,
+  getMe,
+  listShares,
+  revokeShare,
+  shareDataset,
   updateDataset,
   type DatasetDetail,
   type DatasetSummary,
   type ObjectiveSummary,
+  type ShareGrant,
 } from "@/lib/orchestrator";
-import { isInUse } from "@/lib/datasets";
+import { canAdminister, isInUse } from "@/lib/datasets";
 import { formatTimestamp, shortId } from "@/lib/format";
 import {
   Badge,
@@ -35,6 +40,7 @@ export function DatasetDetail({ id }: { id: string }) {
   const [error, setError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [actingUserID, setActingUserID] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -48,6 +54,17 @@ export function DatasetDetail({ id }: { id: string }) {
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
+      });
+    // The acting user's identity decides which affordances render: only the
+    // owner administers, a collaborator works. getMe is cheap and the detail
+    // view is the one place ownership actually gates something visible.
+    getMe()
+      .then((me) => {
+        if (!cancelled) setActingUserID(me.id);
+      })
+      .catch(() => {
+        // Identity is an affordance input, not the page's content: a failed
+        // read leaves every owner-only control hidden, never broken.
       });
     return () => {
       cancelled = true;
@@ -98,6 +115,10 @@ export function DatasetDetail({ id }: { id: string }) {
         <div className="flex flex-col gap-6">
           <RegistrationPanel detail={detail} />
           <ObjectivesPanel objectives={detail.objectives} />
+          {actingUserID &&
+            canAdminister(detail, actingUserID) && (
+              <SharingPanel id={detail.id} ownerID={detail.owner_id} />
+            )}
           <DangerZone
             detail={detail}
             deleting={deleting}
@@ -326,6 +347,137 @@ function ObjectivesRow({ objective }: { objective: ObjectiveSummary }) {
         </span>
       </div>
     </Link>
+  );
+}
+
+// SharingPanel is the owner-only collaborator management surface (US4): the
+// recipient list, add-by-username, and revoke-with-confirm. It renders only
+// when the acting user administers the dataset, so a collaborator never sees
+// the very grants the backend refuses to serve them. The backend's verbatim
+// refusal bodies -- an unknown username (404), a duplicate grant (409), a
+// self-share (400) -- surface exactly as the {error} the orchestrator returns.
+function SharingPanel({ id, ownerID }: { id: string; ownerID: string | null }) {
+  const [shares, setShares] = useState<ShareGrant[] | null>(null);
+  const [username, setUsername] = useState("");
+  const [sharingError, setSharingError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(() => {
+    setSharingError(null);
+    listShares(id)
+      .then(setShares)
+      .catch((err: unknown) => {
+        setShares([]);
+        setSharingError(errorMessage(err, "Could not load collaborators."));
+      });
+  }, [id]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  async function onAdd() {
+    const target = username.trim();
+    if (!target) return;
+    setBusy(true);
+    setSharingError(null);
+    try {
+      await shareDataset(id, target);
+      setUsername("");
+      refresh();
+    } catch (err: unknown) {
+      setSharingError(errorMessage(err, "Could not share the dataset."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onRevoke(grant: ShareGrant) {
+    if (!window.confirm(`Stop sharing “${id}” with ${grant.username}?`)) return;
+    setBusy(true);
+    setSharingError(null);
+    try {
+      await revokeShare(id, grant.username);
+      refresh();
+    } catch (err: unknown) {
+      setSharingError(errorMessage(err, "Could not revoke access."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Panel className="flex flex-col gap-4 p-5">
+      <SectionLabel>Collaborators</SectionLabel>
+      {ownerID === null ? (
+        <p className="py-2 text-sm leading-relaxed text-muted">
+          This dataset has no attributed owner yet, so sharing is unavailable.
+        </p>
+      ) : (
+        <>
+          <ul className="flex flex-col gap-2">
+            {shares === null ? (
+              <li className="flex items-center gap-2 py-2 text-sm text-faint">
+                <Spinner className="h-3.5 w-3.5" /> Loading collaborators…
+              </li>
+            ) : shares.length === 0 && !sharingError ? (
+              <li className="py-2 text-sm text-faint">
+                No collaborators yet. Share with an account by username below.
+              </li>
+            ) : (
+              shares.map((g) => (
+                <li
+                  key={g.user_id}
+                  className="flex items-center justify-between gap-4 rounded-lg border border-line bg-surface/60 px-4 py-3"
+                >
+                  <div className="flex min-w-0 flex-col">
+                    <span className="truncate text-sm font-medium text-fg">
+                      {g.username}
+                    </span>
+                    <span className="text-xs text-faint">
+                      since {formatTimestamp(g.created_at)}
+                    </span>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    loading={busy}
+                    onClick={() => void onRevoke(g)}
+                    className="border-neg/40 text-neg hover:border-neg/70 hover:text-neg"
+                  >
+                    Revoke
+                  </Button>
+                </li>
+              ))
+            )}
+          </ul>
+          <form
+            className="flex items-end gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void onAdd();
+            }}
+          >
+            <div className="flex min-w-0 flex-1 flex-col gap-2">
+              <label htmlFor="share-username" className="text-sm text-muted">
+                Username
+              </label>
+              <input
+                id="share-username"
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="account to grant access"
+                className="w-full rounded-lg border border-line bg-surface px-4 py-3 font-mono text-sm text-fg outline-hidden transition-colors focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+              />
+            </div>
+            <Button type="submit" loading={busy} disabled={!username.trim()}>
+              Share
+            </Button>
+          </form>
+        </>
+      )}
+      {sharingError && <Callout tone="error">{sharingError}</Callout>}
+    </Panel>
   );
 }
 

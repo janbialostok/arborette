@@ -48,7 +48,7 @@ type causalGraphDTO struct {
 // torn partial (no meta) produces, since GetCausalGraph reports absent until meta
 // commits.
 func (s *Server) handleCausalGraph(w http.ResponseWriter, r *http.Request) {
-	goal, ok := s.lookupGoal(r.Context(), w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(r.Context(), w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}

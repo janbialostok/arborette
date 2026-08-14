@@ -100,7 +100,7 @@ type resolveRequest struct {
 // pending or resolved entries.
 func (s *Server) handleListVerifications(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}
@@ -132,7 +132,7 @@ func (s *Server) handleListVerifications(w http.ResponseWriter, r *http.Request)
 // threshold on its own.
 func (s *Server) handleListOutcomes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}
@@ -166,7 +166,7 @@ func (s *Server) handleListOutcomes(w http.ResponseWriter, r *http.Request) {
 // first thing to add if review feels slow.
 func (s *Server) handleOutcomeExcerpt(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}
@@ -190,7 +190,7 @@ func (s *Server) handleOutcomeExcerpt(w http.ResponseWriter, r *http.Request) {
 // together and how a half-applied resolution converges.
 func (s *Server) handleResolveVerification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(ctx, w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}

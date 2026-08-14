@@ -168,7 +168,11 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	var ref, datasetID string
 	var bound bool
 	if explicitDataset != "" {
-		ds, err := s.datasets.Get(ctx, explicitDataset)
+		// The bound-goal lookup is access-gated exactly as the read surface is: a
+		// dataset the acting user cannot reach (not owner, not shared) is refused
+		// as the uniform 404, so binding never leaks a dataset's existence any more
+		// than viewing it does. An accessible but archived dataset keeps its 409.
+		ds, err := s.datasets.GetAccessible(ctx, explicitDataset, s.actingUser(r))
 		if err != nil {
 			s.writeDatasetBindErr(w, err)
 			return
@@ -203,7 +207,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 			service.WriteErr(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		datasetID, err = s.datasetForRef(ctx, ref)
+		datasetID, err = s.datasetForRef(ctx, ref, s.actingUser(r))
 		if err != nil {
 			log.Printf("orchestrator: bind implicit dataset for %q: %v", ref, err)
 			service.WriteErr(w, http.StatusInternalServerError, "internal error")
@@ -229,7 +233,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 	// of fields to extract accurately. Branch here so the tabular objective-fitting
 	// path below is never entered for a document goal.
 	if introspect.Schema.Kind == string(datasource.KindDocument) {
-		s.submitDocumentGoal(ctx, w, goal, ref, introspect.Sample, review, datasetID)
+		s.submitDocumentGoal(ctx, w, goal, ref, introspect.Sample, review, datasetID, s.actingUser(r))
 		return
 	}
 	schema := toSandboxSchema(introspect.Schema)
@@ -287,6 +291,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		EvaluationMatrix:       matrix,
 		DataSourceRef:          ref,
 		DatasetID:              datasetID,
+		CreatedBy:              s.actingUser(r),
 		ConfidenceThreshold:    review.threshold,
 		EpochMode:              review.epochMode,
 		EntityKeyColumn:        entityKey,
@@ -304,6 +309,7 @@ func (s *Server) handleSubmitGoal(w http.ResponseWriter, r *http.Request) {
 		"optimization_function_id": optID,
 		"data_source_ref":          ref,
 		"dataset_id":               datasetID,
+		"created_by":               s.actingUser(r),
 		"track":                    intent.track,
 		"rationale":                intent.rationale,
 	}); err != nil {
@@ -406,7 +412,7 @@ func (s *Server) reportIntent(ctx context.Context, optID string, intent goalInte
 // the tabular path (optimization_function_id), so the caller cannot tell the two
 // intake flows apart. A Claude fault is a 502, matching the tabular generation
 // failure mapping.
-func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, goal, ref, sample string, review reviewSettings, datasetID string) {
+func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, goal, ref, sample string, review reviewSettings, datasetID, createdBy string) {
 	fields, err := s.claude.IntrospectDocumentFields(ctx, goal, sample)
 	if err != nil {
 		log.Printf("orchestrator: introspect document fields: %v", err)
@@ -425,6 +431,7 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 		TargetFields:           fields,
 		DataSourceRef:          ref,
 		DatasetID:              datasetID,
+		CreatedBy:              createdBy,
 		ConfidenceThreshold:    review.threshold,
 		EpochMode:              review.epochMode,
 	}); err != nil {
@@ -437,6 +444,7 @@ func (s *Server) submitDocumentGoal(ctx context.Context, w http.ResponseWriter, 
 		"optimization_function_id": optID,
 		"data_source_ref":          ref,
 		"dataset_id":               datasetID,
+		"created_by":               createdBy,
 	}); err != nil {
 		log.Printf("orchestrator: append audit: %v", err)
 	}
@@ -473,9 +481,9 @@ func (s *Server) handleListGoals(w http.ResponseWriter, r *http.Request) {
 	var goals []store.Goal
 	var err error
 	if datasetID := strings.TrimSpace(r.URL.Query().Get("dataset_id")); datasetID != "" {
-		goals, err = s.goals.ListByDataset(ctx, datasetID)
+		goals, err = s.goals.ListByDatasetAccessible(ctx, datasetID, s.actingUser(r))
 	} else {
-		goals, err = s.goals.List(ctx)
+		goals, err = s.goals.ListAccessible(ctx, s.actingUser(r))
 	}
 	if err != nil {
 		log.Printf("orchestrator: list goals: %v", err)

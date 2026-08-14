@@ -65,6 +65,7 @@ func main() {
 	queue := store.NewVerificationQueue(pool)
 	audits := store.NewAuditLog(pool)
 	datasets := store.NewDatasetStore(pool)
+	users := store.NewUserSessionStore(pool)
 	embeddings := store.NewEmbeddingStore(pool, cfg.Embedding.DistanceFloor)
 	heur := heuristics.NewService(provider, embeddings, repo)
 	claude, err := llm.NewClient(cfg.LLM)
@@ -84,12 +85,13 @@ func main() {
 		log.Printf("orchestrator: reconciled %d orphaned run(s) to failed", n)
 	}
 
-	// Goals that reached the registry without a dataset parent (rows written
-	// before the 0015 migration on a partially migrated stack) are bound to the
-	// dataset for their ref and audited as dataset_reconcile. Normally dormant:
-	// the migration backfills and locks NOT NULL, so this is a safety net, not
-	// the primary path. Non-fatal like the run reconciliation.
-	orchestrator.ReconcileDatasets(ctx, goals, datasets, audits,
+	// A goal that reached the registry without a dataset parent (rows written
+	// before the 0015 migration on a partially migrated stack) is bound to the
+	// dataset for its ref and audited as dataset_reconcile; a dataset this sweep
+	// mints is attributed to the caretaker admin. Normally dormant: the migration
+	// backfills and locks NOT NULL, so this is a safety net, not the primary
+	// path. Non-fatal like the run reconciliation.
+	orchestrator.ReconcileDatasets(ctx, goals, datasets, users, audits,
 		orchestrator.StubIdentity{ID: cfg.Orchestrator.AnalystID})
 
 	// A configured worker URL selects the HTTP launcher (a worker in serve mode);

@@ -272,9 +272,13 @@ func TestHeuristicHandlersErrorPaths(t *testing.T) {
 	}
 
 	traceErr := &fakeHeur{traceErr: errors.New("graph down")}
-	srv = newTestServer(&fakeGoals{}, &fakeAudits{}, &fakeObjects{}, traceErr, &fakeClaude{}, &fakeSandbox{})
+	repo := &fakeRepo{metaHeuristicsByID: map[string]domain.MetaHeuristic{
+		"mh-1": {ID: "mh-1", GoalID: "g1"},
+	}}
+	goals := &fakeGoals{get: store.Goal{OptimizationFunctionID: "g1"}}
+	srv = newTestServerRepo(repo, goals, &fakeAudits{}, &fakeObjects{}, traceErr, &fakeClaude{}, &fakeSandbox{})
 	if rec := serve(srv, http.MethodGet, "/heuristics/mh-1/trace", "", ""); rec.Code != http.StatusInternalServerError {
-		t.Fatalf("trace error status = %d, want 500", rec.Code)
+		t.Fatalf("trace error status = %d, want 500 (body %q)", rec.Code, rec.Body.String())
 	}
 }
 

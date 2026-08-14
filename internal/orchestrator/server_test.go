@@ -103,6 +103,39 @@ func (f *fakeGoals) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeGoals) GetAccessible(ctx context.Context, optimizationFunctionID, _ string) (store.Goal, error) {
+	if err := ctx.Err(); err != nil {
+		return store.Goal{}, err
+	}
+	if f.getErr != nil {
+		return store.Goal{}, f.getErr
+	}
+	if f.get.OptimizationFunctionID == "" {
+		return store.Goal{}, pgx.ErrNoRows
+	}
+	return f.get, nil
+}
+
+func (f *fakeGoals) ListAccessible(_ context.Context, _ string) ([]store.Goal, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.list, nil
+}
+
+func (f *fakeGoals) ListByDatasetAccessible(_ context.Context, datasetID, _ string) ([]store.Goal, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var filtered []store.Goal
+	for _, g := range f.list {
+		if g.DatasetID == datasetID {
+			filtered = append(filtered, g)
+		}
+	}
+	return filtered, nil
+}
+
 // setStatusCall records one SetStatus invocation, including the caller's context
 // error at call time so a test can assert the terminal write ran on a live
 // (detached) context rather than the loop's cancelled one.
@@ -362,6 +395,7 @@ type fakeDatasets struct {
 	refUsage            map[string][2]int
 	deletedRefs         []string
 	touched             []string
+	shares              map[string][]store.ShareGrant
 	getErr              error
 	createErr           error
 	updateErr           error
@@ -539,6 +573,111 @@ func (f *fakeDatasets) DeleteDataSourceRef(_ context.Context, ref string) error 
 	defer f.mu.Unlock()
 	f.deletedRefs = append(f.deletedRefs, ref)
 	return nil
+}
+
+// accessible matches the store's access predicate against the in-memory rows:
+// owner or an explicit share grant. It is the fake's single source of truth for
+// both the list and the single-object reads, so the access behavior the tests
+// assert on is the behavior the handlers actually route through.
+func (f *fakeDatasets) accessibleLocked(d store.Dataset, userID string) bool {
+	if d.OwnerID != "" && d.OwnerID == userID {
+		return true
+	}
+	for _, g := range f.shares[d.ID] {
+		if g.UserID == userID {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeDatasets) GetAccessible(_ context.Context, id, userID string) (store.Dataset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return store.Dataset{}, f.getErr
+	}
+	for i := range f.datasets {
+		if f.datasets[i].ID == id {
+			if !f.accessibleLocked(f.datasets[i], userID) {
+				return store.Dataset{}, pgx.ErrNoRows
+			}
+			d := f.datasets[i]
+			d.ObjectiveCount = len(f.objectivesByDataset[id])
+			return d, nil
+		}
+	}
+	return store.Dataset{}, pgx.ErrNoRows
+}
+
+func (f *fakeDatasets) ListAccessible(_ context.Context, query, userID string) ([]store.Dataset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]store.Dataset, 0, len(f.datasets))
+	for _, d := range f.datasets {
+		if !f.accessibleLocked(d, userID) {
+			continue
+		}
+		if query != "" && !strings.Contains(strings.ToLower(d.Name), strings.ToLower(query)) {
+			continue
+		}
+		d.ObjectiveCount = len(f.objectivesByDataset[d.ID])
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+func (f *fakeDatasets) CanAccess(_ context.Context, id, userID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, d := range f.datasets {
+		if d.ID == id {
+			return f.accessibleLocked(d, userID), nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeDatasets) Share(_ context.Context, datasetID, userID, sharedBy string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.shares == nil {
+		f.shares = map[string][]store.ShareGrant{}
+	}
+	f.shares[datasetID] = append(f.shares[datasetID], store.ShareGrant{
+		UserID:    userID,
+		CreatedAt: time.Now(),
+		SharedBy:  sharedBy,
+	})
+	return nil
+}
+
+func (f *fakeDatasets) RevokeShare(_ context.Context, datasetID, userID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	grants := f.shares[datasetID]
+	filtered := grants[:0]
+	for _, g := range grants {
+		if g.UserID != userID {
+			filtered = append(filtered, g)
+		}
+	}
+	f.shares[datasetID] = filtered
+	return nil
+}
+
+func (f *fakeDatasets) ListShares(_ context.Context, datasetID string) ([]store.ShareGrant, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]store.ShareGrant(nil), f.shares[datasetID]...), nil
+}
+
+// sharesFor is a mutex-guarded read accessor for the grants a handler left
+// behind, so a test can assert share/unshare side effects.
+func (f *fakeDatasets) sharesFor(datasetID string) []store.ShareGrant {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]store.ShareGrant(nil), f.shares[datasetID]...)
 }
 
 // fakeEmbeddings is the pgvector seam the delete handlers retire rows through.
@@ -1088,6 +1227,11 @@ func (f *fakeChat) Chat(ctx context.Context, system string, msgs []llm.ChatMessa
 // here so a test states confidences relative to a known bar.
 const testHITLThreshold = 0.8
 
+// testAnalystID is the stub acting identity testServer.build() wires, so
+// fixtures seeded with this owner are the acting user's own work -- the
+// relationship the access-gated handlers classify and enforce.
+const testAnalystID = "analyst-test"
+
 // testServer is the one place in the package that spells NewServer's argument
 // list. Every helper below fills in the fields it varies and leaves the rest at
 // their zero value, so a new constructor parameter is a single edit here rather
@@ -1415,7 +1559,11 @@ func TestHeuristicTrace(t *testing.T) {
 		Intervention: domain.Intervention{ID: "i-1", Type: domain.InterventionQuery, Properties: map[string]any{}},
 		Outcome:      domain.Outcome{ID: "o-1", VerificationStatus: domain.VerificationVerified, Value: map[string]any{"revenue": 12.0}},
 	}}}
-	srv := newTestServer(&fakeGoals{}, &fakeAudits{}, &fakeObjects{}, heur, &fakeClaude{}, &fakeSandbox{})
+	repo := &fakeRepo{metaHeuristicsByID: map[string]domain.MetaHeuristic{
+		"mh-1": {ID: "mh-1", GoalID: "g1"},
+	}}
+	goals := &fakeGoals{get: store.Goal{OptimizationFunctionID: "g1"}}
+	srv := newTestServerRepo(repo, goals, &fakeAudits{}, &fakeObjects{}, heur, &fakeClaude{}, &fakeSandbox{})
 
 	req := httptest.NewRequest(http.MethodGet, "/heuristics/mh-1/trace", nil)
 	rec := httptest.NewRecorder()

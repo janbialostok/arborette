@@ -60,7 +60,7 @@ const maxProposalRepairs = 3
 // goal up (404 on miss), launches the loop in a goroutine on a timeout-bounded
 // background context so an SSE disconnect never aborts it, and returns 202.
 func (s *Server) handleTriggerLoop(w http.ResponseWriter, r *http.Request) {
-	goal, ok := s.lookupGoal(r.Context(), w, r.PathValue("id"))
+	goal, ok := s.lookupGoal(r.Context(), w, r.PathValue("id"), s.actingUser(r))
 	if !ok {
 		return
 	}

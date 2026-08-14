@@ -14,7 +14,7 @@ import (
 // seedBoundDataset seeds one active dataset the binding tests submit against.
 func seedBoundDataset() *fakeDatasets {
 	ds := &fakeDatasets{}
-	ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "datasources/x/nccd.csv"})
+	ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "datasources/x/nccd.csv", OwnerID: testAnalystID})
 	return ds
 }
 
@@ -105,7 +105,9 @@ func TestSubmitGoalImplicitDataset(t *testing.T) {
 }
 
 // TestSubmitGoalRefusesBadDataset: an unknown dataset and an archived dataset
-// are both refused with 409 before any goal row is written.
+// are both refused before any goal row is written. The unknown/inaccessible
+// case is the uniform 404 (don't leak existence); the archived-but-accessible
+// case keeps its 409.
 func TestSubmitGoalRefusesBadDataset(t *testing.T) {
 	t.Run("unknown dataset", func(t *testing.T) {
 		srv := testServer{
@@ -115,11 +117,11 @@ func TestSubmitGoalRefusesBadDataset(t *testing.T) {
 			sandbox:  &fakeSandbox{introspect: revenueSchema()},
 		}.build()
 		rec := postBoundGoal(t, srv, "ghost")
-		if rec.Code != http.StatusConflict {
-			t.Fatalf("status = %d, want 409 (body %q)", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404 (body %q)", rec.Code, rec.Body.String())
 		}
 		if !strings.Contains(rec.Body.String(), "dataset not found") {
-			t.Fatalf("409 body must name the missing dataset: %q", rec.Body.String())
+			t.Fatalf("404 body must name the missing dataset: %q", rec.Body.String())
 		}
 		if srv.goals.(*fakeGoals).inserted != nil {
 			t.Fatal("a refused goal must not be persisted")
@@ -128,7 +130,7 @@ func TestSubmitGoalRefusesBadDataset(t *testing.T) {
 
 	t.Run("archived dataset", func(t *testing.T) {
 		ds := &fakeDatasets{}
-		ds.seed(store.Dataset{ID: "d1", Name: "Old", Status: store.DatasetArchived, DataSourceRef: "datasources/x/old.csv"})
+		ds.seed(store.Dataset{ID: "d1", Name: "Old", Status: store.DatasetArchived, DataSourceRef: "datasources/x/old.csv", OwnerID: testAnalystID})
 		srv := testServer{
 			goals:    &fakeGoals{},
 			datasets: ds,
@@ -188,7 +190,7 @@ func TestListGoalsByDataset(t *testing.T) {
 func TestObjectivesCarryRunStatus(t *testing.T) {
 	t.Run("completed", func(t *testing.T) {
 		ds := &fakeDatasets{}
-		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "datasources/x/nccd.csv"})
+		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "datasources/x/nccd.csv", OwnerID: testAnalystID})
 		ds.objectivesByDataset = map[string][]store.Goal{"d1": {{OptimizationFunctionID: "g1", GoalText: "grow", DatasetID: "d1"}}}
 		srv := testServer{datasets: ds, goals: &fakeGoals{}, objects: &fakeObjects{}, heur: &fakeHeur{}, claude: &fakeClaude{}, sandbox: &fakeSandbox{}}.build()
 		srv.runs = &fakeRuns{latest: map[string]store.Run{"g1": {Status: store.RunCompleted}}}
@@ -210,7 +212,7 @@ func TestObjectivesCarryRunStatus(t *testing.T) {
 
 	t.Run("no run is synthetic", func(t *testing.T) {
 		ds := &fakeDatasets{}
-		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "datasources/x/nccd.csv"})
+		ds.seed(store.Dataset{ID: "d1", Name: "NCCD", Status: store.DatasetActive, DataSourceRef: "datasources/x/nccd.csv", OwnerID: testAnalystID})
 		ds.objectivesByDataset = map[string][]store.Goal{"d1": {{OptimizationFunctionID: "g1", GoalText: "grow", DatasetID: "d1"}}}
 		srv := testServer{datasets: ds, goals: &fakeGoals{}, objects: &fakeObjects{}, heur: &fakeHeur{}, claude: &fakeClaude{}, sandbox: &fakeSandbox{}}.build()
 
@@ -237,7 +239,7 @@ func TestReconcileDatasetsBindsOrphans(t *testing.T) {
 	}}
 	ds := &fakeDatasets{}
 	audits := &fakeAudits{}
-	ReconcileDatasets(context.Background(), goals, ds, audits, StubIdentity{ID: "analyst-test"})
+	ReconcileDatasets(context.Background(), goals, ds, nil, audits, StubIdentity{ID: "analyst-test"})
 
 	created := ds.currentDatasets()
 	if len(created) != 1 || created[0].DataSourceRef != "datasources/x/orphan.csv" {

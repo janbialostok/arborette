@@ -199,6 +199,28 @@ func (s *UserSessionStore) CountActiveAdmins(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// EarliestActiveAdmin resolves the admin caretaker: the oldest active admin
+// account, the deterministic owner every un-owned pre-ownership dataset and
+// legacy goal is attributed to. The migration backfill and the runtime
+// self-heal use the same ordering (created_at, then id) so attribution is
+// stable and convergent. An empty id signals that no active admin exists (the
+// seed admin is still the first registrant's concern).
+func (s *UserSessionStore) EarliestActiveAdmin(ctx context.Context) (User, error) {
+	var u User
+	err := s.pool.QueryRow(ctx,
+		"SELECT "+userColumns+" FROM users WHERE role = 'admin' AND active "+
+			"ORDER BY created_at ASC, id ASC LIMIT 1",
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Active,
+		&u.AdminNoticeAcknowledged, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return User{}, pgx.ErrNoRows
+		}
+		return User{}, fmt.Errorf("earliest active admin: %w", err)
+	}
+	return u, nil
+}
+
 // UserUpdate is the narrow field-mutation slice the account and admin handlers
 // use. Pointer fields keep PATCH semantics: nil means "leave unchanged", so a
 // consumer updates exactly the columns it means to. Zero fields yields a no-op

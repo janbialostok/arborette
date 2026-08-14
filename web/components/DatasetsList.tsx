@@ -9,7 +9,7 @@ import {
   listDatasets,
   type DatasetSummary,
 } from "@/lib/orchestrator";
-import { filterDatasets, isInUse } from "@/lib/datasets";
+import { filterDatasets, isInUse, isSharedToMe } from "@/lib/datasets";
 import { formatTimestamp, shortId } from "@/lib/format";
 import {
   Badge,
@@ -145,6 +145,9 @@ function DatasetRow({ dataset }: { dataset: DatasetSummary }) {
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {isSharedToMe(dataset) && (
+            <Badge tone="positive">shared with you</Badge>
+          )}
           {isInUse(dataset) && (
             <Badge tone="neutral">
               {dataset.objective_count} objective

@@ -10,7 +10,8 @@ import (
 // ACTION references in the migrations): embeddings carry no FK and go first so
 // goal-scoped rows retire with their goals; runs/verification_queue/
 // causal_verifications reference goal_registry and must go before it;
-// goal_registry references datasets; the data_source_registry ledger is
+// goal_registry references datasets; dataset_shares references datasets AND
+// users, so it goes before both parents; the data_source_registry ledger is
 // logically paired with datasets; sessions reference users (CASCADE) and are
 // deleted explicitly before it; audit_log carries only JSONB references and is
 // wiped last.
@@ -23,6 +24,7 @@ var ResetTables = []string{
 	"verification_queue",
 	"causal_verifications",
 	"goal_registry",
+	"dataset_shares",
 	"datasets",
 	"data_source_registry",
 	"sessions",

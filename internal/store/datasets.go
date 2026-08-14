@@ -40,7 +40,27 @@ type Dataset struct {
 	// column is NULL until the first open.
 	LastAccessedAt *time.Time
 	ObjectiveCount int
+	// OwnerID is the owning account. Empty for a row created before ownership
+	// existed (or by a background process) that has not yet been attributed to
+	// the admin caretaker; such a dataset is visible to nobody until attributed.
+	OwnerID string
 }
+
+// ShareGrant is one collaborator's working access to a dataset, as surfaced by
+// ListShares. SharedBy is the account that granted it, empty for a grant made by
+// the caretaker attribution backfill.
+type ShareGrant struct {
+	UserID    string
+	Username  string
+	CreatedAt time.Time
+	SharedBy  string
+}
+
+// accessPredicate is the shared working-access test applied by every dataset and
+// goal query that filters by user: the dataset's owner or an explicit share
+// grant. The parameter index is $1 for the acting user's id.
+const accessPredicate = `(d.owner_id = $1::uuid OR EXISTS (
+	SELECT 1 FROM dataset_shares sh WHERE sh.dataset_id = d.id AND sh.user_id = $1::uuid))`
 
 // DatasetStore is the datasets-table access package, backed by a runtime pool.
 type DatasetStore struct {
@@ -55,7 +75,8 @@ func NewDatasetStore(pool *Pool) *DatasetStore {
 // datasetColumns is the read projection every dataset query shares, so the
 // column order and scan order cannot drift apart.
 const datasetColumns = `d.id, d.name, d.description, d.status, d.datasource_ref, ` +
-	`d.created_at, d.updated_at, d.last_accessed_at, count(g.optimization_function_id)::int AS objective_count`
+	`d.created_at, d.updated_at, d.last_accessed_at, count(g.optimization_function_id)::int AS objective_count, ` +
+	`coalesce(d.owner_id::text, '')`
 
 // Create registers a new dataset and returns its minted id. The name uniqueness
 // rule is case-insensitive (enforced by the lower(name) function index), so a
@@ -69,8 +90,8 @@ func (s *DatasetStore) Create(ctx context.Context, dataset Dataset) (string, err
 	}
 	var id string
 	err := s.pool.QueryRow(ctx,
-		"INSERT INTO datasets (name, description, status, datasource_ref) VALUES ($1, $2, $3, $4) RETURNING id",
-		dataset.Name, dataset.Description, dataset.Status, dataset.DataSourceRef,
+		"INSERT INTO datasets (name, description, status, datasource_ref, owner_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+		dataset.Name, dataset.Description, dataset.Status, dataset.DataSourceRef, nullableUUID(dataset.OwnerID),
 	).Scan(&id)
 	if err != nil {
 		if isNameConflict(err) {
@@ -90,7 +111,7 @@ func (s *DatasetStore) Get(ctx context.Context, id string) (Dataset, error) {
 			"WHERE d.id = $1 GROUP BY d.id",
 		id,
 	).Scan(&d.ID, &d.Name, &d.Description, &d.Status, &d.DataSourceRef,
-		&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount)
+		&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount, &d.OwnerID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Dataset{}, pgx.ErrNoRows
@@ -112,7 +133,7 @@ func (s *DatasetStore) GetByRef(ctx context.Context, ref string) (Dataset, error
 			"WHERE d.datasource_ref = $1 GROUP BY d.id LIMIT 1",
 		ref,
 	).Scan(&d.ID, &d.Name, &d.Description, &d.Status, &d.DataSourceRef,
-		&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount)
+		&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount, &d.OwnerID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Dataset{}, pgx.ErrNoRows
@@ -154,7 +175,7 @@ func (s *DatasetStore) List(ctx context.Context, query string) ([]Dataset, error
 	for rows.Next() {
 		var d Dataset
 		if err := rows.Scan(&d.ID, &d.Name, &d.Description, &d.Status, &d.DataSourceRef,
-			&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount); err != nil {
+			&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount, &d.OwnerID); err != nil {
 			return nil, fmt.Errorf("scan dataset row: %w", err)
 		}
 		datasets = append(datasets, d)
@@ -163,6 +184,87 @@ func (s *DatasetStore) List(ctx context.Context, query string) ([]Dataset, error
 		return nil, fmt.Errorf("iterate dataset rows: %w", err)
 	}
 	return datasets, nil
+}
+
+// ListAccessible returns the datasets the acting user may work with — those
+// they own or hold a share grant for — under the same ordering and name filter
+// as List. Datasets with no owner (unattributed pre-ownership rows) surface for
+// nobody here, even the caretaker: attribution is an explicit admin act, not an
+// implicit read grant.
+func (s *DatasetStore) ListAccessible(ctx context.Context, query, userID string) ([]Dataset, error) {
+	var rows pgx.Rows
+	var err error
+	const orderBy = " ORDER BY d.last_accessed_at DESC NULLS LAST, d.created_at DESC, d.id"
+	if strings.TrimSpace(query) == "" {
+		rows, err = s.pool.Query(ctx,
+			"SELECT "+datasetColumns+" FROM datasets d "+
+				"LEFT JOIN goal_registry g ON g.dataset_id = d.id "+
+				"WHERE "+accessPredicate+" GROUP BY d.id"+orderBy,
+			userID,
+		)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			"SELECT "+datasetColumns+" FROM datasets d "+
+				"LEFT JOIN goal_registry g ON g.dataset_id = d.id "+
+				"WHERE "+accessPredicate+" AND position(lower($2) in lower(d.name)) > 0 "+
+				"GROUP BY d.id"+orderBy,
+			userID, query,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list accessible datasets: %w", err)
+	}
+	defer rows.Close()
+
+	var datasets []Dataset
+	for rows.Next() {
+		var d Dataset
+		if err := rows.Scan(&d.ID, &d.Name, &d.Description, &d.Status, &d.DataSourceRef,
+			&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount, &d.OwnerID); err != nil {
+			return nil, fmt.Errorf("scan accessible dataset row: %w", err)
+		}
+		datasets = append(datasets, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate accessible dataset rows: %w", err)
+	}
+	return datasets, nil
+}
+
+// GetAccessible fetches a dataset only if the acting user holds working access
+// to it. The caller relies on pgx.ErrNoRows to answer 404 for both "missing"
+// and "exists but not yours" uniformly.
+func (s *DatasetStore) GetAccessible(ctx context.Context, id, userID string) (Dataset, error) {
+	var d Dataset
+	err := s.pool.QueryRow(ctx,
+		"SELECT "+datasetColumns+" FROM datasets d "+
+			"LEFT JOIN goal_registry g ON g.dataset_id = d.id "+
+			"WHERE d.id = $2 AND "+accessPredicate+" GROUP BY d.id",
+		userID, id,
+	).Scan(&d.ID, &d.Name, &d.Description, &d.Status, &d.DataSourceRef,
+		&d.CreatedAt, &d.UpdatedAt, &d.LastAccessedAt, &d.ObjectiveCount, &d.OwnerID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Dataset{}, pgx.ErrNoRows
+		}
+		return Dataset{}, fmt.Errorf("get accessible dataset %q: %w", id, err)
+	}
+	return d, nil
+}
+
+// CanAccess reports whether the acting user holds working access to a dataset.
+// The no-row case (unknown id) reads as no access, which is the right answer for
+// both "missing" and "not yours" callers.
+func (s *DatasetStore) CanAccess(ctx context.Context, id, userID string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx,
+		"SELECT EXISTS (SELECT 1 FROM datasets d WHERE d.id = $2 AND "+accessPredicate+")",
+		userID, id,
+	).Scan(&ok)
+	if err != nil {
+		return false, fmt.Errorf("check dataset access %q: %w", id, err)
+	}
+	return ok, nil
 }
 
 // Touch records that the dataset's detail view was opened, stamping the
@@ -237,7 +339,7 @@ func (s *DatasetStore) ListObjectives(ctx context.Context, datasetID string) ([]
 			&goal.DataSourceRef, &goal.DatasetID, &targetFields,
 			&goal.ConfidenceThreshold, &goal.EpochMode,
 			&goal.EntityKeyColumn, &goal.TimeColumn,
-			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt); err != nil {
+			&goal.Track, &goal.Claim, &goal.ClaimError, &goal.CreatedAt, &goal.CreatedBy); err != nil {
 			return nil, fmt.Errorf("scan objective row for dataset %q: %w", datasetID, err)
 		}
 		if err := decodeGoalObjective(&goal, matrix, targetFields); err != nil {
@@ -262,6 +364,63 @@ func (s *DatasetStore) Delete(ctx context.Context, id string) error {
 		return pgx.ErrNoRows
 	}
 	return nil
+}
+
+// Share grants a user working access to a dataset (or is a no-op when the grant
+// already exists). The caller has already verified the acting user may grant:
+// only the owner grants access, the caretaker attribution path is backfill.
+func (s *DatasetStore) Share(ctx context.Context, datasetID, userID, sharedBy string) error {
+	_, err := s.pool.Exec(ctx,
+		"INSERT INTO dataset_shares (dataset_id, user_id, created_by) VALUES ($1, $2, $3) "+
+			"ON CONFLICT (dataset_id, user_id) DO NOTHING",
+		datasetID, userID, nullableUUID(sharedBy),
+	)
+	if err != nil {
+		return fmt.Errorf("share dataset %q with user %q: %w", datasetID, userID, err)
+	}
+	return nil
+}
+
+// RevokeShare removes a user's working access to a dataset. Revoking a grant
+// that does not exist is a no-op, so the caller treats a completed revoke as
+// success either way.
+func (s *DatasetStore) RevokeShare(ctx context.Context, datasetID, userID string) error {
+	_, err := s.pool.Exec(ctx,
+		"DELETE FROM dataset_shares WHERE dataset_id = $1 AND user_id = $2",
+		datasetID, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("revoke dataset %q share for user %q: %w", datasetID, userID, err)
+	}
+	return nil
+}
+
+// ListShares returns the collaborators currently granted access to a dataset,
+// oldest grant first for a stable UI order.
+func (s *DatasetStore) ListShares(ctx context.Context, datasetID string) ([]ShareGrant, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT sh.user_id, u.username, sh.created_at, coalesce(sh.created_by::text, '') "+
+			"FROM dataset_shares sh JOIN users u ON u.id = sh.user_id "+
+			"WHERE sh.dataset_id = $1 ORDER BY sh.created_at ASC, sh.user_id ASC",
+		datasetID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list shares for dataset %q: %w", datasetID, err)
+	}
+	defer rows.Close()
+
+	var grants []ShareGrant
+	for rows.Next() {
+		var g ShareGrant
+		if err := rows.Scan(&g.UserID, &g.Username, &g.CreatedAt, &g.SharedBy); err != nil {
+			return nil, fmt.Errorf("scan share grant row: %w", err)
+		}
+		grants = append(grants, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate share grant rows: %w", err)
+	}
+	return grants, nil
 }
 
 // DataSourceRefUsage returner how many datasets and goals still reference a ref.
