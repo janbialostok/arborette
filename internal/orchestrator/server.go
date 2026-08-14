@@ -148,6 +148,27 @@ type auditStore interface {
 	Append(ctx context.Context, record store.AuditRecord) error
 }
 
+// userStore is the accounts surface the handlers and the session guard need. It
+// is a narrow slice of store.UserSessionStore: registration, sign-in lookup,
+// the /me and admin reads, the seed/last-admin oracle, and the field-mutation
+// write. A fake can stand in for any of these without touching Postgres.
+type userStore interface {
+	Create(ctx context.Context, username, passwordHash string, seedAdmin bool) (store.User, error)
+	GetByUsername(ctx context.Context, username string) (store.User, error)
+	GetByID(ctx context.Context, id string) (store.User, error)
+	List(ctx context.Context) ([]store.User, error)
+	CountActiveAdmins(ctx context.Context) (int, error)
+	Update(ctx context.Context, id string, updates store.UserUpdate) (store.User, error)
+}
+
+// sessionStore is the signed-in-cookie ledger surface: create on sign-in, look
+// up on every guarded request, delete on sign-out.
+type sessionStore interface {
+	CreateSession(ctx context.Context, tokenHash, userID string) (store.Session, error)
+	GetSessionByTokenHash(ctx context.Context, tokenHash string) (store.Session, error)
+	DeleteSessionByTokenHash(ctx context.Context, tokenHash string) error
+}
+
 type objectStore interface {
 	NewKey(parts ...string) string
 	Put(ctx context.Context, key string, r io.Reader, contentType string) error
@@ -199,6 +220,21 @@ type RouterConfig struct {
 	StaleReverifyCap      int
 }
 
+// SessionConfig bundles the accounts/sessions collaborators and the cookie
+// knobs in one value, mirroring RouterConfig's bundling of a related policy:
+// three positional args where two could easily be swapped is a slot-swap
+// waiting to happen. A nil Users/Sessions fails the session guard open (unit
+// tests that do not exercise accounts leave them unset); production always
+// wires store.NewUserSessionStore. CookieName defaults to "arborette_session"
+// when empty; CookieSecure marks the cookie Secure-only (set via
+// ARBORETTE_SESSION_SECURE, off by default for local plain-HTTP compose).
+type SessionConfig struct {
+	Users        userStore
+	Sessions     sessionStore
+	CookieName   string
+	CookieSecure bool
+}
+
 // Server is the HTTP surface of the orchestrator, holding its collaborators.
 // histograms holds the confidence distribution of each in-flight run, keyed by
 // goal like the hub; see registerHistogram for why that state is in-memory and
@@ -215,6 +251,8 @@ type Server struct {
 	datasets            datasetStore
 	embeddings          embeddingsStore
 	heur                heuristicsService
+	users               userStore
+	sessions            sessionStore
 	claude              claudeClient
 	chat                chatStreamer
 	sandbox             sandboxExecutor
@@ -223,6 +261,8 @@ type Server struct {
 	verifierJobs        JobLauncher
 	identity            Identity
 	router              RouterConfig
+	cookieName          string
+	cookieSecure        bool
 	localImportDir      string
 	sleepCycleJobName   string
 	internalAuthToken   string
@@ -259,10 +299,15 @@ func NewServer(
 	verifierJobs JobLauncher,
 	identity Identity,
 	router RouterConfig,
+	sessionCfg SessionConfig,
 	localImportDir, sleepCycleJobName, internalAuthToken string,
 	hitlThreshold float64,
 	blockingLoopTimeout time.Duration,
 ) *Server {
+	cookieName := sessionCfg.CookieName
+	if cookieName == "" {
+		cookieName = sessionCookieDefaultName
+	}
 	return &Server{
 		repo:                repo,
 		goals:               goals,
@@ -276,6 +321,8 @@ func NewServer(
 		datasets:            datasets,
 		embeddings:          embeddings,
 		heur:                heur,
+		users:               sessionCfg.Users,
+		sessions:            sessionCfg.Sessions,
 		claude:              claude,
 		chat:                chat,
 		sandbox:             sandbox,
@@ -283,6 +330,8 @@ func NewServer(
 		jobs:                jobs,
 		verifierJobs:        verifierJobs,
 		identity:            identity,
+		cookieName:          cookieName,
+		cookieSecure:        sessionCfg.CookieSecure,
 		localImportDir:      localImportDir,
 		sleepCycleJobName:   sleepCycleJobName,
 		internalAuthToken:   internalAuthToken,
@@ -296,38 +345,62 @@ func NewServer(
 	}
 }
 
-// Routes returns the mux with method-prefixed patterns. The internal audit write
-// is the one guarded route: it is service-to-service, so it can carry a shared
-// secret no analyst has to hold. The analyst-facing routes stay open -- analyst
-// authentication is a separate concern from this internal boundary.
+// Routes returns the mux. Analyst-facing routes run behind the session guard
+// (the only exempt paths are the sign-in pair /register and /login); the
+// internal audit write and verification-event hook stay service-to-service:
+// they carry a shared secret no analyst has to hold and never pass through the
+// guard. The outer catch-all alternates fine with the method-prefixed internal
+// patterns -- ServeMux picks the most specific match, so /internal/* reaches
+// BearerAuth and analyst routes reach the guard.
 func (s *Server) Routes() http.Handler {
+	analyst := http.NewServeMux()
+	analyst.HandleFunc("POST /goals", s.handleSubmitGoal)
+	analyst.HandleFunc("GET /goals", s.handleListGoals)
+	analyst.HandleFunc("POST /goals/{id}/hypothesis-loop", s.handleTriggerLoop)
+	analyst.HandleFunc("GET /goals/{id}/stream", s.handleStream)
+	analyst.HandleFunc("POST /goals/{id}/chat", s.handleChat)
+	analyst.HandleFunc("POST /goals/{id}/sleep-cycle", s.handleTriggerSleepCycle)
+	analyst.HandleFunc("GET /goals/{id}/verifications", s.handleListVerifications)
+	analyst.HandleFunc("POST /goals/{id}/verifications/{outcomeID}", s.handleResolveVerification)
+	analyst.HandleFunc("GET /goals/{id}/outcomes", s.handleListOutcomes)
+	analyst.HandleFunc("GET /goals/{id}/outcomes/{outcomeID}/excerpt", s.handleOutcomeExcerpt)
+	analyst.HandleFunc("GET /goals/{id}/causal-graph", s.handleCausalGraph)
+	analyst.HandleFunc("POST /goals/{id}/causal-graph/corrections", s.handleCausalCorrection)
+	analyst.HandleFunc("POST /goals/{id}/findings/{interventionID}/verify", s.handleVerifyFinding)
+	analyst.HandleFunc("GET /goals/{id}/causal-verifications", s.handleListCausalVerifications)
+	analyst.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
+	analyst.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)
+	analyst.HandleFunc("DELETE /heuristics/{id}", s.handleDeleteHeuristic)
+	analyst.HandleFunc("DELETE /goals/{id}", s.handleDeleteGoal)
+	analyst.HandleFunc("GET /datasets", s.handleListDatasets)
+	analyst.HandleFunc("POST /datasets", s.handleCreateDataset)
+	analyst.HandleFunc("GET /datasets/{id}", s.handleGetDataset)
+	analyst.HandleFunc("PATCH /datasets/{id}", s.handleUpdateDataset)
+	analyst.HandleFunc("DELETE /datasets/{id}", s.handleDeleteDataset)
+	analyst.HandleFunc("POST /register", s.handleRegister)
+	analyst.HandleFunc("POST /login", s.handleLogin)
+	analyst.HandleFunc("POST /logout", s.handleLogout)
+	analyst.HandleFunc("GET /me", s.handleMe)
+	analyst.HandleFunc("PATCH /me", s.handlePatchMe)
+	analyst.HandleFunc("GET /users", s.handleListUsers)
+	analyst.HandleFunc("POST /users", s.handleCreateUser)
+	analyst.HandleFunc("PATCH /users/{id}", s.handleUpdateUser)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /goals", s.handleSubmitGoal)
-	mux.HandleFunc("GET /goals", s.handleListGoals)
-	mux.HandleFunc("POST /goals/{id}/hypothesis-loop", s.handleTriggerLoop)
-	mux.HandleFunc("GET /goals/{id}/stream", s.handleStream)
-	mux.HandleFunc("POST /goals/{id}/chat", s.handleChat)
-	mux.HandleFunc("POST /goals/{id}/sleep-cycle", s.handleTriggerSleepCycle)
-	mux.HandleFunc("GET /goals/{id}/verifications", s.handleListVerifications)
-	mux.HandleFunc("POST /goals/{id}/verifications/{outcomeID}", s.handleResolveVerification)
-	mux.HandleFunc("GET /goals/{id}/outcomes", s.handleListOutcomes)
-	mux.HandleFunc("GET /goals/{id}/outcomes/{outcomeID}/excerpt", s.handleOutcomeExcerpt)
-	mux.HandleFunc("GET /goals/{id}/causal-graph", s.handleCausalGraph)
-	mux.HandleFunc("POST /goals/{id}/causal-graph/corrections", s.handleCausalCorrection)
-	mux.HandleFunc("POST /goals/{id}/findings/{interventionID}/verify", s.handleVerifyFinding)
-	mux.HandleFunc("GET /goals/{id}/causal-verifications", s.handleListCausalVerifications)
-	mux.HandleFunc("GET /heuristics/search", s.handleHeuristicSearch)
-	mux.HandleFunc("GET /heuristics/{id}/trace", s.handleHeuristicTrace)
-	mux.HandleFunc("DELETE /heuristics/{id}", s.handleDeleteHeuristic)
-	mux.HandleFunc("DELETE /goals/{id}", s.handleDeleteGoal)
-	mux.HandleFunc("GET /datasets", s.handleListDatasets)
-	mux.HandleFunc("POST /datasets", s.handleCreateDataset)
-	mux.HandleFunc("GET /datasets/{id}", s.handleGetDataset)
-	mux.HandleFunc("PATCH /datasets/{id}", s.handleUpdateDataset)
-	mux.HandleFunc("DELETE /datasets/{id}", s.handleDeleteDataset)
+	mux.Handle("/", s.sessionMiddleware().wrap(sessionExemptPaths, analyst))
 	mux.Handle("POST /internal/audit", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleAudit)))
 	mux.Handle("POST /internal/verification-events", service.BearerAuth(s.internalAuthToken, http.HandlerFunc(s.handleVerificationEvent)))
 	return mux
+}
+
+// sessionMiddleware wires the guard from the server's collaborators. It is the
+// seam the account test-server overrides to exercise real session behavior.
+func (s *Server) sessionMiddleware() *sessionGuard {
+	return &sessionGuard{
+		sessions: s.sessions,
+		users:    s.users,
+		cookie:   s.cookieName,
+	}
 }
 
 // lookupGoal fetches a goal, writing a 404 for a missing id and a masked 500

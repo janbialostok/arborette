@@ -170,6 +170,13 @@ type OrchestratorConfig struct {
 	AutoPromoteTopN         int
 	AutoPromoteShrinkageK   int
 	StaleReverifyCap        int
+	// SessionCookieName is the name of the browser cookie the orchestrator
+	// issues after sign-in and that the BFF proxy tunnels to the frontend.
+	// SessionSecure marks that cookie Secure-only; it is false by default so
+	// local (http) development keeps working, and operators must set it true in
+	// any deployment served over TLS.
+	SessionCookieName string
+	SessionSecure     bool
 }
 
 // MCPConfig drives the MCP Server, arborette's read-side interface for
@@ -439,6 +446,8 @@ func Load() (Config, error) {
 			AutoPromoteTopN:         intEnv("ORCHESTRATOR_AUTOPROMOTE_TOP_N", 5),
 			AutoPromoteShrinkageK:   intEnv("ORCHESTRATOR_AUTOPROMOTE_SHRINKAGE_K", 30),
 			StaleReverifyCap:        intEnv("ORCHESTRATOR_STALE_REVERIFY_CAP", 10),
+			SessionCookieName:       env("ARBORETTE_SESSION_COOKIE", "arborette_session"),
+			SessionSecure:           boolEnv("ARBORETTE_SESSION_SECURE", false),
 		},
 		MCP: MCPConfig{
 			Port:               env("MCP_PORT", "8082"),

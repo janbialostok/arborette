@@ -613,3 +613,120 @@ export function streamUrl(id: string): string {
 export function chatUrl(id: string): string {
   return `${API_BASE}/goals/${encodeURIComponent(id)}/chat`;
 }
+
+// --- Accounts & session surface ---------------------------------------------
+
+// AccountDto is the account shape the roster rows carry. It is the wire form of
+// the orchestrator's user row: role is the single extensible value, and active
+// reflects deactivation (a deactivated account rejects its sessions server-side
+// at their next request).
+export interface AccountDto {
+  id: string;
+  username: string;
+  role: "admin" | "member";
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+// MeDto is the identity bootstrap every signed-in page and the corner chip use:
+// the username's first letter for the chip, the role for the admin Users entry,
+// and admin_notice, the one-shot first-sign-in admin-grant notice that shows
+// until the admin dismisses it via PATCH /me.
+export interface MeDto extends AccountDto {
+  admin_notice: boolean;
+}
+
+// registerUser creates an account and signs it in: the response carries the
+// Set-Cookie the proxy relays as an HttpOnly session cookie. The username/password
+// validation rules live server-side, so the caller just forwards what the user
+// typed and surfaces the {error} verbatim on failure.
+export function registerUser(username: string, password: string): Promise<MeDto> {
+  return requestJSON<MeDto>(`${API_BASE}/register`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+// login verifies credentials and signs the user in the same way. A failure is
+// the single generic 401 the orchestrator returns (unknown user, wrong
+// password, or deactivated account are indistinguishable on purpose).
+export function login(username: string, password: string): Promise<MeDto> {
+  return requestJSON<MeDto>(`${API_BASE}/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+// logout ends the session server-side (row delete) and clears the cookie. The
+// orchestrator answers 204, which request() treats as success.
+export function logout(): Promise<void> {
+  return request(`${API_BASE}/logout`, { method: "POST" });
+}
+
+// getMe is the identity bootstrap every signed-in page and the corner chip
+// read. A 401 here (cookie gone, session dead, account deactivated) surfaces as
+// an OrchestratorError the shell maps to a redirect to /login.
+export function getMe(): Promise<MeDto> {
+  return requestJSON<MeDto>(`${API_BASE}/me`);
+}
+
+// updateMe applies one or more self-service account changes and returns the
+// refreshed identity. Username changes are unique-checked server-side (409);
+// password changes require current_password (wrong -> 403). The chip re-reads
+// /me after navigating, so the refreshed identity here is a courtesy, not the
+// source of truth.
+export function updateMe(
+  patch: Partial<{
+    username: string;
+    password: string;
+    current_password: string;
+    acknowledge_admin_notice: boolean;
+  }>,
+): Promise<MeDto> {
+  return requestJSON<MeDto>(`${API_BASE}/me`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+
+// --- Admin account surface --------------------------------------------------
+
+// UserAdminDto is the roster row shape the admin Users view renders. It is the
+// wire form of the orchestrator's admin listing: role is the single extensible
+// value, active reflects whether the account's next signed-in request works.
+export type UserAdminDto = AccountDto;
+
+// listUsers returns the full account roster to an admin. A member gets the 403
+// the orchestrator returns; the view surfaces it verbatim.
+export function listUsers(): Promise<UserAdminDto[]> {
+  return requestJSON<UserAdminDto[]>(`${API_BASE}/users`);
+}
+
+// createUser creates a member account (always active, role=member) that can
+// sign in immediately. Server-side validation reasons and the 409 clash surface
+// verbatim through OrchestratorError.
+export function createUser(username: string, password: string): Promise<UserAdminDto> {
+  return requestJSON<UserAdminDto>(`${API_BASE}/users`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+// updateUser applies an admin mutation to an account: promote/demote (role),
+// deactivate/reactivate (active), or reset the password (new_password). The
+// last-active-admin guard's 409 and the role gate's 403 surface verbatim.
+export function updateUser(
+  id: string,
+  patch: Partial<{ role: "admin" | "member"; active: boolean; new_password: string }>,
+): Promise<UserAdminDto> {
+  return requestJSON<UserAdminDto>(`${API_BASE}/users/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}

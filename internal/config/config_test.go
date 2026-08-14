@@ -247,9 +247,51 @@ func TestSandboxCacheAndLimitDefaults(t *testing.T) {
 	}
 }
 
-// TestSleepCyclePolicyKnobs pins the env wiring for the knowledge-guided policy: a
-// typo in a name falls back to the default invisibly.
-//
+// TestSessionCookieKnobs pins the session cookie knobs' env wiring. Both names
+// matter: the cookie name is the value the frontend's fetch wrapper must read
+// when stripping the credential, and the Secure flag is a production safety
+// lever that ships off by default — so a typo'd env name would silently ship an
+// insecure cookie under TLS. Cleared rather than assumed absent, because the
+// integration target sources .env where operators may have set real values.
+func TestSessionCookieKnobs(t *testing.T) {
+	setPostgresEnv(t)
+
+	t.Setenv("ARBORETTE_SESSION_COOKIE", "")
+	t.Setenv("ARBORETTE_SESSION_SECURE", "")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Orchestrator.SessionCookieName != "arborette_session" {
+		t.Fatalf("unset = %q, want the arborette_session default", cfg.Orchestrator.SessionCookieName)
+	}
+	if cfg.Orchestrator.SessionSecure {
+		t.Fatalf("unset = true, want the false (insecure-dev) default")
+	}
+
+	t.Setenv("ARBORETTE_SESSION_COOKIE", "session")
+	t.Setenv("ARBORETTE_SESSION_SECURE", "true")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Orchestrator.SessionCookieName != "session" {
+		t.Fatalf("override = %q, want session", cfg.Orchestrator.SessionCookieName)
+	}
+	if !cfg.Orchestrator.SessionSecure {
+		t.Fatalf("override = false, want true")
+	}
+
+	t.Setenv("ARBORETTE_SESSION_SECURE", "garbage")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Orchestrator.SessionSecure {
+		t.Fatalf("unparseable = true, want the false default")
+	}
+}
+
 // Two matter beyond the pattern. The default policy is what the calibration
 // regression justifies, so a silent revert to the beam must fail here. And the
 // cross-goal knob is a kill switch — a typo'd name means an operator's attempt to

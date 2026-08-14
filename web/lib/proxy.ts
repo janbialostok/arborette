@@ -54,25 +54,59 @@ const SSE_HEADERS: HeadersInit = {
   "x-accel-buffering": "no",
 };
 
-// passThrough relays the upstream response verbatim, carrying its status and
-// content-type so an orchestrator {error} body reaches the browser parseable.
+// passThrough relays the upstream response verbatim, carrying its status,
+// content-type, and Set-Cookie so a session issued upstream (login/register
+// signing the browser in) reaches the browser, and the orchestrator's {error}
+// body reaches it parseable.
 function passThrough(upstream: Response): Response {
   const headers = new Headers();
-  const contentType = upstream.headers.get("content-type");
-  if (contentType) headers.set("content-type", contentType);
+  copyResponseHeaders(headers, upstream, ["content-type", "set-cookie"]);
   return new Response(upstream.body, { status: upstream.status, headers });
+}
+
+// copyResponseHeaders copies the named headers from upstream into dst, using
+// getAll-preserving semantics so a multi-value Set-Cookie survives (an
+// underscore-prefixed cookie clearing alongside a fresh session value must not
+// be collapsed).
+function copyResponseHeaders(
+  dst: Headers,
+  upstream: Response,
+  names: string[],
+): void {
+  for (const name of names) {
+    if (name === "set-cookie") {
+      for (const value of upstream.headers.getSetCookie()) {
+        dst.append("set-cookie", value);
+      }
+    } else {
+      const value = upstream.headers.get(name);
+      if (value) dst.set(name, value);
+    }
+  }
 }
 
 // eventStream dresses a streaming reply as SSE. Both stream endpoints resolve
 // the goal before setting any SSE header, so a fault answers JSON and only a 2xx
 // may be relabelled -- relabelling an {error} body would hand the browser
-// something it can parse as neither.
+// something it can parse as neither. A Set-Cookie from the upstream is still
+// relayed (headers.setCookie is preserved on top of the SSE framing).
 function eventStream(upstream: Response): Response {
   if (!upstream.ok) return passThrough(upstream);
+  const headers = new Headers(SSE_HEADERS);
+  for (const value of upstream.headers.getSetCookie()) {
+    headers.append("set-cookie", value);
+  }
   return new Response(upstream.body, {
     status: upstream.status,
-    headers: SSE_HEADERS,
+    headers,
   });
+}
+
+// sessionCookie returns the browser's session cookie, if any. It is the one
+// credential the BFF forwards: the orchestrator owns the session, the browser
+// only ever holds it against the web origin.
+function sessionCookie(req: Request): string | null {
+  return req.headers.get("cookie");
 }
 
 // forward proxies a JSON or multipart request, preserving status and body. The
@@ -87,6 +121,8 @@ export async function forward(
   const headers = new Headers();
   const contentType = req.headers.get("content-type");
   if (contentType) headers.set("content-type", contentType);
+  const cookie = sessionCookie(req);
+  if (cookie) headers.set("cookie", cookie);
 
   const init: NodeRequestInit = { method: req.method, headers };
   const reads = req.method === "GET" || req.method === "HEAD";
@@ -117,11 +153,14 @@ export function forwardSubmit(req: Request, path: string): Promise<Response> {
 }
 
 export async function forwardStream(req: Request, path: string): Promise<Response> {
+  const headers = new Headers({ accept: "text/event-stream" });
+  const cookie = sessionCookie(req);
+  if (cookie) headers.set("cookie", cookie);
   let upstream: Response;
   try {
     upstream = await fetch(upstreamURL(req, path), {
       method: "GET",
-      headers: { accept: "text/event-stream" },
+      headers,
       signal: req.signal,
       dispatcher: streamDispatcher(),
     } as NodeRequestInit);
@@ -143,6 +182,8 @@ export async function forwardStreamSubmit(
   const headers = new Headers({ accept: "text/event-stream" });
   const contentType = req.headers.get("content-type");
   if (contentType) headers.set("content-type", contentType);
+  const cookie = sessionCookie(req);
+  if (cookie) headers.set("cookie", cookie);
 
   const init: NodeRequestInit = {
     method: "POST",

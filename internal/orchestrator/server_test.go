@@ -1106,8 +1106,11 @@ type testServer struct {
 	sandbox             sandboxExecutor
 	causalVerifications causalVerificationStore
 	graphLock           graphLocker
+	users               userStore
+	sessions            sessionStore
 	verifierJobs        JobLauncher
 	router              *RouterConfig
+	cookieSecure        bool
 	localImportDir      string
 	internalAuthToken   string
 }
@@ -1155,6 +1158,7 @@ func (ts testServer) build() *Server {
 		NewHub(), StubLauncher{},
 		orElse(ts.verifierJobs, StubLauncher{}).(JobLauncher),
 		StubIdentity{ID: "analyst-test"}, router,
+		SessionConfig{Users: ts.users, Sessions: ts.sessions, CookieSecure: ts.cookieSecure},
 		ts.localImportDir, "arborette-sleepcycle", ts.internalAuthToken,
 		testHITLThreshold, time.Minute,
 	)

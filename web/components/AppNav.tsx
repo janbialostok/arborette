@@ -3,12 +3,8 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/components/ui";
-
-const LINKS = [
-  { href: "/goals", label: "Objectives" },
-  { href: "/datasets", label: "Datasets" },
-  { href: "/heuristics", label: "Heuristics" },
-];
+import { UserMenu } from "@/components/UserMenu";
+import { NAV_LINKS } from "@/lib/nav";
 
 export function AppNav() {
   const pathname = usePathname();
@@ -20,25 +16,28 @@ export function AppNav() {
           ARBORETTE
         </span>
       </Link>
-      <nav className="flex items-center gap-1">
-        {LINKS.map((link) => {
-          const active = pathname.startsWith(link.href);
-          return (
-            <Link
-              key={link.href}
-              href={link.href}
-              className={cn(
-                "rounded-md px-3 py-1.5 text-sm transition-colors",
-                active
-                  ? "text-signal"
-                  : "text-muted hover:text-fg",
-              )}
-            >
-              {link.label}
-            </Link>
-          );
-        })}
-      </nav>
+      <div className="flex items-center gap-4">
+        <nav className="flex items-center gap-1">
+          {NAV_LINKS.map((link) => {
+            const active = pathname.startsWith(link.href);
+            return (
+              <Link
+                key={link.href}
+                href={link.href}
+                className={cn(
+                  "rounded-md px-3 py-1.5 text-sm transition-colors",
+                  active
+                    ? "text-signal"
+                    : "text-muted hover:text-fg",
+                )}
+              >
+                {link.label}
+              </Link>
+            );
+          })}
+        </nav>
+        <UserMenu />
+      </div>
     </header>
   );
 }
