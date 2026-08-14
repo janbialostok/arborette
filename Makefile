@@ -1,4 +1,4 @@
-.PHONY: build test up down sleep-cycle discover migrate-up migrate-down web-dev web-build
+.PHONY: build test clean-data up down sleep-cycle discover migrate-up migrate-down web-dev web-build
 
 # Host env for runs that talk to the compose stack from the host (not from
 # inside the network): the published ports on localhost.
@@ -11,10 +11,22 @@ build:
 	go build ./...
 
 # Integration tests against a running `make up` stack. Sources .env for
-# credentials and runs with -p 1 so packages do not race on the shared database.
+# credentials, runs with -p 1 so packages do not race on the shared database,
+# then ends with the cleanliness gate: every table, graph node, and object-store
+# key the suite created (or a cluttered stack started with) must be gone. A
+# cluttered stack fails the gate out of the box -- run `make clean-data` once
+# first.
 test:
 	set -a; . ./.env; set +a; \
-	ARBORETTE_INTEGRATION=1 $(HOST_ENV) go test -p 1 ./...
+	ARBORETTE_INTEGRATION=1 $(HOST_ENV) go test -p 1 ./... && \
+	$(HOST_ENV) go run ./cmd/cleanup check
+
+# One-shot operator reset: wipe every dataset, objective, and derived
+# record/artifact from the live stack's stores (Postgres as owner, the whole
+# Neo4j graph, and every object-store key). Idempotent -- safe to run twice.
+clean-data:
+	set -a; . ./.env; set +a; \
+	$(HOST_ENV) go run ./cmd/cleanup clean
 
 up:
 	docker compose up -d --build

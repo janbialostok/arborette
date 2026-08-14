@@ -24,10 +24,15 @@ func newRepo(t *testing.T, ctx context.Context) *graph.Neo4jRepository {
 }
 
 // seedTriplet creates a State→Intervention→Outcome chain with its edges and
-// returns the three ids.
+// returns the three ids. It also registers each node for teardown, so the
+// whole seed (and its edges) is removed at cleanup time.
 func seedTriplet(t *testing.T, ctx context.Context, repo *graph.Neo4jRepository) (string, string, string) {
 	t.Helper()
 	stateID, interventionID, outcomeID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, stateID)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, interventionID)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, outcomeID)
 
 	if err := repo.CreateState(ctx, domain.State{ID: stateID, Properties: map[string]any{"latency_ms": 210.0}}); err != nil {
 		t.Fatalf("create state: %v", err)
@@ -83,6 +88,8 @@ func TestCreateMetaHeuristicPendingLifecycle(t *testing.T) {
 	_, interventionID, outcomeID := seedTriplet(t, ctx, repo)
 
 	mhID := testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, mhID)
 	if err := repo.CreateMetaHeuristic(ctx,
 		domain.MetaHeuristic{ID: mhID, Definition: "reducing threshold restores latency"},
 		[]string{interventionID, outcomeID},
@@ -121,6 +128,8 @@ func TestMetaHeuristicGoalScope(t *testing.T) {
 
 	// A node created with a goal carries it through both read paths.
 	scopedID, goalA := testutil.NewID(t), testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, scopedID)
 	if err := repo.CreateMetaHeuristic(ctx,
 		domain.MetaHeuristic{ID: scopedID, Definition: "scoped at creation", GoalID: goalA},
 		[]string{interventionID},
@@ -145,6 +154,7 @@ func TestMetaHeuristicGoalScope(t *testing.T) {
 	// A legacy node created without a goal reads back empty, heals to a real goal on
 	// re-abstraction, and is never re-blanked by a later goal-less re-issue.
 	legacyID, goalB := testutil.NewID(t), testutil.NewID(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, legacyID)
 	if err := repo.CreateMetaHeuristic(ctx,
 		domain.MetaHeuristic{ID: legacyID, Definition: "legacy, no goal"},
 		[]string{interventionID},
@@ -193,7 +203,9 @@ func TestGetMetaHeuristicsBatch(t *testing.T) {
 	_, interventionID, _ := seedTriplet(t, ctx, repo)
 
 	presentIDs := []string{testutil.NewID(t), testutil.NewID(t)}
+	cfg := testutil.RequireIntegration(t)
 	for _, id := range presentIDs {
+		testutil.RegisterGraphNodeCleanup(t, ctx, cfg, id)
 		if err := repo.CreateMetaHeuristic(ctx,
 			domain.MetaHeuristic{ID: id, Definition: "definition " + id},
 			[]string{interventionID},
@@ -240,6 +252,8 @@ func TestCreateMetaHeuristicRejectsBadReferences(t *testing.T) {
 	for name, refs := range cases {
 		t.Run(name, func(t *testing.T) {
 			mhID := testutil.NewID(t)
+			cfg := testutil.RequireIntegration(t)
+			testutil.RegisterGraphNodeCleanup(t, ctx, cfg, mhID)
 			err := repo.CreateMetaHeuristic(ctx,
 				domain.MetaHeuristic{ID: mhID, Definition: "bad refs"}, refs,
 			)
@@ -259,6 +273,8 @@ func TestTraceCausalChain(t *testing.T) {
 	stateID, interventionID, outcomeID := seedTriplet(t, ctx, repo)
 
 	mhID := testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, mhID)
 	if err := repo.CreateMetaHeuristic(ctx,
 		domain.MetaHeuristic{ID: mhID, Definition: "abstraction"},
 		[]string{interventionID},

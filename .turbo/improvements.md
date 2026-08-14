@@ -4,6 +4,14 @@ Out-of-scope improvement opportunities captured during work sessions. Review per
 
 Entries are removed once shipped — this file lists only open work, in the order it was noted. An entry that shipped in part keeps only its unshipped remainder.
 
+### Give each integration test its own Postgres database or schema instead of sharing one
+
+- **Type**: plan
+- **Category**: testing
+- **Where**: `Makefile` (`test` target, `-p 1`), `internal/testutil` (`RequireIntegration`, `SetupPostgres`), `internal/store` (`ResetAll`)
+- **Why**: The suite shares a single Postgres database, which is why `make test` must run `-p 1`, why tests must assert per-row effects rather than table-global counts, and why the post-suite cleanliness gate exists at all. Per-test databases/schemas (created and dropped around each test, e.g. a `dbname`/`search_path` suffix per test) would remove the shared-state hazard at its root: packages could run concurrently again, and a test's residue could never leak into another's assertions. This is the future alternative to the `-p 1` + per-row `t.Cleanup` + gate combination the Clean Test Data feature ships; it is deliberately not done now because every store connection, DSN, role grant, and the `audit_log`-boundary tests are built around the single shared owner database, so the migration cost is a feature of its own.
+- **Noted**: 2026-08-14
+
 ### Scope `data_source_ref` per goal/tenant at the Sandbox boundary
 
 - **Type**: plan
@@ -66,14 +74,6 @@ Entries are removed once shipped — this file lists only open work, in the orde
 - **Category**: reliability
 - **Where**: `internal/heuristics/service.go` (`Query`, `retireOrphans`), `internal/store/embeddingstore.go` (`SimilaritySearch`, `Delete`), `internal/store/migrations/0008_embedding_delete_grant.up.sql`, handler at `internal/orchestrator/heuristics.go`
 - **Why**: The read path now skips similarity hits whose graph node is gone and retires their pgvector rows, gated on one live sibling in the same batch. Each risk below was surfaced in review and **deliberately accepted** — these are not oversights, and the two disputed windows are recorded so they are not re-litigated. (1) **The guard is per-batch, not per-goal.** `cmd/sleepcycle/main.go:30` requires `-goal`, so repair granularity is per-goal: re-run goal A but not goal B after a graph reset and a live hit from A corroborates permanently deleting B's embeddings. *Disputed, do not re-raise:* there is no `NEO4J_DATABASE` in the codebase, and a wrong `NEO4J_URI` gives a wholly foreign graph where `live == 0` and the guard correctly holds; replica lag is unreachable on the single-instance `neo4j:5`, and bookmarks would not help anyway since write and read live in different processes. (2) **TOCTOU on the delete.** The miss is observed at the top of the loop and the delete runs after the batch, without re-observing the miss, with nothing serializing sleepcycle against read traffic; deterministic `derivedID` means a concurrent repair's fresh embedding can be deleted, leaving `embedding_pending = false` with no vector. Fix is *not* a Go-side timestamp (Go and Postgres clocks skew) — return the observed `(node_id, updated_at)` from `SimilaritySearch` and delete `WHERE node_id = $1 AND updated_at = $2`. (3) **No back-fill.** `LIMIT` is applied before the graph filter, so orphans consume slots; sub-`k` returns are unconditional and an all-orphan top-`k` deadlocks (`live == 0` blocks the deletion that would clear it). Fix is over-fetch-and-filter, or push liveness into SQL. (4) **The GET is destructive on an unauthenticated surface** (bare mux, no middleware, `k` up to `maxSearchK` = 100), and 0008 grants DELETE to `arborette_orchestrator`, widening 0005's SELECT-only stance on that role — so prefetch, crawlers, and retries can trigger deletion. Accepted for the localhost-only trust model; revisit with the web-tier-hardening and orchestrator-auth entries above. The audit gap is **not** closable inside `heuristics.Service` — 0005 gives the service role no privilege on `audit_log` and `cmd/mcpserver` wires the Service as that role, so auditing belongs at the orchestrator handler (return retired ids from `Query`, let the Server record them).
-- **Noted**: 2026-07-28
-
-### Stop integration tests accumulating fixture nodes in the shared dev Neo4j
-
-- **Type**: plan
-- **Category**: testing
-- **Where**: `internal/testutil/testutil.go` (`TruncateEmbeddings` and a missing graph counterpart), fixtures in `internal/graph/graph_test.go:87,145`, `internal/graph/sleepcycle_test.go:162`, `internal/heuristics/heuristics_test.go:49`, `internal/mcpserver/tools_integration_test.go:51`, `internal/llm/abstract_test.go:70`
-- **Why**: Integration tests truncate pgvector but never remove the Neo4j nodes they create, so fixtures accumulate against the shared dev graph indefinitely. Measured 2026-07-28: **169 of 194** Meta-Heuristic nodes were test residue — `"abstraction"` ×97, `"reducing the alert threshold restores latency without degrading recall"` ×25, `"reducing threshold restores latency"` ×24, `"[Primary Population Center] raises [System Output]"` ×23 — leaving only 25 real heuristics, and 4 residue nodes had live embeddings so they ranked in every user-facing search. Beyond the noise, this asymmetry (pgvector truncated, graph persisted) is what manufactured the graph/pgvector drift the reconcile pass now heals, so fixing it removes the main local source of that drift. Options: a `TruncateGraph` counterpart called alongside `TruncateEmbeddings`, per-test `t.Cleanup` deleting seeded ids, or giving integration tests their own database rather than sharing the dev instance — the last also stops `make test` wiping embeddings out from under a running stack.
 - **Noted**: 2026-07-28
 
 ### Bound and authenticate the agent chat endpoint

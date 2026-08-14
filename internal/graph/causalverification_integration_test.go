@@ -14,6 +14,8 @@ import (
 func seedCausalTriplet(t *testing.T, ctx context.Context, repo *graph.Neo4jRepository, goalID string) (interventionID, outcomeID string) {
 	t.Helper()
 	stateID, interventionID, outcomeID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGoalGraphCleanup(t, ctx, cfg, goalID)
 	if err := repo.CreateState(ctx, domain.State{ID: stateID, GoalID: goalID, Properties: map[string]any{"k": 1.0}}); err != nil {
 		t.Fatalf("create state: %v", err)
 	}

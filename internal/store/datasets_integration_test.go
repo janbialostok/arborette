@@ -32,6 +32,7 @@ func containsDataset(datasets []store.Dataset, id string) bool {
 // seedDatasetRow inserts a dataset through the store and returns its id, for the
 // integration tests that need one rather than a bare SQL seed. The name carries
 // a fresh uuid, since lower(name) is globally unique on the shared database.
+// Cleanup is registered here so every caller inherits per-row teardown.
 func seedDatasetRow(t *testing.T, ctx context.Context, p *store.Pool, ds *store.DatasetStore, name string) string {
 	t.Helper()
 	id, err := ds.Create(ctx, store.Dataset{
@@ -43,6 +44,7 @@ func seedDatasetRow(t *testing.T, ctx context.Context, p *store.Pool, ds *store.
 	if err != nil {
 		t.Fatalf("create dataset %q: %v", name, err)
 	}
+	testutil.RegisterDatasetCleanup(t, ctx, testutil.RequireIntegration(t), id)
 	return id
 }
 
@@ -78,6 +80,7 @@ func TestDatasetInventory(t *testing.T) {
 	// A goal bound to the second dataset makes its derived count 1, visible
 	// through both List and Get (the LEFT JOIN the usage derives from).
 	goalID := testutil.NewID(t)
+	testutil.RegisterGoalCleanup(t, ctx, cfg, goalID)
 	if err := store.NewGoalRegistry(p).Insert(ctx, store.Goal{
 		OptimizationFunctionID: goalID,
 		GoalText:               "grow beta revenue",
@@ -212,6 +215,7 @@ func TestDatasetLifecycle(t *testing.T) {
 	// registry row scope lives in the handler (DataSourceRefUsage decides);
 	// the store's own DeleteDataSourceRef is unconditional.
 	ref := "datasources/" + testutil.NewID(t) + "/shared.csv"
+	testutil.RegisterDataSourceRefCleanup(t, ctx, cfg, ref)
 	if err := store.NewGoalRegistry(p).RegisterDataSourceRef(ctx, ref); err != nil {
 		t.Fatalf("register ref: %v", err)
 	}
@@ -224,14 +228,17 @@ func TestDatasetLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create first ref-sharing dataset: %v", err)
 	}
-	if _, err := ds.Create(ctx, store.Dataset{
+	testutil.RegisterDatasetCleanup(t, ctx, cfg, sharedID)
+	secondSharedID, err := ds.Create(ctx, store.Dataset{
 		Name:          "shared-second-" + testutil.NewID(t),
 		Description:   "",
 		Status:        store.DatasetActive,
 		DataSourceRef: ref,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("create second ref-sharing dataset: %v", err)
 	}
+	testutil.RegisterDatasetCleanup(t, ctx, cfg, secondSharedID)
 	if d, g, err := ds.DataSourceRefUsage(ctx, ref); err != nil || d != 2 || g != 0 {
 		t.Fatalf("ref usage after two datasets = (%d,%d) err=%v, want (2,0)", d, g, err)
 	}
@@ -245,6 +252,7 @@ func TestDatasetLifecycle(t *testing.T) {
 	// A dataset that still holds a goal cannot be deleted outright -- the goal's
 	// NO ACTION FK stands in the way until the goal is removed.
 	boundID := testutil.NewID(t)
+	testutil.RegisterGoalCleanup(t, ctx, cfg, boundID)
 	if err := store.NewGoalRegistry(p).Insert(ctx, store.Goal{
 		OptimizationFunctionID: boundID,
 		GoalText:               "blocks its dataset delete",
@@ -289,6 +297,7 @@ func TestGoalDatasetBinding(t *testing.T) {
 	secondID := seedDatasetRow(t, ctx, orch, ds, "second")
 
 	goalID := testutil.NewID(t)
+	testutil.RegisterGoalCleanup(t, ctx, cfg, goalID)
 	if err := reg.Insert(ctx, store.Goal{
 		OptimizationFunctionID: goalID,
 		GoalText:               "bound objective",
@@ -372,6 +381,7 @@ func TestDeleteGoalRetiresEmbeddings(t *testing.T) {
 
 	datasetID := seedDatasetRow(t, ctx, orch, ds, "emb")
 	goalID := testutil.NewID(t)
+	testutil.RegisterGoalCleanup(t, ctx, cfg, goalID)
 	if err := reg.Insert(ctx, store.Goal{
 		OptimizationFunctionID: goalID,
 		GoalText:               "embeddings retire with this",
@@ -383,6 +393,7 @@ func TestDeleteGoalRetiresEmbeddings(t *testing.T) {
 	}
 
 	nodeID := testutil.NewID(t)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, nodeID)
 	if err := embeddings.Upsert(ctx, nodeID, goalID, vec768(0.25)); err != nil {
 		t.Fatalf("upsert embedding: %v", err)
 	}

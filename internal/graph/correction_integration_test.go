@@ -16,6 +16,8 @@ func seedGraph(t *testing.T, ctx context.Context, repo *graph.Neo4jRepository) (
 	t.Helper()
 	goalID = testutil.NewID(t)
 	ref = "correction/" + testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGoalGraphCleanup(t, ctx, cfg, goalID)
 
 	columns := []domain.DataColumn{
 		{GoalID: goalID, DatasourceRef: ref, Name: "X", Kind: "numeric"},

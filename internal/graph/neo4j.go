@@ -942,3 +942,75 @@ func unmarshalProvenance(v any) (*domain.ProvenanceLocator, error) {
 	}
 	return &p, nil
 }
+
+// Wipe removes every node and edge in the graph. It is the operator reset
+// behind cmd/cleanup clean. A whole-graph delete is required rather than a
+// per-goal DeleteGoalGraph because legacy test fixtures were seeded without a
+// goal_id and are unreachable by any goal-scoped pattern. Deleting an already
+// empty graph is a no-op, so the wipe is idempotent. It returns the number of
+// nodes removed for the operator summary.
+func (r *Neo4jRepository) Wipe(ctx context.Context) (int64, error) {
+	return r.writeCountOp(ctx, "wipe graph", "MATCH (n) DETACH DELETE n")
+}
+
+// DeleteNode removes the node with the given application-assigned id and its
+// edges. It is the per-test fixture cleanup primitive: a test deletes exactly
+// the nodes it created, by id, without knowing their label. Matching nothing is
+// not an error (a test that already exercised a delete path still cleans up
+// idempotently), mirroring DeleteMetaHeuristic's contract. Returns the number
+// of nodes removed.
+func (r *Neo4jRepository) DeleteNode(ctx context.Context, id string) (int64, error) {
+	return r.writeCountOp(ctx, "delete node "+id, "MATCH (n {id: $id}) DETACH DELETE n", map[string]any{"id": id})
+}
+
+// CountNodes returns the total number of nodes in the graph, the graph side of
+// the cleanliness gate's emptiness report.
+func (r *Neo4jRepository) CountNodes(ctx context.Context) (int64, error) {
+	var n int64
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx, "MATCH (n) RETURN count(n)", nil)
+		if err != nil {
+			return nil, err
+		}
+		rec, err := result.Single(ctx)
+		if err != nil {
+			return nil, err
+		}
+		value, ok := rec.Values[0].(int64)
+		if !ok {
+			return nil, fmt.Errorf("count(n) returned %T, want int64", rec.Values[0])
+		}
+		return value, nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("count graph nodes: %w", err)
+	}
+	n = res.(int64)
+	return n, nil
+}
+
+// writeCountOp runs a single mutating statement and returns its rows-affected
+// count, wrapping the existing write transaction plumbing.
+func (r *Neo4jRepository) writeCountOp(ctx context.Context, op, statement string, params ...map[string]any) (int64, error) {
+	var removed int64
+	res, err := r.write(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		var queryParams map[string]any
+		if len(params) > 0 {
+			queryParams = params[0]
+		}
+		result, err := tx.Run(ctx, statement, queryParams)
+		if err != nil {
+			return nil, err
+		}
+		summary, err := result.Consume(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return int64(summary.Counters().NodesDeleted()), nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", op, err)
+	}
+	removed = res.(int64)
+	return removed, nil
+}

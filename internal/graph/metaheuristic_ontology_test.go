@@ -21,6 +21,8 @@ func TestMetaHeuristicOntologyRoundTrip(t *testing.T) {
 	repo := newRepo(t, ctx)
 	goalID, otherGoal := testutil.NewID(t), testutil.NewID(t)
 	mhID := testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, mhID)
 
 	terms := []domain.OntologyTerm{
 		{Concrete: "HomePlanet", Ontological: "[Primary Population Center]"},
@@ -108,6 +110,8 @@ func TestAbstractionSourceFiltersWalksInterventionsOnly(t *testing.T) {
 	stateID, interventionID, outcomeID := seedGoalTriplet(t, ctx, repo, goalID, domain.VerificationVerified, false)
 
 	mhID := testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, mhID)
 	mh := domain.MetaHeuristic{ID: mhID, Definition: "[Volume] raises [System Output]", GoalID: goalID}
 	if err := repo.CreateMetaHeuristic(ctx, mh, []string{stateID, interventionID, outcomeID}); err != nil {
 		t.Fatalf("create meta-heuristic: %v", err)

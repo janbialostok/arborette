@@ -46,22 +46,29 @@
   (e.g. a status-sweep's affected-row count) — assert per-row effects instead. When
   asserting an `ORDER BY` over `now()`-defaulted timestamps, `time.Sleep` a couple
   ms between inserts so the ordering is deterministic.
-- `make test` **truncates** `meta_heuristic_embeddings` (`internal/testutil`), so a
-  run against the live stack destroys the pgvector rows of every Meta-Heuristic a
-  real Sleep-Cycle run published. The graph side is untouched, so those nodes keep
-  `embedding_pending = false` and the resume pass skips them — they stay reachable
-  by `trace_causal_chain` while returning nothing from `get_optimized_heuristics`.
-  Never compare an embeddings-table observation taken before the gate with one
-  taken after; re-publish (or re-embed) before drawing conclusions.
-- The graph side is not left alone either: the suite seeds fixture
-  `MetaHeuristic` nodes into the shared dev Neo4j and never removes them, so
-  residue accumulates run over run (a real instance reached 169 of 194 nodes,
-  from the `"abstraction"` and `"reducing threshold restores latency"` fixtures
-  among others). Combined with the truncate above, one `make test` leaves the two
-  stores diverged in **both** directions — nodes with no embedding, and stale
-  embeddings whose fixture node was seeded by an earlier run. When judging drift,
-  filter fixture definitions out first; when verifying against the live stack,
-  expect to restore the corpus after every gate run.
+- Every integration test that writes a persistent fixture registers it for
+  teardown through `internal/testutil`'s `Register*Cleanup` helpers right after
+  creating it (by id, never by truncating a shared table). `t.Cleanup` removes
+  exactly what the test created whether it passes, fails, or panics, over the
+  owner role. The helpers are idempotent, so a test that already exercised a
+  delete path still cleans up quietly. Never truncate `meta_heuristic_embeddings`
+  or any other shared table to clean up — that destroys rows belonging to other
+  processes (a real Sleep-Cycle run's published embeddings) and is how the
+  suite's residue problem started. Register per-row teardown instead.
+- `make test` ends with the post-suite cleanliness gate
+  (`go run ./cmd/cleanup check`): every table, graph node, and object-store key
+  must be gone. The suite is expected to pass the gate out of the box; a cluttered
+  stack works too — run `make clean-data` once first to wipe everything.
+- Teardown ordering is LIFO (`t.Cleanup` runs last-registered first), so a
+  fixture's dependents must always be removable regardless of registration order:
+  a goal bound to a dataset via `goal_registry.dataset_id` (NOT NULL) is cleaned
+  up by `RegisterDatasetCleanup`, which retires the dataset's goals (and their
+  runs/verifications) before deleting the dataset row, mirroring what
+  `RegisterGoalCleanup` would have taken had it run first.
+- Audit rows are append-only and the runtime roles cannot read or delete them
+  (that is the boundary the boundary tests prove). Teardown must run as the
+  owner; a test that needs the appended row's id must read it as the owner too,
+  not through the orchestrator/service pool.
 - `make test` sources `.env`, so a test that asserts a config default by leaving
   the variable unset passes under a bare `go test` and fails the moment an operator
   sets it. Clear the variable explicitly (`t.Setenv(key, "")`) rather than assuming

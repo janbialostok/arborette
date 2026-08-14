@@ -10,6 +10,7 @@ import (
 	"github.com/arborette/arborette/internal/domain"
 	"github.com/arborette/arborette/internal/store"
 	"github.com/arborette/arborette/internal/testutil"
+	"github.com/jackc/pgx/v5"
 	"github.com/pgvector/pgvector-go"
 )
 
@@ -45,6 +46,7 @@ func TestVectorRoundTrip(t *testing.T) {
 	embeddings := store.NewEmbeddingStore(p, 2)
 
 	nodeID := testutil.NewID(t)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, nodeID)
 	want := vec768(0.5)
 	if err := embeddings.Upsert(ctx, nodeID, "", want); err != nil {
 		t.Fatalf("upsert embedding: %v", err)
@@ -83,7 +85,6 @@ func oneHot(weights map[int]float32) []float32 {
 func TestSimilaritySearchRankingAndLimit(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
-	testutil.TruncateEmbeddings(t, ctx, cfg)
 	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
 	// A generous floor keeps this test about ranking and the k cap, not the floor.
 	embeddings := store.NewEmbeddingStore(p, 2)
@@ -92,6 +93,9 @@ func TestSimilaritySearchRankingAndLimit(t *testing.T) {
 	nearID := testutil.NewID(t) // identical direction -> distance 0
 	midID := testutil.NewID(t)  // 45 degrees
 	farID := testutil.NewID(t)  // orthogonal -> distance 1
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, nearID)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, midID)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, farID)
 	if err := embeddings.Upsert(ctx, nearID, "", oneHot(map[int]float32{0: 1})); err != nil {
 		t.Fatalf("upsert near: %v", err)
 	}
@@ -120,12 +124,14 @@ func TestSimilaritySearchRankingAndLimit(t *testing.T) {
 func TestSearchScopeFiltersByGoal(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
-	testutil.TruncateEmbeddings(t, ctx, cfg)
 	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
 	embeddings := store.NewEmbeddingStore(p, 2)
 
 	goalA, goalB := testutil.NewID(t), testutil.NewID(t)
 	aID, bID, legacyID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, aID)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, bID)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, legacyID)
 	v := oneHot(map[int]float32{0: 1})
 	for id, goal := range map[string]string{aID: goalA, bID: goalB, legacyID: ""} {
 		if err := embeddings.Upsert(ctx, id, goal, v); err != nil {
@@ -156,11 +162,12 @@ func TestSearchScopeFiltersByGoal(t *testing.T) {
 func TestDistanceFloorExcludesDistantRows(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
-	testutil.TruncateEmbeddings(t, ctx, cfg)
 	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
 	embeddings := store.NewEmbeddingStore(p, 0.5)
 
 	nearID, farID := testutil.NewID(t), testutil.NewID(t)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, nearID)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, farID)
 	if err := embeddings.Upsert(ctx, nearID, "", oneHot(map[int]float32{0: 1})); err != nil {
 		t.Fatalf("upsert near: %v", err)
 	}
@@ -193,11 +200,11 @@ func TestDistanceFloorExcludesDistantRows(t *testing.T) {
 func TestUpsertNullGoalThenRepaired(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
-	testutil.TruncateEmbeddings(t, ctx, cfg)
 	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
 	embeddings := store.NewEmbeddingStore(p, 2)
 
 	nodeID := testutil.NewID(t)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, nodeID)
 	if err := embeddings.Upsert(ctx, nodeID, "", vec768(0.2)); err != nil {
 		t.Fatalf("upsert null-goal: %v", err)
 	}
@@ -230,11 +237,11 @@ func TestUpsertNullGoalThenRepaired(t *testing.T) {
 func TestSetGoalIDRepairsOnlyNullRows(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
-	testutil.TruncateEmbeddings(t, ctx, cfg)
 	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
 	embeddings := store.NewEmbeddingStore(p, 2)
 
 	nodeID := testutil.NewID(t)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, nodeID)
 	if err := embeddings.Upsert(ctx, nodeID, "", vec768(0.2)); err != nil {
 		t.Fatalf("seed null-goal row: %v", err)
 	}
@@ -288,7 +295,6 @@ func goalOf(t *testing.T, ctx context.Context, e *store.EmbeddingStore, nodeID s
 func TestGoalScopedRecallUnderFiltering(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
-	testutil.TruncateEmbeddings(t, ctx, cfg)
 
 	// One connection so a session-level SET persists into the store's own search
 	// transaction, which the store manages and does not expose.
@@ -304,12 +310,15 @@ func TestGoalScopedRecallUnderFiltering(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		id := testutil.NewID(t)
 		minority[id] = true
+		testutil.RegisterEmbeddingCleanup(t, ctx, cfg, id)
 		if err := embeddings.Upsert(ctx, id, minorityGoal, query); err != nil {
 			t.Fatalf("upsert minority: %v", err)
 		}
 	}
 	for i := 0; i < 50; i++ {
-		if err := embeddings.Upsert(ctx, testutil.NewID(t), majorityGoal, query); err != nil {
+		id := testutil.NewID(t)
+		testutil.RegisterEmbeddingCleanup(t, ctx, cfg, id)
+		if err := embeddings.Upsert(ctx, id, majorityGoal, query); err != nil {
 			t.Fatalf("upsert majority: %v", err)
 		}
 	}
@@ -382,6 +391,22 @@ func TestAuditBoundaryOrchestrator(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("orchestrator append audit: %v", err)
 	}
+	// The appended row is real residue the orchestrator role cannot delete (that
+	// is the boundary this test proves), so hydrate its identity now and remove
+	// it at teardown as the owner -- the only role allowed to. The orchestrator
+	// role has no SELECT on audit_log either, so the read is an owner one.
+	owner, err := pgx.Connect(ctx, cfg.Postgres.OwnerDSN())
+	if err != nil {
+		t.Fatalf("connect owner: %v", err)
+	}
+	defer owner.Close(context.WithoutCancel(ctx))
+	var appendedID int64
+	if err := owner.QueryRow(ctx,
+		"SELECT id FROM audit_log WHERE actor = 'analyst' AND action = 'register_goal' "+
+			"ORDER BY id DESC LIMIT 1").Scan(&appendedID); err != nil {
+		t.Fatalf("read appended audit id: %v", err)
+	}
+	testutil.RegisterAuditCleanup(t, ctx, cfg, appendedID)
 
 	if _, err := p.Exec(ctx, "UPDATE audit_log SET actor = 'x'"); err == nil {
 		t.Fatal("expected orchestrator UPDATE on audit_log to be denied")
@@ -427,6 +452,7 @@ func TestGoalRegistryGrants(t *testing.T) {
 		DataSourceRef: "s3://arborette/data.csv",
 		DatasetID:     seedDataset(t, ctx, orchestrator),
 	}
+	testutil.RegisterGoalCleanup(t, ctx, cfg, goalID)
 	if err := registry.Insert(ctx, goal); err != nil {
 		t.Fatalf("orchestrator insert goal: %v", err)
 	}
@@ -464,6 +490,7 @@ func TestDataSourceRegistry(t *testing.T) {
 	orchReg := store.NewGoalRegistry(orchestrator)
 
 	ref := "datasources/" + testutil.NewID(t) + "/orders.csv"
+	testutil.RegisterDataSourceRefCleanup(t, ctx, cfg, ref)
 
 	if exists, err := orchReg.DataSourceRefExists(ctx, ref); err != nil || exists {
 		t.Fatalf("unregistered ref: exists=%v err=%v, want false/nil", exists, err)
@@ -511,6 +538,7 @@ func TestGoalRegistryDocumentGoal(t *testing.T) {
 		DataSourceRef: "s3://arborette/contract.pdf",
 		DatasetID:     seedDataset(t, ctx, p),
 	}
+	testutil.RegisterGoalCleanup(t, ctx, cfg, docID)
 	if err := registry.Insert(ctx, docGoal); err != nil {
 		t.Fatalf("insert document goal: %v", err)
 	}
@@ -529,6 +557,7 @@ func TestGoalRegistryDocumentGoal(t *testing.T) {
 	// and NULL-target_fields (tabular) rows without a decode error -- the null-guard
 	// that otherwise breaks handleListGoals once one document goal exists.
 	tabID := testutil.NewID(t)
+	testutil.RegisterGoalCleanup(t, ctx, cfg, tabID)
 	if err := registry.Insert(ctx, store.Goal{
 		OptimizationFunctionID: tabID,
 		GoalText:               "grow revenue",
@@ -565,6 +594,7 @@ func TestGoalRegistryWindowBindings(t *testing.T) {
 	registry := store.NewGoalRegistry(p)
 
 	boundID := testutil.NewID(t)
+	testutil.RegisterGoalCleanup(t, ctx, cfg, boundID)
 	if err := registry.Insert(ctx, store.Goal{
 		OptimizationFunctionID: boundID,
 		GoalText:               "flag anomalous velocity",
@@ -586,6 +616,7 @@ func TestGoalRegistryWindowBindings(t *testing.T) {
 
 	// A goal with no bindings reads both back as empty (NULL columns COALESCEd).
 	unboundID := testutil.NewID(t)
+	testutil.RegisterGoalCleanup(t, ctx, cfg, unboundID)
 	if err := registry.Insert(ctx, store.Goal{
 		OptimizationFunctionID: unboundID,
 		GoalText:               "grow revenue",
@@ -623,6 +654,7 @@ func TestGoalRegistryTrackAndClaim(t *testing.T) {
 		t.Fatalf("marshal claim: %v", err)
 	}
 	verifyID := testutil.NewID(t)
+	testutil.RegisterGoalCleanup(t, ctx, cfg, verifyID)
 	if err := registry.Insert(ctx, store.Goal{
 		OptimizationFunctionID: verifyID,
 		GoalText:               "do gold-tier accounts spend more?",
@@ -693,7 +725,9 @@ func strPtr(s string) *string { return &s }
 
 // seedGoal inserts a minimal registered goal a run row can reference, returning
 // its id. The goal is bound to a freshly seeded dataset: goal_registry.dataset_id
-// is NOT NULL, so every goal insert needs a parent row.
+// is NOT NULL, so every goal insert needs a parent row. Cleanup is registered for
+// the goal here (and, inside seedDataset, for the dataset), so every caller
+// inherits per-row teardown at its single change point.
 func seedGoal(t *testing.T, ctx context.Context, p *store.Pool) string {
 	t.Helper()
 	goalID := testutil.NewID(t)
@@ -706,12 +740,14 @@ func seedGoal(t *testing.T, ctx context.Context, p *store.Pool) string {
 	}); err != nil {
 		t.Fatalf("seed goal: %v", err)
 	}
+	testutil.RegisterGoalCleanup(t, ctx, testutil.RequireIntegration(t), goalID)
 	return goalID
 }
 
 // seedDataset inserts a dataset row any goal insert can reference, returning its
 // id. Name and ref are per-test fresh: the name-uniqueness rule (lower(name)
 // index) and residue from earlier runs on the shared db make fixed values unsafe.
+// Cleanup is registered here so every caller inherits per-row teardown.
 func seedDataset(t *testing.T, ctx context.Context, p *store.Pool) string {
 	t.Helper()
 	var id string
@@ -722,6 +758,7 @@ func seedDataset(t *testing.T, ctx context.Context, p *store.Pool) string {
 	if err != nil {
 		t.Fatalf("seed dataset: %v", err)
 	}
+	testutil.RegisterDatasetCleanup(t, ctx, testutil.RequireIntegration(t), id)
 	return id
 }
 
@@ -788,6 +825,7 @@ func TestGoalRegistryList(t *testing.T) {
 	registry := store.NewGoalRegistry(p)
 
 	olderID := testutil.NewID(t)
+	testutil.RegisterGoalCleanup(t, ctx, cfg, olderID)
 	if err := registry.Insert(ctx, store.Goal{OptimizationFunctionID: olderID, GoalText: "older",
 		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "revenue", Direction: domain.Maximize, Aggregation: "avg"}}},
 		DataSourceRef:    "ref", DatasetID: seedDataset(t, ctx, p)}); err != nil {
@@ -795,6 +833,7 @@ func TestGoalRegistryList(t *testing.T) {
 	}
 	time.Sleep(2 * time.Millisecond) // keep created_at distinct so DESC ordering is deterministic
 	newerID := testutil.NewID(t)
+	testutil.RegisterGoalCleanup(t, ctx, cfg, newerID)
 	if err := registry.Insert(ctx, store.Goal{OptimizationFunctionID: newerID, GoalText: "newer",
 		EvaluationMatrix: domain.EvaluationMatrix{Targets: []domain.Target{{Field: "cost", Direction: domain.Minimize, Aggregation: "sum"}}},
 		DataSourceRef:    "ref", DatasetID: seedDataset(t, ctx, p)}); err != nil {
@@ -1011,12 +1050,13 @@ func TestEmbeddingGrants(t *testing.T) {
 func TestSimilaritySearchScoredCarriesDistances(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
-	testutil.TruncateEmbeddings(t, ctx, cfg)
 	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
 	embeddings := store.NewEmbeddingStore(p, 2)
 
 	goalID := testutil.NewID(t)
 	nearID, midID := testutil.NewID(t), testutil.NewID(t)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, nearID)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, midID)
 	if err := embeddings.Upsert(ctx, nearID, goalID, oneHot(map[int]float32{0: 1})); err != nil {
 		t.Fatalf("upsert near: %v", err)
 	}
@@ -1050,11 +1090,13 @@ func TestSimilaritySearchScoredCarriesDistances(t *testing.T) {
 func TestSimilaritySearchScoredHonoursFloorAndLimit(t *testing.T) {
 	ctx := context.Background()
 	cfg := setup(t, ctx)
-	testutil.TruncateEmbeddings(t, ctx, cfg)
 	p := pool(t, ctx, cfg.Postgres.ServiceDSN())
 	embeddings := store.NewEmbeddingStore(p, 0.5)
 
 	nearID, midID, farID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, nearID)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, midID)
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, farID)
 	if err := embeddings.Upsert(ctx, nearID, "", oneHot(map[int]float32{0: 1})); err != nil {
 		t.Fatalf("upsert near: %v", err)
 	}

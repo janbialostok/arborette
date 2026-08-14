@@ -16,6 +16,10 @@ import (
 func seedExtractionTriplet(t *testing.T, ctx context.Context, repo *graph.Neo4jRepository, goalID, field, value string, confidence float64) string {
 	t.Helper()
 	stateID, interventionID, outcomeID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, stateID)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, interventionID)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, outcomeID)
 
 	if err := repo.CreateState(ctx, domain.State{ID: stateID, GoalID: goalID, Properties: map[string]any{"field": field}}); err != nil {
 		t.Fatalf("create state: %v", err)

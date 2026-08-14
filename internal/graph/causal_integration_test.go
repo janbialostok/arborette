@@ -18,6 +18,8 @@ func TestCausalGraphRoundTrip(t *testing.T) {
 
 	goalID := testutil.NewID(t)
 	ref := "causal/" + testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGoalGraphCleanup(t, ctx, cfg, goalID)
 	columns := []domain.DataColumn{
 		{GoalID: goalID, DatasourceRef: ref, Name: "X", Kind: "numeric"},
 		{GoalID: goalID, DatasourceRef: ref, Name: "Y", Kind: "numeric"},

@@ -21,7 +21,6 @@ func TestToolsIntegration(t *testing.T) {
 	ctx := context.Background()
 	cfg := testutil.RequireIntegration(t)
 	testutil.SetupPostgres(t, ctx, cfg)
-	testutil.TruncateEmbeddings(t, ctx, cfg)
 
 	repo, err := graph.NewNeo4jRepository(ctx, cfg.Neo4j.URI, cfg.Neo4j.User, cfg.Neo4j.Password)
 	if err != nil {
@@ -41,6 +40,9 @@ func TestToolsIntegration(t *testing.T) {
 	provider := embedding.NewOllamaProvider(cfg.Ollama.URL, cfg.Ollama.Model, cfg.Embedding.Dimension)
 
 	stateID, interventionID, outcomeID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, stateID)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, interventionID)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, outcomeID)
 	mustSeed(t, repo.CreateState(ctx, domain.State{ID: stateID, Properties: map[string]any{"latency_ms": 210.0}}))
 	mustSeed(t, repo.CreateIntervention(ctx, domain.Intervention{ID: interventionID, Type: domain.InterventionQuery}))
 	mustSeed(t, repo.CreateOutcome(ctx, domain.Outcome{ID: outcomeID, VerificationStatus: domain.VerificationVerified}))
@@ -48,9 +50,11 @@ func TestToolsIntegration(t *testing.T) {
 	mustSeed(t, repo.CreateProduced(ctx, interventionID, outcomeID, domain.ProducedEdge{EffectSize: -12, Confidence: 1.0}))
 
 	mhID := testutil.NewID(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, mhID)
 	definition := "reducing the alert threshold restores latency without degrading recall"
 	mustSeed(t, repo.CreateMetaHeuristic(ctx, domain.MetaHeuristic{ID: mhID, Definition: definition}, []string{interventionID}))
 
+	testutil.RegisterEmbeddingCleanup(t, ctx, cfg, mhID)
 	docVec, err := provider.EmbedDocument(ctx, definition)
 	if err != nil {
 		t.Fatalf("embed document: %v", err)

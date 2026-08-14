@@ -39,6 +39,7 @@ func TestUserAccountLifecycle(t *testing.T) {
 
 	username := "inv-" + testutil.NewID(t)
 	created := seedUser(t, ctx, us, username, false)
+	testutil.RegisterUserCleanup(t, ctx, cfg, created.ID)
 	if created.Role != store.RoleMember {
 		t.Fatalf("seed decision without the seed proposition = %q, want member", created.Role)
 	}
@@ -120,6 +121,7 @@ func TestSessionLifecycle(t *testing.T) {
 	us := store.NewUserSessionStore(p)
 
 	u := seedUser(t, ctx, us, "sess-"+testutil.NewID(t), false)
+	testutil.RegisterUserCleanup(t, ctx, cfg, u.ID)
 
 	tokenHash := "h" + testutil.NewID(t) // stand-in for sha256(token); see usersessions_test
 	sess, err := us.CreateSession(ctx, tokenHash, u.ID)
@@ -179,6 +181,7 @@ func TestUsersGrants(t *testing.T) {
 
 	username := "grants-" + testutil.NewID(t)
 	u := seedUser(t, ctx, store.NewUserSessionStore(orch), username, false)
+	testutil.RegisterUserCleanup(t, ctx, cfg, u.ID)
 
 	if _, err := svc.Exec(ctx, "INSERT INTO users (username, password_hash, role) VALUES ($1,'x','member')", "svc-"+testutil.NewID(t)); err == nil {
 		t.Fatal("expected service INSERT on users to be denied")

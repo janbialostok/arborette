@@ -37,6 +37,8 @@ func newTestClient(t *testing.T, ctx context.Context) *objectstore.Client {
 func putObject(t *testing.T, ctx context.Context, client *objectstore.Client, ext string, body []byte) string {
 	t.Helper()
 	key := client.NewKey("test", testutil.NewID(t), "data"+ext)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterObjectCleanup(t, ctx, cfg, key)
 	if err := client.Put(ctx, key, bytes.NewReader(body), "application/octet-stream"); err != nil {
 		t.Fatalf("put object: %v", err)
 	}

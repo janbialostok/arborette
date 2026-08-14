@@ -24,6 +24,9 @@ func TestDeleteMetaHeuristicLive(t *testing.T) {
 	_, interventionID, outcomeID := seedTriplet(t, ctx, repo)
 
 	removedID, derivedID := testutil.NewID(t), testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, removedID)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, derivedID)
 	if err := repo.CreateMetaHeuristic(ctx,
 		domain.MetaHeuristic{ID: removedID, Definition: "to be deleted"},
 		[]string{interventionID, outcomeID},

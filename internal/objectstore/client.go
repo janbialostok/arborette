@@ -4,7 +4,10 @@
 package objectstore
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Client is an S3-API object store scoped to a single bucket.
@@ -42,8 +47,43 @@ func NewClient(ctx context.Context, endpoint, region, bucket, accessKey, secretK
 			o.BaseEndpoint = aws.String(endpoint)
 		}
 		o.UsePathStyle = pathStyle
+		o.APIOptions = append(o.APIOptions, contentMD5Middleware)
 	})
 	return &Client{s3: s3Client, bucket: bucket}, nil
+}
+
+// contentMD5Middleware stamps the Content-MD5 header onto multi-object-delete
+// requests. MinIO requires the header (it refuses DeleteObjects without it), and
+// aws-sdk-go-v2 leaves the header off the wire even though the API documents it
+// as required. The middleware runs after serialization, when the request body
+// holds the XML payload, and only touches requests for the ?delete endpoint so
+// every other operation is untouched.
+func contentMD5Middleware(stack *middleware.Stack) error {
+	return stack.Serialize.Add(middleware.SerializeMiddlewareFunc(
+		"ContentMD5ForDeleteObjects",
+		func(ctx context.Context, in middleware.SerializeInput, next middleware.SerializeHandler) (
+			middleware.SerializeOutput, middleware.Metadata, error,
+		) {
+			req, ok := in.Request.(*smithyhttp.Request)
+			if !ok || !req.URL.Query().Has("delete") {
+				return next.HandleSerialize(ctx, in)
+			}
+			body, err := io.ReadAll(req.GetStream())
+			if err != nil {
+				return middleware.SerializeOutput{}, middleware.Metadata{},
+					fmt.Errorf("read multi-delete payload for checksum: %w", err)
+			}
+			sum := md5.Sum(body)
+			req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(sum[:]))
+			req, err = req.SetStream(bytes.NewReader(body))
+			if err != nil {
+				return middleware.SerializeOutput{}, middleware.Metadata{},
+					fmt.Errorf("rewind multi-delete payload: %w", err)
+			}
+			in.Request = req
+			return next.HandleSerialize(ctx, in)
+		},
+	), middleware.After)
 }
 
 // NewKey joins path segments into a deterministic object key.
@@ -106,6 +146,57 @@ func IsNotFound(err error) bool {
 		return code == "NoSuchKey" || code == "NotFound"
 	}
 	return false
+}
+
+// ListKeys returns every object key in the bucket. It is the listing the wipe
+// and the cleanliness gate both need, and the single place the driver's
+// continuation-token paging lives so callers never see a partial page.
+func (c *Client) ListKeys(ctx context.Context) ([]string, error) {
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.bucket),
+	})
+	var keys []string
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list objects in %q: %w", c.bucket, err)
+		}
+		for _, obj := range page.Contents {
+			keys = append(keys, *obj.Key)
+		}
+	}
+	return keys, nil
+}
+
+// Wipe removes every object the bucket holds. It is the object-store arm of the
+// operator reset behind cmd/cleanup clean, deleting in DeleteObjects batches of
+// up to a thousand keys. An empty bucket has no keys to delete, so wiping an
+// already-clean bucket succeeds and changes nothing (idempotent). Unlike the
+// per-key Delete, this never touches the bucket itself, so a concurrently
+// bootstrapping service's EnsureBucket race is unaffected.
+func (c *Client) Wipe(ctx context.Context) (int, error) {
+	keys, err := c.ListKeys(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for start := 0; start < len(keys); start += 1000 {
+		end := start + 1000
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := keys[start:end]
+		identifiers := make([]types.ObjectIdentifier, len(batch))
+		for i, key := range batch {
+			identifiers[i] = types.ObjectIdentifier{Key: aws.String(key)}
+		}
+		if _, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(c.bucket),
+			Delete: &types.Delete{Objects: identifiers},
+		}); err != nil {
+			return 0, fmt.Errorf("delete %d objects in %q: %w", len(batch), c.bucket, err)
+		}
+	}
+	return len(keys), nil
 }
 
 // EnsureBucket idempotently creates the configured bucket to bootstrap local

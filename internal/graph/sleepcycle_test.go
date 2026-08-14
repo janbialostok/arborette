@@ -17,6 +17,10 @@ func seedGoalTriplet(t *testing.T, ctx context.Context, repo *graph.Neo4jReposit
 	goalID string, status domain.VerificationStatus, sleepDerived bool) (string, string, string) {
 	t.Helper()
 	stateID, interventionID, outcomeID := testutil.NewID(t), testutil.NewID(t), testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, stateID)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, interventionID)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, outcomeID)
 
 	mustCreate(t, repo.CreateState(ctx, domain.State{ID: stateID, GoalID: goalID}))
 	mustCreate(t, repo.CreateIntervention(ctx, domain.Intervention{
@@ -115,6 +119,8 @@ func TestCreateMetaHeuristicIsIdempotent(t *testing.T) {
 	_, interventionID, outcomeID := seedGoalTriplet(t, ctx, repo, goalID, domain.VerificationVerified, false)
 
 	mhID := testutil.NewID(t)
+	cfg := testutil.RequireIntegration(t)
+	testutil.RegisterGraphNodeCleanup(t, ctx, cfg, mhID)
 	refs := []string{interventionID, outcomeID}
 	mh := domain.MetaHeuristic{ID: mhID, Definition: "[Primary Population Center] raises [System Output]"}
 
@@ -158,6 +164,8 @@ func TestMarkStaleMetaHeuristics(t *testing.T) {
 	seed := func(status domain.VerificationStatus) string {
 		_, interventionID, outcomeID := seedGoalTriplet(t, ctx, repo, goalID, status, false)
 		mhID := testutil.NewID(t)
+		cfg := testutil.RequireIntegration(t)
+		testutil.RegisterGraphNodeCleanup(t, ctx, cfg, mhID)
 		mustCreate(t, repo.CreateMetaHeuristic(ctx,
 			domain.MetaHeuristic{ID: mhID, Definition: "abstraction"}, []string{interventionID, outcomeID}))
 		return mhID
