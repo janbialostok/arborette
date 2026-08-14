@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
+  AuthRedirected,
+  OrchestratorError,
   getMe,
   logout,
   updateMe,
@@ -18,6 +20,12 @@ import { Callout, SectionLabel } from "@/components/ui";
 // the grant notice yet (MeDto.admin_notice) a one-line banner is shown under
 // the chip. Signing out POSTs the BFF /logout, which clears the session cookie,
 // then lands on /login.
+//
+// It mounts only after the AppShell session gate has passed, and the gate owns
+// sign-out detection: a 401 here (a session that died mid-use) is routed to the
+// login page by the data client's registered auth-redirect handler and must
+// never flash as an error. Only genuine failures -- a transport or upstream
+// error with no 401 -- surface a message.
 export function UserMenu() {
   const [me, setMe] = useState<MeDto | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -32,6 +40,8 @@ export function UserMenu() {
       })
       .catch((err: unknown) => {
         if (cancelled) return;
+        if (err instanceof AuthRedirected) return;
+        if (err instanceof OrchestratorError && err.status === 401) return;
         setError(errorMessage(err, "Could not load your account."));
       });
     return () => {

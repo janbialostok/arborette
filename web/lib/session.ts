@@ -33,3 +33,23 @@ export function isSignedIn(user: SessionUser | null): boolean {
 export function isAdmin(user: SessionUser | null): boolean {
   return user !== null && user.role === "admin" && user.active;
 }
+
+// safeNextPath validates a ?next= deep-link destination for the login redirect.
+// Only a same-origin relative path is accepted: it must start with "/" and must
+// not start with "//" (protocol-relative). Any other value -- an absolute URL
+// (no leading "/"), a protocol-relative path, a scheme-full value, or nothing
+// -- yields null so the caller falls back to "/" (FR-008 open-redirect guard).
+export function safeNextPath(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  if (!raw.startsWith("/") || raw.startsWith("//")) return null;
+  return raw;
+}
+
+// loginURL builds the login-page redirect target for a signed-out visitor. The
+// original destination (path + query) is carried as a percent-encoded ?next=
+// so the analyst lands back where they were going after signing in; with no
+// destination it is the bare /login (FR-008). Always a relative URL.
+export function loginURL(next?: string): string {
+  const safe = safeNextPath(next);
+  return safe ? `/login?next=${encodeURIComponent(safe)}` : "/login";
+}

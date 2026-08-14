@@ -1,8 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { Suspense, useState } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { login, registerUser, errorMessage } from "@/lib/orchestrator";
+import { safeNextPath } from "@/lib/session";
 import { Button, Callout, Panel, SectionLabel } from "@/components/ui";
 
 // LoginPage is sign-in and account creation as one screen. The first account on
@@ -10,12 +12,32 @@ import { Button, Callout, Panel, SectionLabel } from "@/components/ui";
 // both a fresh install and an analyst signing back in. A returned {error} body
 // is surfaced verbatim -- the login failure is deliberately one generic message,
 // and registration validation reasons are analyst-safe to show.
+//
+// The middleware and the shell gate bounce a signed-out visitor here with a
+// ?next=<encoded destination> deep link; after a successful sign-in or
+// registration the analyst is returned to that validated same-origin view (or
+// the console root when there is none). useSearchParams is wrapped in Suspense
+// because the page is prerendered: the search params only resolve on the client.
 export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
+  );
+}
+
+function LoginForm() {
+  const searchParams = useSearchParams();
   const [mode, setMode] = useState<"signin" | "register">("signin");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // The deep-link destination is validated to a same-origin relative path (an
+  // absolute URL, protocol-relative path, or scheme-full value resolves to the
+  // root); an absent next is the plain /login visit, which lands on "/".
+  const destination = safeNextPath(searchParams.get("next")) ?? "/";
 
   async function submit() {
     setLoading(true);
@@ -26,7 +48,7 @@ export default function LoginPage() {
       } else {
         await registerUser(username, password);
       }
-      window.location.assign("/");
+      window.location.assign(destination);
     } catch (err) {
       setError(errorMessage(err, "Could not complete the request. Please retry."));
       setLoading(false);

@@ -1,15 +1,21 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  AuthRedirected,
   OrchestratorError,
   correctCausalEdge,
   errorMessage,
   getCausalGraph,
+  getMe,
   getOutcomeExcerpt,
   isExtraction,
   listCausalVerifications,
+  listDatasets,
   listGoals,
   listOutcomes,
   listVerifications,
+  login,
+  registerAuthRedirect,
+  registerUser,
   resolveVerification,
   searchHeuristics,
   verifyFinding,
@@ -24,6 +30,7 @@ import {
 } from "./orchestrator";
 
 afterEach(() => {
+  registerAuthRedirect(null);
   vi.unstubAllGlobals();
 });
 
@@ -36,6 +43,13 @@ function mockFetch(response: Response) {
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function unauthorizedResponse(): Response {
+  return new Response(JSON.stringify({ error: "unauthorized" }), {
+    status: 401,
     headers: { "content-type": "application/json" },
   });
 }
@@ -99,6 +113,152 @@ describe("requestJSON via searchHeuristics", () => {
       message: "request failed (500)",
       status: 500,
     });
+  });
+});
+
+describe("auth-redirect seam", () => {
+  it("invokes the registered handler once and throws AuthRedirected on a session-secured 401", async () => {
+    const handler = vi.fn();
+    registerAuthRedirect(handler);
+    mockFetch(unauthorizedResponse());
+
+    await expect(searchHeuristics("x")).rejects.toBeInstanceOf(AuthRedirected);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("never surfaces a view error on a redirected 401", async () => {
+    registerAuthRedirect(() => {});
+    mockFetch(unauthorizedResponse());
+
+    const err = await searchHeuristics("x").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AuthRedirected);
+    expect(err).not.toBeInstanceOf(OrchestratorError);
+  });
+
+  it("surfaces the 401 as a plain OrchestratorError when no handler is registered", async () => {
+    registerAuthRedirect(null);
+    mockFetch(unauthorizedResponse());
+
+    await expect(searchHeuristics("x")).rejects.toMatchObject({
+      name: "OrchestratorError",
+      status: 401,
+    });
+  });
+
+  it("registerAuthRedirect(null) clears the handler so a later 401 is not redirected", async () => {
+    const handler = vi.fn();
+    registerAuthRedirect(handler);
+    registerAuthRedirect(null);
+    mockFetch(unauthorizedResponse());
+
+    await expect(searchHeuristics("x")).rejects.toMatchObject({ status: 401 });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("a non-401 failure never invokes the handler", async () => {
+    const handler = vi.fn();
+    registerAuthRedirect(handler);
+    mockFetch(
+      new Response(JSON.stringify({ error: "boom" }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(searchHeuristics("x")).rejects.toMatchObject({ status: 500 });
+    expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+describe("session-secured 401 routing", () => {
+  it("getMe answering 401 invokes the handler and throws AuthRedirected", async () => {
+    const handler = vi.fn();
+    registerAuthRedirect(handler);
+    mockFetch(unauthorizedResponse());
+
+    await expect(getMe()).rejects.toBeInstanceOf(AuthRedirected);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("listDatasets answering 401 invokes the handler and throws AuthRedirected", async () => {
+    const handler = vi.fn();
+    registerAuthRedirect(handler);
+    mockFetch(unauthorizedResponse());
+
+    await expect(listDatasets()).rejects.toBeInstanceOf(AuthRedirected);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("login answering 401 keeps its inline bad-credentials verdict without invoking the handler", async () => {
+    const handler = vi.fn();
+    registerAuthRedirect(handler);
+    mockFetch(unauthorizedResponse());
+
+    await expect(login("alice", "wrong")).rejects.toMatchObject({
+      name: "OrchestratorError",
+      status: 401,
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("registerUser answering 401 keeps its inline verdict without invoking the handler", async () => {
+    const handler = vi.fn();
+    registerAuthRedirect(handler);
+    mockFetch(unauthorizedResponse());
+
+    await expect(registerUser("alice", "weak")).rejects.toMatchObject({
+      name: "OrchestratorError",
+      status: 401,
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("a transport failure with no status never invokes the handler (FR-010)", async () => {
+    const handler = vi.fn();
+    registerAuthRedirect(handler);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new TypeError("fetch failed")),
+    );
+
+    await expect(getMe()).rejects.toBeInstanceOf(TypeError);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("a 200 getMe never invokes the handler (FR-010 false-sign-out guard)", async () => {
+    const handler = vi.fn();
+    registerAuthRedirect(handler);
+    mockFetch(
+      jsonResponse({
+        id: "u1",
+        username: "alice",
+        role: "admin",
+        active: true,
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+        admin_notice: false,
+      }),
+    );
+
+    await expect(getMe()).resolves.toMatchObject({ username: "alice" });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("a non-401 failure on a session-secured call never invokes the handler nor throws AuthRedirected", async () => {
+    const handler = vi.fn();
+    registerAuthRedirect(handler);
+    mockFetch(
+      new Response(JSON.stringify({ error: "forbidden" }), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(listGoals()).rejects.toMatchObject({
+      name: "OrchestratorError",
+      status: 403,
+    });
+    expect(handler).not.toHaveBeenCalled();
   });
 });
 

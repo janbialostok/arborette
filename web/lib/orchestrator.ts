@@ -402,18 +402,81 @@ export function errorMessage(err: unknown, fallback: string): string {
   return err instanceof OrchestratorError ? err.message : fallback;
 }
 
+// AuthRedirectHandler is invoked when a session-secured call answers 401 and a
+// handler is registered. The shell installs it to route the analyst to the
+// login page on a dying session; tests substitute a spy. A null handler disables
+// the redirect (the failure then surfaces as a normal OrchestratorError).
+export type AuthRedirectHandler = () => void;
+
+let authRedirectHandler: AuthRedirectHandler | null = null;
+
+// registerAuthRedirect installs (or, with null, clears) the 401-redirect
+// handler. It is a module-level seam so the data client can route a mid-session
+// 401 to login without every view owning the navigation, and so vitest (no
+// window.location) can substitute a spy. Exactly one handler is active.
+export function registerAuthRedirect(handler: AuthRedirectHandler | null): void {
+  authRedirectHandler = handler;
+}
+
+// AuthRedirected is the sentinel thrown after the registered handler runs. A
+// caller's catch can distinguish "navigating away to login" from a genuine
+// failure and must not render an error flash for a session that is dying.
+export class AuthRedirected extends Error {
+  constructor() {
+    super("session expired, redirecting to login");
+    this.name = "AuthRedirected";
+  }
+}
+
+// RequestOptions tailors a single requestJSON/request call. redirectOn401=false
+// opts a call out of the 401-redirect -- the sign-in calls use it so their 401
+// (the orchestrator's generic bad-credentials verdict) surfaces inline on the
+// login page instead of looping back to it. Every other call inherits the
+// default: a 401 with a registered handler invokes it and throws AuthRedirected.
+interface RequestOptions {
+  redirectOn401?: boolean;
+}
+
+// raiseIfSessionGone runs the registered auth-redirect handler for a 401 on a
+// session-secured call and throws AuthRedirected so no view paints an error
+// flash while the navigation happens. With no handler (or the opt-out set) it
+// returns and the caller's normal error path applies.
+function raiseIfSessionGone(err: OrchestratorError, opts: RequestOptions): void {
+  if (opts.redirectOn401 === false) return;
+  if (err.status !== 401) return;
+  if (!authRedirectHandler) return;
+  authRedirectHandler();
+  throw new AuthRedirected();
+}
+
 // requestJSON performs a same-origin BFF call, surfacing the orchestrator's
 // {error} body verbatim on a non-2xx response and returning the parsed JSON.
-async function requestJSON<T>(input: string, init?: RequestInit): Promise<T> {
+async function requestJSON<T>(
+  input: string,
+  init?: RequestInit,
+  opts: RequestOptions = {},
+): Promise<T> {
   const res = await fetch(input, init);
-  if (!res.ok) throw await errorFrom(res);
+  if (!res.ok) {
+    const err = await errorFrom(res);
+    raiseIfSessionGone(err, opts);
+    throw err;
+  }
   return (await res.json()) as T;
 }
 
 // request performs a BFF call whose response has no JSON body (a 204 delete).
-async function request(input: string, init?: RequestInit): Promise<void> {
+async function request(
+  input: string,
+  init?: RequestInit,
+  opts: RequestOptions = {},
+): Promise<void> {
   const res = await fetch(input, init);
-  if (!res.ok) throw await errorFrom(res);
+  if (!res.ok) {
+    const err = await errorFrom(res);
+    raiseIfSessionGone(err, opts);
+    throw err;
+  }
 }
 
 export function submitGoal(form: FormData): Promise<SubmitGoalResponse> {
@@ -640,24 +703,35 @@ export interface MeDto extends AccountDto {
 // registerUser creates an account and signs it in: the response carries the
 // Set-Cookie the proxy relays as an HttpOnly session cookie. The username/password
 // validation rules live server-side, so the caller just forwards what the user
-// typed and surfaces the {error} verbatim on failure.
+// typed and surfaces the {error} verbatim on failure. It opts out of the
+// 401-redirect: its 401 is the orchestrator's generic bad-credentials verdict
+// and must keep surfacing inline on the login page, never looping back to it.
 export function registerUser(username: string, password: string): Promise<MeDto> {
-  return requestJSON<MeDto>(`${API_BASE}/register`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username, password }),
-  });
+  return requestJSON<MeDto>(
+    `${API_BASE}/register`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    },
+    { redirectOn401: false },
+  );
 }
 
 // login verifies credentials and signs the user in the same way. A failure is
 // the single generic 401 the orchestrator returns (unknown user, wrong
-// password, or deactivated account are indistinguishable on purpose).
+// password, or deactivated account are indistinguishable on purpose) and is
+// exempt from the 401-redirect for the same reason as registerUser.
 export function login(username: string, password: string): Promise<MeDto> {
-  return requestJSON<MeDto>(`${API_BASE}/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username, password }),
-  });
+  return requestJSON<MeDto>(
+    `${API_BASE}/login`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    },
+    { redirectOn401: false },
+  );
 }
 
 // logout ends the session server-side (row delete) and clears the cookie. The
